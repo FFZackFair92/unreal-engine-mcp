@@ -1,0 +1,10 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "",
+	"Category": "",
+	"Description": "Blank starter project preconfigured for unreal-mcp: Python Editor Script Plugin + Remote Control API enabled, web server on port 30010 at every editor launch. No C++ to build.",
+	"Plugins": [
+		{ "Name": "PythonScriptPlugin", "Enabled": true },
+		{ "Name": "RemoteControl", "Enabled": true }
+	]
+}

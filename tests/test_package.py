@@ -1,0 +1,128 @@
+"""Test del packaging: avvio di RunUAT in background e lettura dello stato."""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from unreal_mcp import local
+
+from test_local import _make_engine
+
+
+@pytest.fixture
+def progetto(tmp_path, monkeypatch):
+    root = tmp_path / "engines"
+    root.mkdir()
+    engine_root = _make_engine(root, "5.8")
+    for nome in ("Build.bat", "RunUAT.bat"):
+        script = engine_root / "Engine/Build/BatchFiles" / nome
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("@echo off", encoding="utf-8")
+
+    monkeypatch.setenv("UE_MCP_ENGINE_DIRS", str(root))
+    monkeypatch.setattr(local, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(local, "STATE_FILE", tmp_path / "state/state.json")
+    monkeypatch.setattr(local, "PACKAGE_STATE_FILE", tmp_path / "state/package.json")
+    monkeypatch.setattr(local, "WINDOWS_LAUNCHER_DAT", tmp_path / "assente.dat")
+    monkeypatch.setattr(local, "editor_status", lambda: {"running": False})
+    monkeypatch.setattr(local, "terminate_process_by_name", lambda nome: False)
+
+    return local.create_project("MyGame", str(tmp_path / "Projects"))
+
+
+class _FakePopen:
+    def __init__(self, args, **kwargs):
+        self.args = args
+        self.pid = 999
+
+
+def test_package_configurazione_invalida(progetto):
+    with pytest.raises(local.LocalError) as excinfo:
+        local.start_package(progetto["uproject"], configuration="Turbo")
+    assert "Development" in str(excinfo.value)
+
+
+def test_package_rifiuta_editor_aperto(progetto, monkeypatch):
+    monkeypatch.setattr(local, "editor_status", lambda: {"editor_process_detected": True})
+    with pytest.raises(local.LocalError) as excinfo:
+        local.start_package(progetto["uproject"])
+    assert "editor" in str(excinfo.value).lower()
+
+
+def test_package_comando_generato(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+
+    avvio = local.start_package(
+        progetto["uproject"],
+        configuration="Development",
+        maps=["/Game/MyGame/Levels/L_CortileScolastico"],
+    )
+    assert avvio["pid"] == 999
+    assert avvio["configuration"] == "Development"
+    assert json.loads(local.PACKAGE_STATE_FILE.read_text())["pid"] == 999
+
+    script = next((Path(progetto["root"]) / "Saved").glob("mcp_package_run.*"))
+    comando = script.read_text(encoding="utf-8")
+    assert "BuildCookRun" in comando
+    assert "-clientconfig=Development" in comando
+    assert "-map=/Game/MyGame/Levels/L_CortileScolastico" in comando
+    assert "-archivedirectory=" in comando
+    assert "-server" not in comando
+
+
+def test_package_server_dedicato(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.start_package(progetto["uproject"], dedicated_server=True)
+
+    script = next((Path(progetto["root"]) / "Saved").glob("mcp_package_run.*"))
+    comando = script.read_text(encoding="utf-8")
+    assert "-server" in comando
+    assert "-serverconfig=Development" in comando
+
+
+def test_package_stato_successo(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    avvio = local.start_package(progetto["uproject"])
+
+    archivio = Path(avvio["archive"]) / "Windows"
+    archivio.mkdir(parents=True, exist_ok=True)
+    (archivio / "MyGame.exe").write_text("finto eseguibile", encoding="utf-8")
+
+    Path(avvio["log"]).write_text(
+        "********** COOK COMMAND STARTED **********\n"
+        "********** ARCHIVE COMMAND STARTED **********\n"
+        "BUILD SUCCESSFUL\n"
+        "EXITCODE=0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(local, "_process_alive", lambda pid: False)
+
+    stato = local.package_status()
+    assert stato["succeeded"] is True
+    assert stato["phase"] == "Archive"
+    assert any("MyGame.exe" in e for e in stato["executables"])
+
+
+def test_package_stato_fallimento(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    avvio = local.start_package(progetto["uproject"])
+
+    Path(avvio["log"]).write_text(
+        "********** COOK COMMAND STARTED **********\n"
+        "ERROR: Cook failed. Deployment aborted.\n"
+        "EXITCODE=1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(local, "_process_alive", lambda pid: False)
+
+    stato = local.package_status()
+    assert stato["succeeded"] is False
+    assert stato["exit_code"] == "1"
+    assert any("Cook failed" in e for e in stato["errors"])
+    assert stato["phase"] == "Cook"
+
+
+def test_package_status_senza_avvii(tmp_path, monkeypatch):
+    monkeypatch.setattr(local, "PACKAGE_STATE_FILE", tmp_path / "mai.json")
+    assert local.package_status()["running"] is False

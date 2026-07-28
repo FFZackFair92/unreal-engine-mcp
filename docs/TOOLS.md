@@ -1,0 +1,147 @@
+# Tool reference
+
+49 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+
+**Local layer** — runs as a process on your machine. Finds engines, creates
+projects, opens and closes the editor, compiles C++, packages the game,
+downloads assets. Works with the editor closed.
+
+**Editor layer** — talks to a *running* editor over the Remote Control API
+(`http://127.0.0.1:30010`), executing Python inside it. Needs the editor open.
+
+Positions are in centimetres (1 Unreal unit = 1 cm), Z is up. Asset paths use
+the Unreal convention (`/Game/...`).
+
+---
+
+## Engine and projects (local)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_engine_list` | — | Engine installs found via `UE_MCP_ENGINE_DIRS`, the Epic Launcher manifest and the Windows registry (including hand-registered builds keyed by GUID). |
+| `ue_engine_templates` | `engine_version` | Official templates shipped with the engine (`TP_Blank`, `TP_ThirdPerson`, …). |
+| `ue_project_create` | `name`, `directory`, `engine_version`, `template`, `blueprint_only`, `plugins`, `default_map`, `default_game_mode`, `description`, `force` | Creates a project already wired for the bridge: `.uproject` with the required plugins, `DefaultRemoteControl.ini` with the two security flags, and `Content/Python/init_unreal.py`. Optionally copies an engine template, dropping its `Source/` for a Blueprint-only project. |
+| `ue_project_find` | `directory`, `max_depth` | Finds `.uproject` files under a folder. |
+| `ue_project_info` | `uproject` | Engine association, enabled plugins, whether the bridge is ready, whether the project has C++. |
+| `ue_project_set_plugins` | `uproject`, `enable`, `disable` | Enables/disables plugins by editing the `.uproject`. Requires an editor restart. |
+
+## Editor lifecycle (local)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args` | Launches the editor and **waits until the bridge answers**, so the next call is safe. First launch compiles shaders and can take minutes. |
+| `ue_editor_status` | — | Whether the editor process is alive (including one you started by hand), whether Live Coding is running, whether the bridge answers. |
+| `ue_editor_close` | `save_all`, `force` | Clean shutdown: saves, then `quit_editor` over the bridge. Falls back to killing the process. |
+
+## Compiling and packaging (local)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_build_start` | `uproject`, `engine_version`, `target`, `configuration` | Compiles the C++ module in the background. **Editor must be closed.** Kills `LiveCodingConsole.exe` first — it outlives the editor and keeps a lock on the DLLs. |
+| `ue_build_status` | `tail_lines` | Running or finished, exit code, parsed compiler errors and warnings, log tail. |
+| `ue_live_compile` | `max_wait_seconds` | Recompiles **with the editor open**, via Live Coding. Only patches function bodies: adding or changing `UCLASS`/`UFUNCTION`/`UPROPERTY` changes reflection data and still needs `ue_build_start`. |
+| `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version` | Cook + build + stage + pak via `RunUAT BuildCookRun`. Produces a standalone executable. **Editor must be closed.** |
+| `ue_package_status` | `tail_lines` | Current phase (Cook, Stage, Package, Archive), errors, and the path of the produced `.exe`. |
+
+Neither build nor package waits for completion inside the call: they would blow
+past the MCP timeout. They start and you poll the status tool.
+
+## Diagnostics (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_status` | — | Engine version, open project, current level, actor count. **Call this first in any session.** |
+| `ue_read_log` | `lines`, `only_errors` | Tail of the Unreal log, optionally filtered to errors and warnings. |
+| `ue_exec_python` | `code` | Arbitrary Python inside the editor. The escape hatch: `unreal` and every `mcp_*` helper are in scope; assign to `result` to return a value. |
+| `ue_save_all` | — | Saves the current level and every dirty asset. |
+
+## Assets and levels (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_import_assets` | `files`, `destination`, `replace_existing`, `import_as_skeletal` | Imports `.glb`/`.gltf`/`.fbx`/`.wav` through the Interchange framework. |
+| `ue_import_audio` | `files`, `destination` | Imports `.wav` files as SoundWave assets. |
+| `ue_list_assets` | `path`, `recursive`, `class_filter` | Lists assets under a Content Browser path, filterable by class name. |
+| `ue_new_level` | `path`, `template` | Creates a level and opens it. |
+| `ue_open_level` | `path` | Opens an existing level. |
+
+## Actors (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_spawn_actor` | `class_ref`, `location`, `rotation`, `scale`, `label` | Spawns from a class name, a `/Script/...` path, a Blueprint path, or a static mesh asset. The `label` is how other tools find it again. |
+| `ue_list_actors` | `name_contains`, `class_contains` | Lists level actors with optional filters. |
+| `ue_set_actor_transform` | `label`, `location`, `rotation`, `scale` | Moves, rotates and scales an actor by label. |
+| `ue_delete_actor` | `label` | Removes an actor from the level. |
+
+## Blueprints (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_blueprint` | `package_path`, `name`, `parent_class` | New Blueprint with the given parent (`Actor`, `Character`, `GameModeBase`, or a full path). Idempotent. |
+| `ue_add_component` | `blueprint_path`, `component_class`, `name` | Adds a component through `SubobjectDataSubsystem` and recompiles. |
+| `ue_add_variable` | `blueprint_path`, `var_name`, `var_type`, `sub_type`, `replicated`, `instance_editable`, `default_value` | Typed member variable with replication and instance-editable flags. Types: `bool`, `int`, `int64`, `float`, `string`, `name`, `text`, `byte`, `struct`, `object`, `class`. **UE 5.4+** — earlier engines have no Python API for this; the tool fails with an explicit message. |
+| `ue_set_class_defaults` | `blueprint_path`, `properties` | Writes Class Defaults on the CDO. |
+| `ue_compile_blueprint` | `blueprint_path` | Compiles and saves. |
+| `ue_set_replication` | `blueprint_path`, `replicates`, `replicate_movement`, `always_relevant` | Networking flags on the CDO. |
+
+**Not supported: authoring Blueprint node graphs.** UE 5.8 does not expose it to
+Python — `EdGraph.Nodes` is protected, pin types are not exposed and there is no
+API to link pins. These tools cover variables, components and defaults; the logic
+itself belongs in C++ or in the editor by hand. See [UNREAL-NOTES.md](UNREAL-NOTES.md).
+
+## Play In Editor (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_configure_pie` | `num_players`, `net_mode`, `one_process` | Client count and net mode (`standalone`, `listen_server`, `client`) for local multiplayer testing. |
+| `ue_start_pie` / `ue_stop_pie` | — | Starts and stops the session. |
+| `ue_set_project_setting` | `section`, `key`, `value`, `config` | Writes into `Config/Default<config>.ini`. Some settings need an editor restart. |
+
+## Audio (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_metasound_source` | `package_path`, `name` | Empty MetaSound Source asset (needs the MetaSound plugin). |
+| `ue_create_sound_cue` | `package_path`, `name`, `wave_path` | Sound Cue, optionally already wired to an imported SoundWave. |
+
+## Free asset downloads (local)
+
+Downloads land in `UE_MCP_LIBRARY` (default `~/UnrealAssetLibrary`), are verified
+against the published md5 where available, are size-capped by
+`UE_MCP_MAX_DOWNLOAD`, and archives are extracted with path-traversal protection.
+
+| Tool | Source | Licence |
+|---|---|---|
+| `preset_search_polyhaven` / `preset_download_polyhaven` | [Poly Haven](https://polyhaven.com) — HDRIs, PBR textures, models. glTF downloads pull their `.bin` and textures too. | CC0 |
+| `preset_search_ambientcg` / `preset_download_ambientcg` | [ambientCG](https://ambientcg.com) — PBR materials, HDRIs, models. | CC0 |
+| `preset_download_kenney` | [kenney.nl](https://kenney.nl) — low-poly packs. No API: the link is resolved from the page. | CC0 |
+| `preset_download_url` | Any direct URL (zip/glb/fbx/wav), extracted automatically. | depends |
+| `preset_extract_archive` | A zip/tar already on disk. `.rar` is not supported by the standard library. | — |
+| `preset_library_list` | Lists the local library, ready to feed `ue_import_assets`. | — |
+| `preset_fab_list_vault` / `preset_fab_download` | Purchased Fab/Marketplace content. | your Epic licence |
+
+> **Fab caveat.** Purchased content sits behind an Epic login with no public API.
+> These two tools shell out to the community client
+> [`legendary`](https://github.com/derrod/legendary) (`pip install legendary-gl`,
+> then `legendary auth`). Without it, the tool explains how to download from the
+> Epic Games Launcher instead. This is third-party software, not an official route.
+
+## Extending it with project-specific tools
+
+Any `local_tools.py` placed next to `server.py` is imported automatically at
+startup and can register extra tools with `@mcp.tool()`:
+
+```python
+from .server import lit, mcp, run
+
+@mcp.tool()
+async def mygame_bootstrap(root: str = "/Game/MyGame") -> dict:
+    """Compose the primitives into a one-call workflow for your game."""
+    return await run(f"result = mcp_create_blueprint({lit(root + '/Blueprints')}, 'BP_MyGameMode', 'GameModeBase')")
+```
+
+The file is listed in `.gitignore`, so per-project workflows (folder structures,
+Blueprint sets with replication and typed variables, level population) stay on
+your machine and out of the public repo. `tests/test_local_tools.py` gets the
+same treatment for their tests.

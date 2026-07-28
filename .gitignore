@@ -1,0 +1,19 @@
+# Cartelle generate da Unreal nello StarterProject
+StarterProject/Binaries/
+StarterProject/DerivedDataCache/
+StarterProject/Intermediate/
+StarterProject/Saved/
+StarterProject/.vs/
+StarterProject/*.sln
+
+# Estensioni locali specifiche del proprio gioco: non pubblicate
+src/unreal_mcp/local_tools.py
+tests/test_local_tools.py
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
