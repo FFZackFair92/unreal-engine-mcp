@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Only two runtime dependencies (mcp, httpx), so monthly is plenty.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    ignore:
+      # The 1.x pin is deliberate: v2 renamed FastMCP to MCPServer and moved
+      # the module, so a major bump does not just work. See CHANGELOG.
+      - dependency-name: mcp
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

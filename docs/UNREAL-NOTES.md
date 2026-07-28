@@ -26,6 +26,13 @@ bAllowAnyRemoteFunctionCall=False
 The targeted allowlist is preferable to `bAllowAnyRemoteFunctionCall=True`, which
 would expose every `UFUNCTION` in the project to HTTP calls.
 
+A third flag, `bAllowConsoleCommandRemoteExecution`, looks like it belongs in
+that set and does not. Epic documents it as *"Enable calling
+'ExecuteConsoleCommand' through the web api"* — it gates one HTTP route, not
+console commands in general. Code running inside the editor, including
+`unreal.SystemLibrary.execute_console_command`, is unaffected, so a bridge that
+executes Python and issues its console commands from there can leave it off.
+
 Note the file: `URemoteControlSettings` is declared `UCLASS(config = RemoteControl)`
 in the `RemoteControlCommon` module, so it reads **`DefaultRemoteControl.ini`** —
 putting these keys in `DefaultEngine.ini` does nothing. Both changes need an
@@ -77,8 +84,59 @@ pin.import_text('(PinCategory="struct",PinSubCategoryObject="/Script/CoreUObject
 
 `EdGraph.Nodes` is protected, `EdGraphPin` is not exposed, K2 node classes can be
 instantiated but not inserted into a graph, and there is no pin-linking API.
-Variables, components and defaults are scriptable; **logic is not**. Write it in
-C++ or by hand in the editor.
+Variables, components and defaults are scriptable; **logic is not**.
+
+The way around it is not to script the graph but to avoid needing one: generate
+a C++ parent class, compile, and reparent the Blueprint onto it. The Blueprint
+keeps its components and its editor-set values; the behaviour is inherited.
+`UFUNCTION(BlueprintCallable)` members then show up as nodes a human can wire.
+
+## Material graphs, unlike Blueprint graphs, *are* scriptable
+
+`MaterialEditingLibrary` exposes the whole thing — `create_material_expression`,
+`connect_material_property`, `recompile_material`, and the material-instance
+parameter setters. Nodes can be created, positioned and linked from Python.
+
+One trap: a normal map needs both `srgb = False` on the texture and
+`SAMPLERTYPE_NORMAL` on the sampler node. Set only one and the map is sampled as
+colour, which looks subtly wrong rather than obviously broken.
+
+## Parent class headers are not all under GameFramework/
+
+`AIController.h` sits at the root of the `AIModule` include path, components
+live under `Components/`, `UObject` under `UObject/Object.h`. Getting this wrong
+produces a compiler error that never names the class you were trying to derive
+from.
+
+The `A`/`U` prefix cannot be derived by stripping the first letter either:
+`ActorComponent` starts with an `A` but the class is `UActorComponent`. The
+prefix follows the hierarchy — `A` for `AActor` descendants, `U` for every other
+`UObject` — so it needs a lookup, not string surgery.
+
+## Replicated properties fail silently without DOREPLIFETIME
+
+Marking a `UPROPERTY` as `Replicated` and forgetting to add it to
+`GetLifetimeReplicatedProps` compiles without complaint. The value simply never
+replicates, and the bug surfaces much later as desync.
+
+## Sending helpers with every call is expensive
+
+`ExecutePythonCommandEx` with `fileExecutionScope: "Private"` runs each snippet
+in a fresh scope, but the *process* is shared: `sys.modules` persists between
+calls. Installing helpers once as a module and importing them afterwards turns
+every call from "parse and execute 750 lines" into "look up a dict".
+
+Key it by a hash of the source, and have the lightweight snippet report back
+when the module is missing or stale rather than assuming — the editor can
+restart underneath you at any point.
+
+## Edits from a script are not undoable unless you ask
+
+Anything done through the Python API lands outside the transaction buffer, so
+Ctrl+Z does nothing. Wrapping the work in `unreal.ScopedEditorTransaction`
+registers it as one named entry in the undo stack. For an agent editing someone
+else's level, this is the difference between a tool you can trust and one you
+cannot.
 
 ## Blueprint components live in the subobject system
 

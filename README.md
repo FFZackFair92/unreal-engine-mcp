@@ -1,5 +1,9 @@
 # Unreal Engine MCP
 
+[![CI](https://github.com/FFZackFair92/unreal-engine-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/FFZackFair92/unreal-engine-mcp/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 [Italiano](README.it.md)
 
 An [MCP](https://modelcontextprotocol.io) server that lets an AI agent drive
@@ -22,8 +26,8 @@ The local layer exists because the Remote Control API only works against an
 editor that is **already running**: creating a project, launching it, compiling
 and packaging all have to happen at the process level.
 
-- **49 tools** — [full reference](docs/TOOLS.md)
-- **91 tests**, none of which need Unreal installed
+- **58 tools** — [full reference](docs/TOOLS.md)
+- **138 tests**, none of which need Unreal installed
 - **[Unreal automation notes](docs/UNREAL-NOTES.md)** — the API traps found the hard way
 
 ---
@@ -33,7 +37,9 @@ and packaging all have to happen at the process level.
 - Unreal Engine **5.0 or newer** (developed and tested against 5.8 — see
   [version compatibility](#unreal-version-compatibility))
 - Python 3.10+
-- Windows for the local layer (process handling and build scripts are Windows-specific).
+- Windows, Linux or macOS. Development happens on Windows, which is where the
+  local layer is exercised most; the Linux and macOS paths (`Build.sh`,
+  `RunUAT.sh`, `pgrep`) are implemented and covered by CI, but less battle-tested.
   The editor layer is platform-neutral.
 
 ### Unreal version compatibility
@@ -45,7 +51,8 @@ message instead of a cryptic Python error when a feature is missing:
 | Feature | Works on |
 |---|---|
 | Actors, levels, spawn/transform, PIE, project settings, build & packaging, Sound Cues | **5.0+** |
-| Blueprint creation, components (`SubobjectDataSubsystem`) | **5.0+** |
+| Blueprint creation, components (`SubobjectDataSubsystem`), reparenting | **5.0+** |
+| Materials, material instances, screenshots, C++ class generation | **5.0+** |
 | glTF/`.glb` import via Interchange | **5.2+** (earlier: enable the *glTF Importer* plugin; the tool tells you when that is the problem) |
 | Blueprint member variables + per-variable replication (`ue_add_variable`) | **5.4+** (no Python API before that — the tool says so explicitly) |
 | MetaSounds | any 5.x with the *MetaSound* plugin enabled |
@@ -169,9 +176,9 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
    bAutoStartWebSocketServer=True
    RemoteControlHttpServerPort=30010
    bEnableRemotePythonExecution=True
-   bAllowConsoleCommandRemoteExecution=True
    bAllowAnyRemoteFunctionCall=False
    +CustomAllowedRemoteFunctionCalls=(ClassPath="/Script/PythonScriptPlugin.PythonScriptLibrary")
+   bAllowConsoleCommandRemoteExecution=False
    ```
 
    These are **two separate gates** — one unlocks the object, the other the
@@ -185,6 +192,18 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
    The server listens on `127.0.0.1` only, so remote Python execution is not
    reachable from outside the machine.
 
+   What the server can do once connected, and how to open it up safely if you
+   really need to reach the editor from another machine, is in
+   [SECURITY.md](SECURITY.md).
+
+   `bAllowConsoleCommandRemoteExecution` stays **off**. It enables
+   `ExecuteConsoleCommand` *through the web API*, which this server never calls
+   — the console commands it does need (`LiveCoding.Compile`,
+   `WebControl.StartServer`, `HighResShot`) are issued from inside Python via
+   `unreal.SystemLibrary.execute_console_command` and do not go through that
+   gate. Older versions of this project set it to `True`; existing projects can
+   flip it to `False` without losing anything.
+
 3. **Check it**: open `http://127.0.0.1:30010/remote/info` in a browser. JSON
    back means you are connected.
 
@@ -194,23 +213,49 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 |---|---|
 | **Projects** | Find engine installs, create projects from a spec, manage plugins |
 | **Editor lifecycle** | Open (waiting for the bridge), status, clean shutdown |
+| **C++** | Generate compilable classes with the boilerplate written correctly, then reparent Blueprints onto them |
 | **Build** | Compile C++ in the background; `ue_live_compile` recompiles **with the editor open** via Live Coding |
 | **Package** | `RunUAT BuildCookRun` → standalone executable, with phase reporting |
 | **Assets** | Import `.glb`/`.gltf`/`.fbx`/`.wav`, list and search the Content Browser |
-| **Levels** | Create and open levels, spawn/move/delete actors |
-| **Blueprints** | Create, add components, typed variables with replication, class defaults, compile |
+| **Levels** | Create and open levels, spawn/move/delete actors, batch spawn, set properties on placed actors |
+| **Materials** | Build material graphs, wire PBR textures, material instances, assign to actors |
+| **Blueprints** | Create, add components, typed variables with replication, class defaults, reparent, compile |
 | **Networking** | Replication flags, multi-client PIE, project settings |
 | **Audio** | Import wavs, MetaSound sources, Sound Cues |
 | **Free assets** | Poly Haven, ambientCG and Kenney downloads (all CC0), plus any direct URL |
+| **Feedback** | `ue_screenshot` captures the viewport, so the agent can see what it built |
 
 Full parameter list in [docs/TOOLS.md](docs/TOOLS.md).
 
-### Known limits
+### Working around the Blueprint graph limit
 
-- **Blueprint node graphs cannot be authored.** UE 5.8 does not expose graph
-  editing to Python: `EdGraph.Nodes` is protected, pins are not exposed and
-  there is no linking API. Variables, components and defaults are scriptable;
-  logic belongs in C++ or in the editor. Details in [docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+**Blueprint node graphs cannot be authored from Python.** `EdGraph.Nodes` is
+protected, pins are not exposed and there is no linking API — this is a hard
+limit of the engine, not of this server. Details in
+[docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+
+What works instead: **put the logic in a C++ parent class.** The Blueprint stays
+the container for components and tweakable values; the behaviour is inherited.
+
+```
+ue_cpp_class_create      # writes the class, and the whole C++ module if the
+                         # project was Blueprint-only
+ue_editor_close
+ue_build_start           # poll ue_build_status until running=false
+ue_editor_open
+ue_reparent_blueprint    # the Blueprint now inherits the behaviour
+```
+
+Blueprint variables whose names match a `UPROPERTY` on the new parent are
+absorbed by it, so values set in the editor survive the move. Functions marked
+`BlueprintCallable` become callable from the graph — an agent can build the
+vocabulary the designer then wires up by hand.
+
+Material graphs, unlike Blueprint graphs, *are* fully scriptable:
+`ue_create_material` really does create and connect the nodes.
+
+### Other limits
+
 - **Compiling C++ needs the editor closed**, unless the change only touches
   function bodies — then `ue_live_compile` works with it open.
 - **Packaging always needs the editor closed**: the build step rewrites the DLLs
@@ -247,10 +292,13 @@ pytest -q
 ```
 
 Adding a tool: a reusable helper in `src/unreal_mcp/ue_side.py` (editor side),
-an `@mcp.tool()` function in `server.py`, and a test in `tests/`.
-`ue_side.py` is re-read from disk on every call, so editor-side changes take
-effect without restarting the server; changes to `server.py` or `local.py` need
-a client restart.
+an `@mcp.tool()` function in `server.py`, and a test in `tests/`. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the conventions worth knowing.
+
+`ue_side.py` is installed into the running editor as a module and keyed by a
+hash of its source, so editor-side changes take effect on the next call without
+restarting the server — and every other call is just a small snippet that
+imports it. Changes to `server.py` or `local.py` need a client restart.
 
 ## Troubleshooting
 
@@ -263,6 +311,7 @@ a client restart.
 | `NameError: name 'unreal' is not defined` | *Python Editor Script Plugin* not enabled |
 | `Unable to build while Live Coding is active` | `LiveCodingConsole.exe` outlives the editor — kill it (the build tools do this automatically) |
 | `No Unreal Engine installation found` | Set `UE_MCP_ENGINE_DIRS`, add `mcp_engine.txt`, or pass `engine_root` |
+| `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` | `mcp` 2.x is installed; this server targets the 1.x line. `pip install "mcp<2"` — reinstalling the package does it for you |
 
 ## Licence
 

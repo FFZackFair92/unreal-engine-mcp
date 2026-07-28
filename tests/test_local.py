@@ -8,7 +8,6 @@ import pytest
 
 from unreal_mcp import local
 
-
 # --------------------------------------------------------------- fixtures
 
 
@@ -36,6 +35,24 @@ def _make_engine(root: Path, version: str = "5.4") -> Path:
     (template / "Source/TP_ThirdPerson/Module.cpp").write_text("// c++", encoding="utf-8")
     (template / "TP_ThirdPerson.uproject").write_text('{"FileVersion": 3}', encoding="utf-8")
     return engine_root
+
+
+def _make_batch_files(engine_root: Path) -> None:
+    """Crea gli script di build per tutte le piattaforme.
+
+    Epic li distribuisce come `.bat` su Windows e `.sh` sotto `Linux/`o `Mac/`:
+    creandoli tutti, i test girano identici ovunque e la CI può usare Linux.
+    """
+    batch = engine_root / "Engine/Build/BatchFiles"
+    for stem in ("Build", "RunUAT"):
+        windows = batch / f"{stem}.bat"
+        windows.parent.mkdir(parents=True, exist_ok=True)
+        windows.write_text("@echo off", encoding="utf-8")
+        for sistema in ("Linux", "Mac"):
+            unix = batch / sistema / f"{stem}.sh"
+            unix.parent.mkdir(parents=True, exist_ok=True)
+            unix.write_text("#!/bin/sh\n", encoding="utf-8")
+            unix.chmod(0o755)
 
 
 @pytest.fixture
@@ -134,6 +151,11 @@ def test_create_project_blank(engines, tmp_path):
     assert "PythonScriptPlugin.PythonScriptLibrary" in rc_ini
     assert "bAllowAnyRemoteFunctionCall=False" in rc_ini
 
+    # Il bridge non chiama mai ExecuteConsoleCommand via web API: quel gate
+    # resta chiuso. I comandi console partono da dentro Python.
+    assert "bAllowConsoleCommandRemoteExecution=False" in rc_ini
+    assert "bAllowConsoleCommandRemoteExecution=True" not in rc_ini
+
     init_py = (root / "Content/Python/init_unreal.py").read_text(encoding="utf-8")
     assert "WebControl.StartServer" in init_py
 
@@ -142,12 +164,12 @@ def test_create_project_con_gamemode_e_mappa(engines, tmp_path):
     result = local.create_project(
         "MyGame",
         str(tmp_path / "Projects"),
-        default_map="/Game/MyGame/Levels/L_Cortile",
+        default_map="/Game/MyGame/Levels/L_Main",
         default_game_mode="/Game/MyGame/Blueprints/BP_GM.BP_GM_C",
         plugins=["ModelingToolsEditorMode", "GameplayAbilities"],
     )
     root = Path(result["root"])
-    assert "GameDefaultMap=/Game/MyGame/Levels/L_Cortile" in (
+    assert "GameDefaultMap=/Game/MyGame/Levels/L_Main" in (
         root / "Config/DefaultEngine.ini"
     ).read_text(encoding="utf-8")
     assert "GlobalDefaultGameMode=/Game/MyGame/Blueprints/BP_GM.BP_GM_C" in (

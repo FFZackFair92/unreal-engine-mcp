@@ -1,0 +1,68 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most failures happen inside the Unreal editor rather than in the server,
+        so the traceback the bridge returns is usually far more useful than the
+        one-line summary. Please paste it in full.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Tool calls that reproduce it
+      description: The smallest sequence you found. Include the arguments.
+      placeholder: |
+        1. ue_editor_open(uproject="...")
+        2. ue_spawn_actor(class_ref="...", location=[0,0,0])
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Full error or traceback
+      render: text
+
+  - type: input
+    id: engine
+    attributes:
+      label: Unreal Engine version
+      placeholder: "5.8.0 — or 'custom build from source'"
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Desktop, Claude Code, Cursor, VS Code, custom agent…
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python version
+      placeholder: "Windows 11, Python 3.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of ue_status
+      description: >
+        It reports the engine version and the `capabilities` detected at
+        runtime, which is what decides whether a tool is available at all.
+      render: json

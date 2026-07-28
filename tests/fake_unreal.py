@@ -55,6 +55,10 @@ class Transform(FakeObject):
 
 
 class LinearColor(FakeObject):
+    def __init__(self, r=0.0, g=0.0, b=0.0, a=1.0):
+        super().__init__()
+        self.r, self.g, self.b, self.a = float(r), float(g), float(b), float(a)
+
     @staticmethod
     def static_struct():
         return "StructLinearColor"
@@ -68,6 +72,23 @@ Vector.static_struct = staticmethod(_static_struct_for("Vector"))
 Rotator.static_struct = staticmethod(_static_struct_for("Rotator"))
 
 
+class ActorComponent(FakeObject):
+    def __init__(self, name="Component", class_name="ActorComponent"):
+        super().__init__()
+        self._name = name
+        self._class_name = class_name
+        self.materials = {}
+
+    def get_name(self):
+        return self._name
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._class_name)
+
+    def set_material(self, slot, material):
+        self.materials[int(slot)] = material
+
+
 class Actor(FakeObject):
     def __init__(self, class_name="Actor", label="Actor_0"):
         super().__init__()
@@ -76,6 +97,13 @@ class Actor(FakeObject):
         self._location = Vector()
         self._rotation = Rotator()
         self._scale = Vector(1, 1, 1)
+        # Ogni attore ha almeno un mesh component, come StaticMeshActor.
+        self._components = [
+            ActorComponent("StaticMeshComponent0", "StaticMeshComponent")
+        ]
+
+    def get_components_by_class(self, cls):
+        return list(self._components)
 
     # API Unreal
     def get_actor_label(self):
@@ -191,6 +219,67 @@ class PlayNetMode:
     PIE_Client = "PIE_Client"
 
 
+class Material(FakeObject):
+    pass
+
+
+class MaterialInstanceConstant(FakeObject):
+    pass
+
+
+class MaterialFactoryNew(FakeObject):
+    pass
+
+
+class MaterialInstanceConstantFactoryNew(FakeObject):
+    pass
+
+
+class MaterialExpressionTextureSampleParameter2D(FakeObject):
+    pass
+
+
+class MaterialExpressionScalarParameter(FakeObject):
+    pass
+
+
+class Texture2D(FakeObject):
+    pass
+
+
+class MaterialProperty:
+    MP_BASE_COLOR = "MP_BASE_COLOR"
+    MP_METALLIC = "MP_METALLIC"
+    MP_SPECULAR = "MP_SPECULAR"
+    MP_ROUGHNESS = "MP_ROUGHNESS"
+    MP_EMISSIVE_COLOR = "MP_EMISSIVE_COLOR"
+    MP_OPACITY = "MP_OPACITY"
+    MP_OPACITY_MASK = "MP_OPACITY_MASK"
+    MP_NORMAL = "MP_NORMAL"
+    MP_AMBIENT_OCCLUSION = "MP_AMBIENT_OCCLUSION"
+
+
+class MaterialSamplerType:
+    SAMPLERTYPE_NORMAL = "SAMPLERTYPE_NORMAL"
+    SAMPLERTYPE_COLOR = "SAMPLERTYPE_COLOR"
+
+
+class ScopedEditorTransaction:
+    """Registra le transazioni aperte, per verificare che le modifiche siano annullabili."""
+
+    opened: list = []
+
+    def __init__(self, description):
+        self.description = description
+
+    def __enter__(self):
+        ScopedEditorTransaction.opened.append(self.description)
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
 class _World:
     def __init__(self, state):
         self._state = state
@@ -219,9 +308,14 @@ def build_fake_unreal(tmp_path):
         SoundCue, SoundWave, MetaSoundSource, BlueprintFactory, SoundCueFactoryNew,
         MetaSoundSourceFactory, AssetImportTask, FbxImportUI, AddNewSubobjectParams,
         EdGraphPinType, BPVariableDescription, LevelEditorPlaySettings, LifetimeCondition,
-        PlayNetMode,
+        PlayNetMode, ActorComponent, Material, MaterialInstanceConstant, MaterialFactoryNew,
+        MaterialInstanceConstantFactoryNew, MaterialExpressionTextureSampleParameter2D,
+        MaterialExpressionScalarParameter, Texture2D, MaterialProperty, MaterialSamplerType,
+        ScopedEditorTransaction,
     ):
         setattr(module, cls.__name__, cls)
+
+    ScopedEditorTransaction.opened = []
 
     # classi comuni risolte per nome (mcp_resolve_class usa hasattr(unreal, ref))
     for name in (
@@ -384,12 +478,60 @@ def build_fake_unreal(tmp_path):
     def set_instance_editable(blueprint, variable_name, editable):
         _vars(blueprint)[str(variable_name)]["editable"] = bool(editable)
 
+    def reparent_blueprint(blueprint, new_parent):
+        blueprint.parent = new_parent
+        state.setdefault("reparented", []).append((blueprint.path, str(new_parent)))
+        # Unreal assorbe le variabili che coincidono con una UPROPERTY del padre:
+        # qui simuliamo l'assorbimento di quelle che iniziano per "Parent".
+        for nome in [n for n in _vars(blueprint) if n.startswith("Parent")]:
+            del _vars(blueprint)[nome]
+
+    def remove_unused_variables(blueprint):
+        state.setdefault("cleaned", []).append(blueprint.path)
+
     module.BlueprintEditorLibrary = types.SimpleNamespace(
         compile_blueprint=lambda bp: state["saved"].append("compiled:" + bp.path),
         add_member_variable=add_member_variable,
         list_member_variable_names=lambda bp: [Name(n) for n in _vars(bp)],
         set_blueprint_variable_replication=set_replication,
         set_blueprint_variable_instance_editable=set_instance_editable,
+        reparent_blueprint=reparent_blueprint,
+        remove_unused_variables=remove_unused_variables,
+    )
+
+    # ---- materiali
+    def create_material_expression(materiale, cls, x, y):
+        nodo = cls()
+        materiale._props.setdefault("_expressions", []).append(nodo)
+        return nodo
+
+    def connect_material_property(nodo, pin, proprieta):
+        nodo.set_editor_property("_connected_to", proprieta)
+        state.setdefault("material_links", []).append(str(proprieta))
+        return True
+
+    module.MaterialEditingLibrary = types.SimpleNamespace(
+        create_material_expression=create_material_expression,
+        connect_material_property=connect_material_property,
+        recompile_material=lambda m: state["saved"].append("recompiled-material"),
+        set_material_instance_parent=lambda inst, parent: inst.set_editor_property("parent", parent),
+        set_material_instance_scalar_parameter_value=lambda i, n, v: i.set_editor_property(str(n), v),
+        set_material_instance_vector_parameter_value=lambda i, n, v: i.set_editor_property(str(n), v),
+        set_material_instance_texture_parameter_value=lambda i, n, v: i.set_editor_property(str(n), v),
+        set_material_instance_static_switch_parameter_value=lambda i, n, v: i.set_editor_property(str(n), v),
+    )
+
+    # ---- screenshot
+    def take_high_res_screenshot(width, height, filename):
+        state.setdefault("screenshots", []).append(filename)
+        import os as _os
+
+        _os.makedirs(_os.path.dirname(filename), exist_ok=True)
+        with open(filename, "wb") as handle:
+            handle.write(b"\x89PNG fake")
+
+    module.AutomationLibrary = types.SimpleNamespace(
+        take_high_res_screenshot=take_high_res_screenshot
     )
     module.BlueprintVariableReplication = types.SimpleNamespace(
         NONE="NONE", REPLICATED="REPLICATED", REP_NOTIFY="REP_NOTIFY"
@@ -432,6 +574,7 @@ def build_fake_unreal(tmp_path):
         project_content_dir=lambda: str(tmp_path / "Content"),
         project_config_dir=lambda: str(config_dir),
         project_log_dir=lambda: str(log_dir),
+        project_saved_dir=lambda: str(tmp_path / "Saved"),
     )
 
     _defaults = {}

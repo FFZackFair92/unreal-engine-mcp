@@ -23,8 +23,8 @@ Il livello locale esiste perché la Remote Control API funziona **solo con un
 editor già aperto**: creare un progetto, avviarlo, compilare e produrre il
 pacchetto sono tutte operazioni a livello di processo.
 
-- **49 tool** — [riferimento completo](docs/TOOLS.it.md)
-- **91 test**, nessuno dei quali richiede Unreal installato
+- **58 tool** — [riferimento completo](docs/TOOLS.it.md)
+- **138 test**, nessuno dei quali richiede Unreal installato
 - **[Note sull'automazione di Unreal](docs/UNREAL-NOTES.md)** — le trappole delle API trovate sul campo
 
 ---
@@ -34,8 +34,10 @@ pacchetto sono tutte operazioni a livello di processo.
 - Unreal Engine **5.0 o successivo** (sviluppato e provato su 5.8 — vedi
   [compatibilità con le versioni](#compatibilit%C3%A0-con-le-versioni-di-unreal))
 - Python 3.10+
-- Windows per il livello locale (gestione processi e script di build sono
-  specifici di Windows). Il livello editor è indipendente dalla piattaforma.
+- Windows, Linux o macOS. Lo sviluppo avviene su Windows, dove il livello locale
+  è più collaudato; i percorsi Linux e macOS (`Build.sh`, `RunUAT.sh`, `pgrep`)
+  ci sono e la CI li esegue, ma hanno meno chilometri alle spalle. Il livello
+  editor è indipendente dalla piattaforma.
 
 ### Compatibilità con le versioni di Unreal
 
@@ -171,9 +173,9 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
    bAutoStartWebSocketServer=True
    RemoteControlHttpServerPort=30010
    bEnableRemotePythonExecution=True
-   bAllowConsoleCommandRemoteExecution=True
    bAllowAnyRemoteFunctionCall=False
    +CustomAllowedRemoteFunctionCalls=(ClassPath="/Script/PythonScriptPlugin.PythonScriptLibrary")
+   bAllowConsoleCommandRemoteExecution=False
    ```
 
    Sono **due controlli distinti** — uno sblocca l'oggetto, l'altro la chiamata
@@ -187,6 +189,18 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
    Il server ascolta solo su `127.0.0.1`: l'esecuzione Python remota non è
    raggiungibile da fuori dalla macchina.
 
+   Cosa può fare il server una volta collegato, e come aprirlo in sicurezza se
+   davvero ti serve raggiungere l'editor da un'altra macchina, sta in
+   [SECURITY.md](SECURITY.md).
+
+   `bAllowConsoleCommandRemoteExecution` resta **disattivo**. Abilita
+   `ExecuteConsoleCommand` *via web API*, che questo server non chiama mai: i
+   comandi console che gli servono (`LiveCoding.Compile`,
+   `WebControl.StartServer`, `HighResShot`) partono da dentro Python con
+   `unreal.SystemLibrary.execute_console_command` e non passano da quel
+   controllo. Le versioni precedenti di questo progetto lo mettevano a `True`;
+   sui progetti esistenti si può portare a `False` senza perdere nulla.
+
 3. **Verifica**: apri `http://127.0.0.1:30010/remote/info` nel browser. Se
    risponde con del JSON, sei collegato.
 
@@ -196,24 +210,50 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 |---|---|
 | **Progetti** | Trova le installazioni del motore, crea progetti da specifica, gestisce i plugin |
 | **Ciclo di vita editor** | Apertura (attendendo il bridge), stato, chiusura pulita |
+| **C++** | Genera classi compilabili con il boilerplate scritto giusto, poi ci riaggancia i Blueprint |
 | **Compilazione** | C++ in background; `ue_live_compile` ricompila **a editor aperto** via Live Coding |
 | **Pacchetto** | `RunUAT BuildCookRun` → eseguibile autonomo, con indicazione della fase |
 | **Asset** | Import `.glb`/`.gltf`/`.fbx`/`.wav`, elenco e ricerca nel Content Browser |
-| **Livelli** | Creazione e apertura, spawn/spostamento/eliminazione attori |
-| **Blueprint** | Creazione, componenti, variabili tipizzate con replication, class defaults, compilazione |
+| **Livelli** | Creazione e apertura, spawn (anche in blocco), spostamento, eliminazione, proprietà sugli attori piazzati |
+| **Materiali** | Costruzione del grafo, collegamento delle texture PBR, material instance, assegnazione agli attori |
+| **Blueprint** | Creazione, componenti, variabili tipizzate con replication, class defaults, reparent, compilazione |
 | **Networking** | Flag di replication, PIE multi-client, impostazioni di progetto |
 | **Audio** | Import wav, MetaSound source, Sound Cue |
 | **Asset gratuiti** | Download da Poly Haven, ambientCG e Kenney (tutti CC0), più qualunque URL diretto |
+| **Riscontro visivo** | `ue_screenshot` cattura la viewport: l'agente vede cosa ha costruito |
 
 Elenco completo dei parametri in [docs/TOOLS.it.md](docs/TOOLS.it.md).
 
-### Limiti noti
+### Aggirare il limite sui grafi Blueprint
 
-- **I grafi Blueprint non si possono costruire.** UE 5.8 non espone l'editing dei
-  grafi a Python: `EdGraph.Nodes` è protetta, i pin non sono esposti e non esiste
-  un'API per collegarli. Variabili, componenti e default sono programmabili; la
-  logica va in C++ o costruita a mano nell'editor. Dettagli in
-  [docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+**I grafi Blueprint non si possono costruire da Python.** `EdGraph.Nodes` è
+protetta, i pin non sono esposti e non esiste un'API per collegarli: è un limite
+del motore, non di questo server. Dettagli in
+[docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+
+Quello che funziona: **mettere la logica in una classe C++ padre.** Il Blueprint
+resta il contenitore di componenti e valori regolabili, il comportamento si
+eredita.
+
+```
+ue_cpp_class_create      # scrive la classe, e l'intero modulo C++ se il
+                         # progetto era Blueprint-only
+ue_editor_close
+ue_build_start           # poi ue_build_status finché running=false
+ue_editor_open
+ue_reparent_blueprint    # il Blueprint eredita il comportamento
+```
+
+Le variabili Blueprint con lo stesso nome di una `UPROPERTY` del nuovo padre
+vengono assorbite, quindi i valori impostati nell'editor sopravvivono al
+passaggio. Le funzioni `BlueprintCallable` diventano nodi richiamabili dal
+grafo: l'agente costruisce il vocabolario che poi il designer collega a mano.
+
+I grafi *materiale*, a differenza di quelli Blueprint, sono pienamente
+programmabili: `ue_create_material` crea e collega davvero i nodi.
+
+### Altri limiti
+
 - **Compilare il C++ richiede l'editor chiuso**, a meno che la modifica tocchi
   solo il corpo delle funzioni: in quel caso `ue_live_compile` funziona a editor
   aperto.
@@ -249,12 +289,17 @@ tool → snippet → harness → risultato.
 ```bash
 pip install -e ".[dev]"
 pytest -q
+ruff check .
 ```
 
 Per aggiungere un tool: un helper riutilizzabile in `src/unreal_mcp/ue_side.py`
 (lato editor), una funzione `@mcp.tool()` in `server.py` e un test in `tests/`.
-`ue_side.py` viene riletto da disco a ogni chiamata, quindi le modifiche lato
-editor hanno effetto senza riavviare il server; quelle a `server.py` o `local.py`
+Le convenzioni che conviene conoscere stanno in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+`ue_side.py` viene installato come modulo dentro l'editor e identificato
+dall'hash del suo sorgente: le modifiche lato editor hanno effetto alla chiamata
+successiva senza riavviare il server, e tutte le altre chiamate sono solo un
+piccolo snippet che lo importa. Le modifiche a `server.py` o `local.py`
 richiedono un riavvio del client.
 
 ## Problemi comuni
@@ -268,6 +313,7 @@ richiedono un riavvio del client.
 | `NameError: name 'unreal' is not defined` | Plugin *Python Editor Script Plugin* non abilitato |
 | `Unable to build while Live Coding is active` | `LiveCodingConsole.exe` sopravvive all'editor: va terminato (i tool di build lo fanno da soli) |
 | `Nessuna installazione di Unreal Engine trovata` | Imposta `UE_MCP_ENGINE_DIRS`, aggiungi `mcp_engine.txt`, o passa `engine_root` |
+| `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` | È installata la `mcp` 2.x, mentre questo server usa la linea 1.x. `pip install "mcp<2"` — reinstallare il pacchetto lo fa da solo |
 
 ## Licenza
 

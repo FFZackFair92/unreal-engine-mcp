@@ -1,6 +1,6 @@
 # Riferimento dei tool
 
-49 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
+58 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
 
 **Livello locale** — gira come processo sulla tua macchina. Trova i motori, crea
 progetti, apre e chiude l'editor, compila il C++, produce il pacchetto, scarica
@@ -33,6 +33,26 @@ path degli asset seguono la convenzione Unreal (`/Game/...`).
 | `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args` | Avvia l'editor e **attende che il bridge risponda**, così la chiamata successiva è sicura. Il primo avvio compila gli shader e può durare minuti. |
 | `ue_editor_status` | — | Se il processo editor è vivo (anche se avviato a mano), se Live Coding è attivo, se il bridge risponde. |
 | `ue_editor_close` | `save_all`, `force` | Chiusura pulita: salva, poi `quit_editor` via bridge. Ripiega sulla terminazione del processo. |
+
+## C++ (locale)
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_cpp_class_create` | `uproject`, `class_name`, `parent_class`, `module`, `properties`, `functions`, `with_tick`, `force` | Genera una classe compilabile col boilerplate Unreal scritto giusto: `UCLASS`, `GENERATED_BODY`, macro `MODULO_API`, header del parent corretto (`AIController.h` non sta sotto `GameFramework/`) e prefisso `A`/`U` secondo la gerarchia. Le proprietà replicate ottengono anche `GetLifetimeReplicatedProps` e i `DOREPLIFETIME` — dimenticarli non dà errori, semplicemente la replication non avviene. Se il progetto è Blueprint-only, viene creato l'intero modulo C++. |
+
+Le voci di `properties` accettano `name`, `type` e, opzionali, `category`,
+`default`, `replicated`, `rep_notify`, `read_only`. Quelle di `functions`
+accettano `name`, `return_type`, `params`, `specifiers` (default
+`BlueprintCallable`) e `body`: una funzione `BlueprintCallable` diventa
+richiamabile dai grafi Blueprint, ed è così che la logica generata arriva nelle
+mani di un designer.
+
+È l'aggiramento del limite sui grafi Blueprint. Flusso completo:
+
+```
+ue_cpp_class_create → ue_editor_close → ue_build_start
+→ ue_build_status (finché running=false) → ue_editor_open → ue_reparent_blueprint
+```
 
 ## Compilazione e pacchetto (locale)
 
@@ -71,9 +91,15 @@ timeout MCP. Partono e si consulta il tool di stato.
 | Tool | Parametri | Cosa fa |
 |---|---|---|
 | `ue_spawn_actor` | `class_ref`, `location`, `rotation`, `scale`, `label` | Spawna da nome di classe, path `/Script/...`, path di un Blueprint o asset static mesh. La `label` è il modo con cui gli altri tool lo ritrovano. |
+| `ue_spawn_many` | `actors` | Spawna una lista di attori in **una sola chiamata e una sola transazione**. Ogni voce è `{class_ref, location, rotation, scale, label}`. Una voce che fallisce viene segnalata senza perdere le altre. |
 | `ue_list_actors` | `name_contains`, `class_contains` | Elenca gli attori del livello, con filtri opzionali. |
 | `ue_set_actor_transform` | `label`, `location`, `rotation`, `scale` | Sposta, ruota e scala un attore identificato dalla label. |
+| `ue_set_actor_property` | `label`, `properties`, `component` | Imposta proprietà su un attore **già piazzato** o su un suo componente: la mesh, l'intensità di una luce, il raggio di un trigger. I vettori sono `{"x":…}`, i colori `{"r":…}`, e le stringhe `/Game/...` vengono caricate come asset. |
+| `ue_list_actor_components` | `label` | Componenti di un attore piazzato, con nome e classe: dice cosa passare come `component` qui sopra. |
 | `ue_delete_actor` | `label` | Rimuove un attore dal livello. |
+
+Le modifiche agli attori sono avvolte in `ScopedEditorTransaction`: tutto quello
+qui sopra è annullabile con Ctrl+Z da chi sta guardando l'editor.
 
 ## Blueprint (editor)
 
@@ -83,13 +109,33 @@ timeout MCP. Partono e si consulta il tool di stato.
 | `ue_add_component` | `blueprint_path`, `component_class`, `name` | Aggiunge un componente tramite `SubobjectDataSubsystem` e ricompila. |
 | `ue_add_variable` | `blueprint_path`, `var_name`, `var_type`, `sub_type`, `replicated`, `instance_editable`, `default_value` | Variabile membro tipizzata, con flag di replication ed esposizione sulle istanze. Tipi: `bool`, `int`, `int64`, `float`, `string`, `name`, `text`, `byte`, `struct`, `object`, `class`. **UE 5.4+** — i motori precedenti non hanno l'API Python per farlo; il tool fallisce con un messaggio esplicito. |
 | `ue_set_class_defaults` | `blueprint_path`, `properties` | Scrive i Class Defaults sul CDO. |
+| `ue_reparent_blueprint` | `blueprint_path`, `new_parent`, `remove_unused_variables` | Riassegna la classe padre, tipicamente a una classe C++ generata. Le variabili che coincidono con una `UPROPERTY` del nuovo padre vengono assorbite; le altre sopravvivono rinominate con `_0`. Riporta quali sono state assorbite. |
 | `ue_compile_blueprint` | `blueprint_path` | Compila e salva. |
 | `ue_set_replication` | `blueprint_path`, `replicates`, `replicate_movement`, `always_relevant` | Flag di rete sul CDO. |
 
 **Non supportato: costruire i grafi Blueprint.** UE 5.8 non lo espone a Python —
 `EdGraph.Nodes` è protetta, i tipi dei pin non sono esposti e non esiste un'API
-per collegarli. Questi tool coprono variabili, componenti e default; la logica va
-in C++ o costruita a mano nell'editor. Vedi [UNREAL-NOTES.md](UNREAL-NOTES.md).
+per collegarli. La via d'uscita non è programmare il grafo ma non averne bisogno:
+si genera una classe C++ padre con `ue_cpp_class_create`, si compila e ci si
+riaggancia il Blueprint con `ue_reparent_blueprint`. Vedi
+[UNREAL-NOTES.md](UNREAL-NOTES.md).
+
+## Materiali (editor)
+
+A differenza dei grafi Blueprint, **i grafi materiale sono pienamente
+programmabili**: questi tool creano e collegano davvero i nodi.
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_create_material` | `package_path`, `name`, `textures`, `scalars`, `two_sided` | Crea un materiale e collega le texture ai canali PBR (`base_color`, `normal`, `roughness`, `metallic`, `ambient_occlusion`, `emissive`, `opacity`). Con la chiave `"auto"` il canale si deduce dal nome del file — segue le convenzioni di ambientCG e Poly Haven, quindi gli asset scaricati si collegano da soli. Le normal map ricevono sRGB spento e il sampler giusto. |
+| `ue_create_material_instance` | `package_path`, `name`, `parent_path`, `parameters` | Material Instance da un materiale padre. Un numero è uno scalare, `{"r","g","b"}` un colore, un bool uno static switch, un path `/Game/...` una texture. |
+| `ue_assign_material` | `label`, `material_path`, `slot`, `component` | Assegna un materiale a un attore piazzato. |
+
+## Screenshot (editor)
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_screenshot` | `filename`, `width`, `height` | Cattura la viewport dell'editor in un PNG sotto `<Progetto>/Saved/Screenshots/MCP` e ne restituisce il percorso. La cattura avviene uno o due frame dopo, quindi il tool attende il file e segnala se non è mai comparso. |
 
 ## Play In Editor (editor)
 

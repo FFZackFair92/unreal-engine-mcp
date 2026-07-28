@@ -1,18 +1,57 @@
 [project]
 name = "unreal-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "FFZackFair92" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "unreal-engine",
+    "unreal",
+    "ue5",
+    "gamedev",
+    "llm",
+    "agent",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Games/Entertainment",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
+    # Pinned to the 1.x line: v2 renamed FastMCP to MCPServer and moved it to
+    # mcp.server.mcpserver, so `from mcp.server.fastmcp import FastMCP` raises
+    # ModuleNotFoundError there. 1.x is still actively released alongside 2.x.
     "mcp>=1.2.0,<2",
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://github.com/FFZackFair92/unreal-engine-mcp"
+Repository = "https://github.com/FFZackFair92/unreal-engine-mcp"
+Issues = "https://github.com/FFZackFair92/unreal-engine-mcp/issues"
+Changelog = "https://github.com/FFZackFair92/unreal-engine-mcp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -25,6 +64,66 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/unreal_mcp"]
 
+[tool.hatch.build.targets.sdist]
+# StarterProject is referenced from the README as the zero-setup path, and
+# README.it.md is linked from the first line of README.md — leaving them out
+# makes the PyPI page point at files that are not in the archive.
+include = [
+    "src",
+    "tests",
+    "docs",
+    "StarterProject",
+    "README.md",
+    "README.it.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["StarterProject"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "S",    # bandit
+    "N",    # pep8-naming
+    "BLE",  # blind except — deliberate here, but each one is marked
+    "RUF",
+]
+ignore = [
+    "E501",    # long lines are a formatting concern, not a correctness one
+    "S101",    # asserts are the point in tests
+    "RUF001",  # ambiguous unicode: Italian prose in docstrings
+    "RUF002",
+    "RUF003",
+    "B008",
+    # ue_side.py is sent as source into the editor's own interpreter; %-format
+    # keeps it readable next to the Unreal API docs, which use the same style.
+    "UP031",
+    # The build tools (tasklist, pgrep, taskkill) are resolved from PATH on
+    # purpose: hardcoding absolute paths would break across Windows versions.
+    "S607",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ue_side.py runs inside the editor, where `unreal` is injected as a global.
+"src/unreal_mcp/ue_side.py" = ["F821"]
+# UnrealNotConnected is part of the public API; renaming it would be a breaking
+# change for no gain, and it already subclasses UnrealBridgeError.
+"src/unreal_mcp/bridge.py" = ["N818"]
+# The fakes mimic Unreal's and http.server's naming, which is not PEP 8, and
+# the suite deliberately execs generated snippets — that is what it tests.
+"tests/*" = ["N802", "N803", "N806", "N815", "S102", "S108", "S603", "RUF012"]

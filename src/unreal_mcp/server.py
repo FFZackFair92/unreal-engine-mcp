@@ -7,6 +7,7 @@ tramite la Remote Control API. Vedi README.md per l'attivazione dei plugin.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +22,11 @@ from .bridge import (
 )
 
 mcp = FastMCP(
+    # `name` posizionale, tutto il resto per keyword. In mcp 2 il costruttore
+    # ha inserito `title` e `description` prima di `instructions`: passarle per
+    # posizione le farebbe finire nel titolo in silenzio, e il modello non le
+    # riceverebbe più. Vale la pena rispettarlo anche restando sulla 1.x, così
+    # una futura migrazione non cambia questa riga.
     "unreal-mcp",
     instructions=(
         "Drive Unreal Engine 5 on two levels: "
@@ -32,7 +38,12 @@ mcp = FastMCP(
         "On a running editor, always call ue_status first. "
         "Asset paths follow the Unreal convention (/Game/...); positions are in centimetres "
         "(1 unit = 1 cm) with Z up. Compiling C++ needs the editor closed (ue_build_start), "
-        "unless the change only touches function bodies (ue_live_compile)."
+        "unless the change only touches function bodies (ue_live_compile). "
+        "Blueprint node graphs cannot be scripted: put logic in a C++ parent class "
+        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). Material graphs, on the "
+        "other hand, are fully scriptable (ue_create_material). "
+        "Use ue_screenshot to actually look at what you built instead of inferring it "
+        "from coordinates, and ue_spawn_many when placing more than a few actors."
     ),
 )
 
@@ -88,9 +99,11 @@ async def ue_engine_list() -> dict:
 
 
 @mcp.tool()
-async def ue_engine_templates(engine_version: str | None = None) -> dict:
+async def ue_engine_templates(
+    engine_version: str | None = None, engine_root: str | None = None
+) -> dict:
     """Elenca i template ufficiali disponibili nell'installazione (TP_Blank, TP_ThirdPerson, ...)."""
-    engine = local_call(local.resolve_engine, engine_version)
+    engine = local_call(local.resolve_engine, engine_version, engine_root)
     return {"engine": engine.version, "templates": local_call(local.list_templates, engine)}
 
 
@@ -106,6 +119,7 @@ async def ue_project_create(
     default_game_mode: str | None = None,
     description: str = "",
     force: bool = False,
+    engine_root: str | None = None,
 ) -> dict:
     """Crea un progetto Unreal da specifica, pronto per il bridge MCP.
 
@@ -124,12 +138,15 @@ async def ue_project_create(
         default_map: mappa di avvio, es. "/Game/MyGame/Levels/L_Main".
         default_game_mode: GameMode di default (path della classe `..._C`).
         force: procede anche se la cartella di destinazione esiste già.
+        engine_root: percorso del motore, quando la ricerca automatica non lo trova
+            (es. "C:/Program Files/Epic Games/UE_5.8").
     """
     return local_call(
         local.create_project,
         name=name,
         directory=directory,
         engine_version=engine_version,
+        engine_root=engine_root,
         template=template,
         blueprint_only=blueprint_only,
         plugins=plugins,
@@ -171,6 +188,7 @@ async def ue_editor_open(
     engine_version: str | None = None,
     wait_seconds: int = 240,
     extra_args: list[str] | None = None,
+    engine_root: str | None = None,
 ) -> dict:
     """Apre un progetto nell'editor e attende che il bridge Remote Control risponda.
 
@@ -180,11 +198,15 @@ async def ue_editor_open(
         wait_seconds: quanto attendere l'apertura (il primo avvio compila gli shader
             e può richiedere diversi minuti; con 0 non attende).
         extra_args: argomenti aggiuntivi per la riga di comando dell'editor.
+        engine_root: percorso del motore, quando non è registrato nel sistema.
     """
-    launched = local_call(local.launch_editor, uproject, engine_version, extra_args)
+    # L'editor riparte da zero: gli helper installati nella sessione precedente
+    # non ci sono più.
+    _bridge.forget_helpers()
+    launched = local_call(local.launch_editor, uproject, engine_version, extra_args, engine_root)
 
     if wait_seconds <= 0:
-        return {**launched, "bridge_ready": False, "nota": "avvio non atteso"}
+        return {**launched, "bridge_ready": False, "note": "launch not awaited"}
 
     deadline = asyncio.get_event_loop().time() + wait_seconds
     while asyncio.get_event_loop().time() < deadline:
@@ -198,12 +220,65 @@ async def ue_editor_open(
     return {
         **launched,
         "bridge_ready": False,
-        "nota": (
-            "Editor avviato ma il bridge non ha risposto entro %d s. Al primo avvio la "
-            "compilazione degli shader è lunga: riprova con ue_status fra qualche minuto."
-            % wait_seconds
+        "note": (
+            "Editor launched but the bridge did not answer within %d s. The first "
+            "launch compiles shaders and takes a while: retry with ue_status in a "
+            "few minutes." % wait_seconds
         ),
     }
+
+
+@mcp.tool()
+async def ue_cpp_class_create(
+    uproject: str,
+    class_name: str,
+    parent_class: str = "Actor",
+    module: str | None = None,
+    properties: list[dict] | None = None,
+    functions: list[dict] | None = None,
+    with_tick: bool = False,
+    force: bool = False,
+) -> dict:
+    """Genera una classe C++ compilabile nel modulo del progetto.
+
+    È la risposta al limite principale di questo MCP: i grafi Blueprint non
+    sono scrivibili da Python, ma la logica può stare in C++ e arrivare ai
+    Blueprint per ereditarietà. Flusso completo:
+
+        ue_cpp_class_create -> ue_editor_close -> ue_build_start ->
+        ue_build_status (finché running=false) -> ue_editor_open ->
+        ue_reparent_blueprint
+
+    Se il progetto è Blueprint-only, il modulo C++ (Build.cs, Target.cs,
+    IMPLEMENT_PRIMARY_GAME_MODULE, voce Modules nel .uproject) viene creato.
+
+    Args:
+        uproject: percorso del file .uproject.
+        class_name: nome senza prefisso, es. "DoorBase" -> ADoorBase.
+        parent_class: "Actor", "Pawn", "Character", "ActorComponent",
+            "GameModeBase", "PlayerState", ...
+        module: nome del modulo C++; default il nome del progetto.
+        properties: lista di dict con `name`, `type` (es. "float", "FVector",
+            "TObjectPtr<AActor>"), e opzionali `category`, `default`,
+            `replicated`, `rep_notify`, `read_only`. Le proprietà replicate
+            generano anche GetLifetimeReplicatedProps e i DOREPLIFETIME.
+        functions: lista di dict con `name`, `return_type`, `params`,
+            `specifiers` (default BlueprintCallable), `body`. Le funzioni
+            BlueprintCallable diventano chiamabili dai grafi Blueprint.
+        with_tick: abilita il Tick (di default è spento, come conviene).
+        force: sovrascrive i file se esistono già.
+    """
+    return local_call(
+        local.create_cpp_class,
+        uproject=uproject,
+        class_name=class_name,
+        parent_class=parent_class,
+        module=module,
+        properties=properties,
+        functions=functions,
+        with_tick=with_tick,
+        force=force,
+    )
 
 
 @mcp.tool()
@@ -212,6 +287,7 @@ async def ue_build_start(
     engine_version: str | None = None,
     target: str | None = None,
     configuration: str = "Development",
+    engine_root: str | None = None,
 ) -> dict:
     """Avvia la compilazione del modulo C++ del progetto (in background).
 
@@ -225,8 +301,18 @@ async def ue_build_start(
         engine_version: forza una versione del motore diversa da quella associata.
         target: default "<Progetto>Editor".
         configuration: "Development" | "DebugGame" | "Shipping".
+        engine_root: percorso del motore, quando non è registrato nel sistema
+            e la ricerca automatica non lo trova.
     """
-    return local_call(local.start_build, uproject, engine_version, target, "Win64", configuration)
+    return local_call(
+        local.start_build,
+        uproject,
+        engine_version,
+        target,
+        None,
+        configuration,
+        engine_root,
+    )
 
 
 @mcp.tool()
@@ -259,6 +345,8 @@ async def ue_package_start(
     output_dir: str | None = None,
     dedicated_server: bool = False,
     engine_version: str | None = None,
+    engine_root: str | None = None,
+    target_platform: str | None = None,
 ) -> dict:
     """Crea il pacchetto giocabile del gioco (cook + build + stage + pak).
 
@@ -277,16 +365,19 @@ async def ue_package_start(
             Se omesso cuoce secondo le impostazioni di progetto, che è più lento.
         output_dir: cartella di destinazione; default <Progetto>/Packaged.
         dedicated_server: produce anche un server dedicato per le partite LAN.
+        engine_root: percorso del motore, se la ricerca automatica non lo trova.
+        target_platform: "Win64" | "Linux" | "Mac"; default la piattaforma corrente.
     """
     return local_call(
         local.start_package,
         uproject,
         engine_version,
         configuration,
-        "Win64",
+        target_platform or local.default_target_platform(),
         maps,
         output_dir,
         dedicated_server,
+        engine_root,
     )
 
 
@@ -337,14 +428,21 @@ result = True
                 "import unreal\nunreal.SystemLibrary.quit_editor()\n"
             )
             await asyncio.sleep(3)
-            return {"closed": True, "mode": "pulita", "saved": save_all, **local_call(local.editor_status)}
+            _bridge.forget_helpers()
+            return {"closed": True, "mode": "clean", "saved": save_all, **local_call(local.editor_status)}
         except (UnrealBridgeError, RuntimeError) as exc:
             fallback_reason = str(exc)
     else:
         fallback_reason = "force=True"
 
     killed = local_call(local.kill_editor)
-    return {"closed": killed.get("killed", False), "mode": "processo terminato", "motivo": fallback_reason, **killed}
+    _bridge.forget_helpers()
+    return {
+        "closed": killed.get("killed", False),
+        "mode": "process terminated",
+        "reason": fallback_reason,
+        **killed,
+    }
 
 
 # =============================== livello LOCALE: download preset e asset
@@ -487,7 +585,8 @@ async def ue_status() -> dict:
 
 @mcp.tool()
 async def ue_read_log(lines: int = 80, only_errors: bool = False) -> dict:
-    """Legge la coda del log di Unreal (equivalente di read_console in Unity).
+    """Legge la coda del log di Unreal: è il modo per vedere cosa è andato storto
+    dopo un'operazione che non ha sollevato eccezioni.
 
     Args:
         lines: quante righe finali restituire (default 80).
@@ -537,7 +636,7 @@ async def ue_import_assets(
     Per i personaggi con scheletro usare .fbx con import_as_skeletal=True.
 
     Args:
-        files: percorsi assoluti sul disco (es. ["C:/tmp/four_corners_export/Arena_Tetto.glb"]).
+        files: percorsi assoluti sul disco (es. ["C:/Assets/Rocks/rock_01.glb"]).
         destination: cartella Unreal di destinazione (/Game/...).
         replace_existing: sovrascrive asset con lo stesso nome.
         import_as_skeletal: per .fbx, importa come Skeletal Mesh con animazioni.
@@ -638,6 +737,21 @@ async def ue_list_actors(
 
 
 @mcp.tool()
+async def ue_spawn_many(actors: list[dict]) -> dict:
+    """Spawna molti attori in una sola chiamata e in una sola transazione undo.
+
+    Costruire un livello con ue_spawn_actor costa un round-trip HTTP per attore:
+    per una scena di qualche decina di elementi conviene questo.
+
+    Args:
+        actors: lista di dict con `class_ref` (obbligatorio) e, opzionali,
+            `location` [x,y,z], `rotation` [pitch,yaw,roll], `scale` [x,y,z],
+            `label`. Esempio: [{"class_ref": "PointLight", "location": [0,0,300]}].
+    """
+    return await run(f"result = mcp_spawn_many({lit(actors)})")
+
+
+@mcp.tool()
 async def ue_set_actor_transform(
     label: str,
     location: list[float] | None = None,
@@ -646,33 +760,47 @@ async def ue_set_actor_transform(
 ) -> dict:
     """Modifica posizione/rotazione/scala di un attore identificato dalla sua label."""
     return await run(
-        f"""
-actor = mcp_actor_by_label({lit(label)})
-if actor is None:
-    raise ValueError("Nessun attore con label {label!r} nel livello corrente.")
-if {lit(location)} is not None:
-    actor.set_actor_location(mcp_to_vector({lit(location)}), False, False)
-if {lit(rotation)} is not None:
-    actor.set_actor_rotation(mcp_to_rotator({lit(rotation)}), False)
-if {lit(scale)} is not None:
-    actor.set_actor_scale3d(mcp_to_vector({lit(scale)}, (1.0, 1.0, 1.0)))
-result = mcp_actor_info(actor)
-"""
+        f"result = mcp_set_transform({lit(label)}, {lit(location)}, "
+        f"{lit(rotation)}, {lit(scale)})"
     )
+
+
+@mcp.tool()
+async def ue_set_actor_property(
+    label: str, properties: dict, component: str | None = None
+) -> dict:
+    """Imposta proprietà su un attore già piazzato, o su un suo componente.
+
+    Copre tutto ciò che non sono i Class Defaults di un Blueprint: assegnare
+    una mesh a uno StaticMeshActor, l'intensità di una luce, il raggio di un
+    trigger. I valori seguono il JSON: un vettore è {"x":0,"y":0,"z":0}, un
+    colore {"r":1,"g":0,"b":0}, e il path di un asset (/Game/...) viene
+    caricato in automatico.
+
+    Args:
+        label: etichetta dell'attore nell'Outliner.
+        properties: mappa nome_proprieta -> valore.
+        component: nome o classe del componente su cui scrivere
+            (es. "StaticMeshComponent"); se omesso scrive sull'attore.
+    """
+    return await run(
+        f"result = mcp_set_actor_property({lit(label)}, {lit(properties)}, {lit(component)})"
+    )
+
+
+@mcp.tool()
+async def ue_list_actor_components(label: str) -> dict:
+    """Elenca i componenti di un attore piazzato, con nome e classe.
+
+    Serve a sapere cosa passare come `component` a ue_set_actor_property.
+    """
+    return await run(f"result = mcp_actor_component_list({lit(label)})")
 
 
 @mcp.tool()
 async def ue_delete_actor(label: str) -> dict:
     """Elimina dal livello corrente l'attore con la label indicata."""
-    return await run(
-        f"""
-actor = mcp_actor_by_label({lit(label)})
-if actor is None:
-    raise ValueError("Nessun attore con label {label!r}.")
-mcp_actor_subsystem().destroy_actor(actor)
-result = {{"deleted": {lit(label)}}}
-"""
-    )
+    return await run(f"result = mcp_delete_actor({lit(label)})")
 
 
 # =================================================================== blueprint
@@ -760,6 +888,126 @@ async def ue_compile_blueprint(blueprint_path: str) -> dict:
     return await run(f"result = mcp_compile_blueprint({lit(blueprint_path)})")
 
 
+@mcp.tool()
+async def ue_reparent_blueprint(
+    blueprint_path: str, new_parent: str, remove_unused_variables: bool = False
+) -> dict:
+    """Riassegna il parent di un Blueprint, tipicamente a una classe C++.
+
+    È la via per dare logica eseguibile a un Blueprint: i grafi non sono
+    scrivibili da Python, ma la logica può stare nella classe C++ padre
+    (creata con ue_cpp_class_create) mentre il Blueprint resta il contenitore
+    di componenti e valori.
+
+    Le variabili del Blueprint con lo stesso nome di una UPROPERTY del nuovo
+    padre vengono assorbite; le altre sopravvivono rinominate con `_0`.
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/Blueprints/BP_Door".
+        new_parent: nome o path della nuova classe padre, es. "ADoorBase"
+            oppure "/Script/MyGame.DoorBase".
+        remove_unused_variables: ripulisce le variabili rimaste orfane.
+    """
+    return await run(
+        f"result = mcp_reparent_blueprint({lit(blueprint_path)}, {lit(new_parent)}, "
+        f"{bool(remove_unused_variables)})"
+    )
+
+
+# =================================================================== materiali
+
+
+@mcp.tool()
+async def ue_create_material(
+    package_path: str,
+    name: str,
+    textures: dict | None = None,
+    scalars: dict | None = None,
+    two_sided: bool = False,
+) -> dict:
+    """Crea un materiale collegando le texture ai canali PBR.
+
+    A differenza dei grafi Blueprint, il grafo *materiale* è pienamente
+    scriptabile: qui i nodi vengono creati e collegati davvero.
+
+    Args:
+        package_path: cartella, es. "/Game/MyGame/Materials".
+        name: nome asset, es. "M_Brick".
+        textures: mappa canale -> path della texture importata. Canali:
+            base_color, normal, roughness, metallic, ambient_occlusion,
+            emissive, opacity. Usa la chiave "auto" con il path per far
+            dedurre il canale dal nome file (convenzioni ambientCG/Poly Haven).
+        scalars: costanti sui canali senza texture, es. {"roughness": 0.4}.
+        two_sided: disattiva il backface culling.
+    """
+    return await run(
+        f"result = mcp_create_material({lit(package_path)}, {lit(name)}, "
+        f"{lit(textures)}, {lit(scalars)}, {bool(two_sided)})"
+    )
+
+
+@mcp.tool()
+async def ue_create_material_instance(
+    package_path: str, name: str, parent_path: str, parameters: dict | None = None
+) -> dict:
+    """Crea una Material Instance da un materiale padre e ne imposta i parametri.
+
+    Variare un materiale via istanza non ricompila il grafo: è la via
+    economica per avere molte varianti dello stesso materiale.
+
+    Args:
+        package_path: cartella di destinazione.
+        name: es. "MI_Brick_Red".
+        parent_path: materiale padre, es. "/Game/MyGame/Materials/M_Brick".
+        parameters: mappa nome -> valore. Numero = scalare, dict {"r","g","b"}
+            = colore, bool = static switch, path /Game/... = texture.
+    """
+    return await run(
+        f"result = mcp_create_material_instance({lit(package_path)}, {lit(name)}, "
+        f"{lit(parent_path)}, {lit(parameters)})"
+    )
+
+
+@mcp.tool()
+async def ue_assign_material(
+    label: str, material_path: str, slot: int = 0, component: str | None = None
+) -> dict:
+    """Assegna un materiale a un attore piazzato.
+
+    Args:
+        label: etichetta dell'attore nell'Outliner.
+        material_path: es. "/Game/MyGame/Materials/M_Brick".
+        slot: indice dello slot materiale sulla mesh.
+        component: componente su cui scrivere; default il primo MeshComponent.
+    """
+    return await run(
+        f"result = mcp_assign_material({lit(label)}, {lit(material_path)}, "
+        f"{int(slot)}, {lit(component)})"
+    )
+
+
+# ================================================================== screenshot
+
+
+@mcp.tool()
+async def ue_screenshot(
+    filename: str | None = None, width: int = 1280, height: int = 720
+) -> dict:
+    """Cattura la viewport dell'editor in un PNG e ne restituisce il percorso.
+
+    Senza questo l'agente costruisce alla cieca: è l'unico modo per verificare
+    davvero com'è venuta una scena invece di dedurlo dalle coordinate. Il file
+    finisce in <Progetto>/Saved/Screenshots/MCP.
+
+    Args:
+        filename: nome file; se omesso ne genera uno con il timestamp.
+        width, height: risoluzione della cattura.
+    """
+    return await run(
+        f"result = mcp_screenshot({lit(filename)}, {int(width)}, {int(height)})"
+    )
+
+
 # ================================================================== networking
 
 
@@ -770,7 +1018,8 @@ async def ue_set_replication(
     replicate_movement: bool = True,
     always_relevant: bool = False,
 ) -> dict:
-    """Configura la replication di un Blueprint (equivalente di NetworkObject in Unity)."""
+    """Configura la replication di un Blueprint: se e come viene sincronizzato
+    fra server e client in una partita in rete."""
     return await run(
         f"result = mcp_set_replication({lit(blueprint_path)}, {bool(replicates)}, "
         f"{bool(replicate_movement)}, {bool(always_relevant)})"
@@ -874,7 +1123,13 @@ except ImportError:
 
 def main() -> None:
     """Entry point stdio."""
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        # Il client httpx tiene aperta una connessione keep-alive verso
+        # l'editor: senza questo resta appesa alla chiusura del server.
+        with contextlib.suppress(Exception):
+            asyncio.run(_bridge.aclose())
 
 
 if __name__ == "__main__":

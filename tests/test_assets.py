@@ -1,13 +1,12 @@
 """Test del download preset: Poly Haven, ambientCG, Kenney, URL diretti, vault Fab."""
 
-import io
 import zipfile
 from pathlib import Path
 
 import pytest
+from fake_web import FakeWebServer
 
 from unreal_mcp import assets
-from fake_web import FakeWebServer
 
 
 @pytest.fixture

@@ -11,10 +11,11 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +140,7 @@ def _engines_from_registry() -> list[EngineInstall]:
     if platform.system() != "Windows":
         return []
     try:
-        import winreg  # noqa: PLC0415
+        import winreg
     except ImportError:
         return []
 
@@ -342,13 +343,18 @@ RemoteControlHttpServerPort={int(spec.get("remote_control_port", 30010))}
 
 ; Sblocca l'oggetto PythonScriptLibrary (FRemoteControlModule::CanBeAccessedRemotely).
 bEnableRemotePythonExecution=True
-bAllowConsoleCommandRemoteExecution=True
 
 ; Sblocca la chiamata di funzione (WebRemoteControlInternalUtils::ValidateFunctionCall).
 ; Allowlist mirata: solo questa classe, invece di bAllowAnyRemoteFunctionCall=True
 ; che aprirebbe qualunque UFUNCTION del progetto alle chiamate HTTP.
 bAllowAnyRemoteFunctionCall=False
 +CustomAllowedRemoteFunctionCalls=(ClassPath="/Script/PythonScriptPlugin.PythonScriptLibrary")
+
+; Lasciato disattivo di proposito: abilita ExecuteConsoleCommand *via web API*,
+; che il bridge non usa mai. I comandi console che servono (LiveCoding.Compile,
+; WebControl.StartServer, HighResShot) partono da dentro Python con
+; unreal.SystemLibrary.execute_console_command e non passano da questo gate.
+bAllowConsoleCommandRemoteExecution=False
 """
 
 
@@ -420,6 +426,7 @@ def create_project(
     default_game_mode: str | None = None,
     description: str = "",
     force: bool = False,
+    engine_root: str | None = None,
 ) -> dict:
     """Crea un progetto Unreal da specifica, con i plugin del bridge già attivi."""
     if not name.isidentifier():
@@ -428,7 +435,7 @@ def create_project(
             "senza iniziare con un numero." % name
         )
 
-    engine = resolve_engine(engine_version)
+    engine = resolve_engine(engine_version, engine_root)
     target = Path(directory).expanduser() / name
 
     if target.exists():
@@ -549,7 +556,400 @@ def set_project_plugins(uproject: str, enable: list[str], disable: list[str] | N
     return {
         "uproject": str(path),
         "plugins": [p["Name"] for p in data["Plugins"] if p["Enabled"]],
-        "nota": "riavvia l'editor se era già aperto",
+        "note": "restart the editor if it was already open",
+    }
+
+
+# --------------------------------------------------------------- codice C++
+
+#: Prefisso della classe secondo la convenzione Unreal, per gerarchia.
+#: `A` per gli attori, `U` per gli UObject e i componenti.
+_ACTOR_PARENTS = {
+    "Actor", "Pawn", "Character", "GameModeBase", "GameMode", "PlayerController",
+    "AIController", "Controller", "GameStateBase", "PlayerState", "HUD",
+    "DefaultPawn", "SpectatorPawn", "Info",
+}
+
+#: Header di dichiarazione delle classi base più usate. Non stanno tutte sotto
+#: `GameFramework/`: sbagliare il percorso fa fallire la compilazione con un
+#: errore che non nomina la classe, quindi la mappa è esplicita.
+_PARENT_INCLUDES = {
+    "Actor": "GameFramework/Actor.h",
+    "Pawn": "GameFramework/Pawn.h",
+    "Character": "GameFramework/Character.h",
+    "DefaultPawn": "GameFramework/DefaultPawn.h",
+    "SpectatorPawn": "GameFramework/SpectatorPawn.h",
+    "GameModeBase": "GameFramework/GameModeBase.h",
+    "GameMode": "GameFramework/GameMode.h",
+    "GameStateBase": "GameFramework/GameStateBase.h",
+    "PlayerState": "GameFramework/PlayerState.h",
+    "PlayerController": "GameFramework/PlayerController.h",
+    "Controller": "GameFramework/Controller.h",
+    "HUD": "GameFramework/HUD.h",
+    "Info": "GameFramework/Info.h",
+    "AIController": "AIController.h",
+    "ActorComponent": "Components/ActorComponent.h",
+    "SceneComponent": "Components/SceneComponent.h",
+    "StaticMeshComponent": "Components/StaticMeshComponent.h",
+    "BoxComponent": "Components/BoxComponent.h",
+    "SphereComponent": "Components/SphereComponent.h",
+    "Object": "UObject/Object.h",
+    "DataAsset": "Engine/DataAsset.h",
+    "SaveGame": "GameFramework/SaveGame.h",
+    "GameInstance": "Engine/GameInstance.h",
+}
+
+_TARGET_CS = """using UnrealBuildTool;
+
+public class {name}Target : TargetRules
+{{
+    public {name}Target(TargetInfo Target) : base(Target)
+    {{
+        Type = TargetType.Game;
+        DefaultBuildSettings = BuildSettingsVersion.V5;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+        ExtraModuleNames.Add("{module}");
+    }}
+}}
+"""
+
+_EDITOR_TARGET_CS = """using UnrealBuildTool;
+
+public class {name}EditorTarget : TargetRules
+{{
+    public {name}EditorTarget(TargetInfo Target) : base(Target)
+    {{
+        Type = TargetType.Editor;
+        DefaultBuildSettings = BuildSettingsVersion.V5;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+        ExtraModuleNames.Add("{module}");
+    }}
+}}
+"""
+
+_BUILD_CS = """using UnrealBuildTool;
+
+public class {module} : ModuleRules
+{{
+    public {module}(ReadOnlyTargetRules Target) : base(Target)
+    {{
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(new string[] {{
+            "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput"
+        }});
+
+        PrivateDependencyModuleNames.AddRange(new string[] {{ }});
+    }}
+}}
+"""
+
+_MODULE_H = """#pragma once
+
+#include "CoreMinimal.h"
+"""
+
+_MODULE_CPP = """#include "{module}.h"
+#include "Modules/ModuleManager.h"
+
+IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, {module}, "{module}");
+"""
+
+
+def _strip_prefix(nome: str) -> str:
+    """Toglie il prefisso Unreal solo se ne resta un nome noto.
+
+    Non basta `lstrip("AU")`: `ActorComponent` inizia per A ma la classe è
+    `UActorComponent`, e togliere la lettera darebbe `ctorComponent`.
+    """
+    if nome in _PARENT_INCLUDES or nome in _ACTOR_PARENTS:
+        return nome
+    if len(nome) > 1 and nome[0] in "AUF" and nome[1].isupper():
+        candidato = nome[1:]
+        if candidato in _PARENT_INCLUDES or candidato in _ACTOR_PARENTS:
+            return candidato
+    return nome
+
+
+def _cpp_prefix(parent_class: str) -> str:
+    """`A` per le classi che discendono da AActor, `U` per gli altri UObject."""
+    return "A" if _strip_prefix(parent_class) in _ACTOR_PARENTS else "U"
+
+
+def _qualified_parent(parent_class: str) -> str:
+    """Nome C++ completo del parent, con il prefisso giusto."""
+    nudo = _strip_prefix(parent_class)
+    return _cpp_prefix(nudo) + nudo
+
+
+#: Tipi puntatore a UObject citati in una firma: `TObjectPtr<AFoo>`, `AFoo*`,
+#: `const UBar*`. Servono per generare le forward declaration.
+_UOBJECT_REF = re.compile(r"\b(?:TObjectPtr\s*<\s*)?([AU][A-Z]\w*)\s*(?:>|\*)")
+
+
+def _forward_declarations(tipi: list[str], escludi: set[str]) -> list[str]:
+    """Forward declaration per le classi citate come puntatore.
+
+    Un `TObjectPtr<APlayerState>` in un header non compila se la classe non è
+    almeno dichiarata, e `CoreMinimal.h` non la porta dentro. Per un puntatore
+    la forward declaration basta e non appesantisce le dipendenze.
+    """
+    trovate: list[str] = []
+    for testo in tipi:
+        for nome in _UOBJECT_REF.findall(testo or ""):
+            if nome not in escludi and nome not in trovate:
+                trovate.append(nome)
+    return sorted(trovate)
+
+
+def _render_property(prop: dict) -> tuple[str, str]:
+    """Restituisce (blocco UPROPERTY, eventuale dichiarazione OnRep)."""
+    nome = prop["name"]
+    tipo = prop.get("type", "float")
+    categoria = prop.get("category", "Gameplay")
+
+    specificatori = ["EditAnywhere", "BlueprintReadWrite"]
+    if prop.get("read_only"):
+        specificatori = ["VisibleAnywhere", "BlueprintReadOnly"]
+
+    on_rep = ""
+    if prop.get("replicated"):
+        if prop.get("rep_notify"):
+            specificatori.append("ReplicatedUsing = OnRep_%s" % nome)
+            on_rep = "    UFUNCTION()\n    void OnRep_%s();\n" % nome
+        else:
+            specificatori.append("Replicated")
+
+    specificatori.append('Category = "%s"' % categoria)
+
+    default = prop.get("default")
+    inizializzatore = " = %s" % default if default is not None else ""
+
+    blocco = "    UPROPERTY(%s)\n    %s %s%s;\n" % (
+        ", ".join(specificatori), tipo, nome, inizializzatore,
+    )
+    return blocco, on_rep
+
+
+def create_cpp_class(
+    uproject: str,
+    class_name: str,
+    parent_class: str = "Actor",
+    module: str | None = None,
+    properties: list[dict] | None = None,
+    functions: list[dict] | None = None,
+    with_tick: bool = False,
+    force: bool = False,
+) -> dict:
+    """Genera una classe C++ compilabile nel modulo del progetto.
+
+    Il boilerplate di Unreal (macro API, GENERATED_BODY, Build.cs, Target.cs,
+    IMPLEMENT_PRIMARY_GAME_MODULE) è la parte che si sbaglia più facilmente:
+    qui viene generata corretta, e se il progetto è Blueprint-only il modulo
+    C++ viene creato da zero.
+
+    Le funzioni dichiarate come `BlueprintCallable` diventano chiamabili dai
+    grafi Blueprint — è il modo per dare all'agente logica eseguibile pur non
+    potendo scrivere i nodi.
+    """
+    path = Path(uproject).expanduser()
+    if not path.exists():
+        raise LocalError("File .uproject non trovato: %s" % path)
+    if not class_name.isidentifier():
+        raise LocalError(
+            "Nome classe '%s' non valido: usa lettere, numeri e underscore, "
+            "senza prefisso (viene aggiunto in automatico)." % class_name
+        )
+
+    nome_modulo = module or path.stem
+    radice = path.parent
+    source = radice / "Source"
+    cartella_modulo = source / nome_modulo
+
+    creati: list[str] = []
+    note: list[str] = []
+
+    # --- modulo C++ da zero se il progetto era Blueprint-only
+    modulo_nuovo = not cartella_modulo.is_dir()
+    if modulo_nuovo:
+        cartella_modulo.mkdir(parents=True, exist_ok=True)
+        for nome_file, contenuto in (
+            (source / f"{path.stem}.Target.cs", _TARGET_CS.format(name=path.stem, module=nome_modulo)),
+            (source / f"{path.stem}Editor.Target.cs", _EDITOR_TARGET_CS.format(name=path.stem, module=nome_modulo)),
+            (cartella_modulo / f"{nome_modulo}.Build.cs", _BUILD_CS.format(module=nome_modulo)),
+            (cartella_modulo / f"{nome_modulo}.h", _MODULE_H),
+            (cartella_modulo / f"{nome_modulo}.cpp", _MODULE_CPP.format(module=nome_modulo)),
+        ):
+            if not nome_file.exists():
+                nome_file.write_text(contenuto, encoding="utf-8")
+                creati.append(str(nome_file))
+
+        # Senza la voce Modules il .uproject resta Blueprint-only e il codice
+        # non viene nemmeno compilato.
+        dati = json.loads(path.read_text(encoding="utf-8-sig"))
+        moduli = dati.setdefault("Modules", [])
+        if not any(m.get("Name") == nome_modulo for m in moduli):
+            moduli.append(
+                {"Name": nome_modulo, "Type": "Runtime", "LoadingPhase": "Default"}
+            )
+            path.write_text(json.dumps(dati, indent=2) + "\n", encoding="utf-8")
+        note.append(
+            "modulo C++ '%s' creato: il progetto non era più Blueprint-only" % nome_modulo
+        )
+
+    # --- la classe
+    prefisso = _cpp_prefix(parent_class)
+    parent = _qualified_parent(parent_class)
+    completo = prefisso + class_name
+
+    header = cartella_modulo / f"{class_name}.h"
+    implementazione = cartella_modulo / f"{class_name}.cpp"
+    if header.exists() and not force:
+        raise LocalError(
+            "%s esiste già. Usa force=True per sovrascriverlo." % header
+        )
+
+    blocchi: list[str] = []
+    on_reps: list[str] = []
+    replicate = []
+    for prop in properties or []:
+        blocco, on_rep = _render_property(prop)
+        blocchi.append(blocco)
+        if on_rep:
+            on_reps.append(on_rep)
+        if prop.get("replicated"):
+            replicate.append(prop["name"])
+
+    dichiarazioni_funzioni = []
+    definizioni_funzioni = []
+    for funzione in functions or []:
+        nome = funzione["name"]
+        ritorno = funzione.get("return_type", "void")
+        parametri = funzione.get("params", "")
+        specificatori = funzione.get("specifiers", "BlueprintCallable, Category = \"Gameplay\"")
+        corpo = funzione.get("body", "// TODO")
+        dichiarazioni_funzioni.append(
+            "    UFUNCTION(%s)\n    %s %s(%s);\n" % (specificatori, ritorno, nome, parametri)
+        )
+        definizioni_funzioni.append(
+            "%s %s::%s(%s)\n{\n    %s\n}\n" % (ritorno, completo, nome, parametri, corpo)
+        )
+
+    api_macro = "%s_API" % nome_modulo.upper()
+    e_attore = prefisso == "A"
+
+    parent_nudo = _strip_prefix(parent)
+    include_parent = _PARENT_INCLUDES.get(parent_nudo)
+    if include_parent is None:
+        include_parent = "GameFramework/%s.h" % parent_nudo
+        note.append(
+            "header del parent '%s' non in tabella: incluso come '%s', "
+            "correggilo se la compilazione non lo trova." % (parent_nudo, include_parent)
+        )
+
+    citati = [p.get("type", "") for p in properties or []]
+    citati += [f.get("params", "") for f in functions or []]
+    citati += [f.get("return_type", "") for f in functions or []]
+    forward = _forward_declarations(citati, escludi={completo, parent})
+
+    corpo_header = [
+        "#pragma once\n\n",
+        '#include "CoreMinimal.h"\n',
+        '#include "%s"\n' % include_parent,
+        '#include "%s.generated.h"\n\n' % class_name,
+    ]
+    if forward:
+        corpo_header.extend("class %s;\n" % nome for nome in forward)
+        corpo_header.append("\n")
+    corpo_header += [
+        "UCLASS()\n",
+        "class %s %s : public %s\n{\n" % (api_macro, completo, parent),
+        "    GENERATED_BODY()\n\n",
+        "public:\n",
+        "    %s();\n\n" % completo,
+    ]
+    if blocchi:
+        corpo_header.extend(blocchi)
+        corpo_header.append("\n")
+    if on_reps:
+        corpo_header.extend(on_reps)
+        corpo_header.append("\n")
+    if dichiarazioni_funzioni:
+        corpo_header.extend(dichiarazioni_funzioni)
+        corpo_header.append("\n")
+    if replicate:
+        corpo_header.append(
+            "    virtual void GetLifetimeReplicatedProps("
+            "TArray<FLifetimeProperty>& OutLifetimeProps) const override;\n\n"
+        )
+    if e_attore:
+        corpo_header.append("protected:\n    virtual void BeginPlay() override;\n")
+        if with_tick:
+            corpo_header.append("\npublic:\n    virtual void Tick(float DeltaTime) override;\n")
+    corpo_header.append("};\n")
+
+    corpo_cpp = ['#include "%s.h"\n' % class_name]
+    # Nell'header la forward declaration basta; nel .cpp il corpo di una
+    # funzione può volerne i membri, quindi si include per esteso quando
+    # l'header della classe è noto.
+    for nome in forward:
+        header_noto = _PARENT_INCLUDES.get(_strip_prefix(nome))
+        if header_noto:
+            corpo_cpp.append('#include "%s"\n' % header_noto)
+    if replicate:
+        corpo_cpp.append('#include "Net/UnrealNetwork.h"\n')
+    corpo_cpp.append("\n")
+    corpo_cpp.append("%s::%s()\n{\n" % (completo, completo))
+    if e_attore:
+        corpo_cpp.append("    PrimaryActorTick.bCanEverTick = %s;\n" % ("true" if with_tick else "false"))
+    if replicate:
+        corpo_cpp.append("    bReplicates = true;\n")
+    corpo_cpp.append("}\n\n")
+
+    if e_attore:
+        corpo_cpp.append("void %s::BeginPlay()\n{\n    Super::BeginPlay();\n}\n\n" % completo)
+        if with_tick:
+            corpo_cpp.append(
+                "void %s::Tick(float DeltaTime)\n{\n    Super::Tick(DeltaTime);\n}\n\n" % completo
+            )
+
+    if replicate:
+        corpo_cpp.append(
+            "void %s::GetLifetimeReplicatedProps("
+            "TArray<FLifetimeProperty>& OutLifetimeProps) const\n{\n"
+            "    Super::GetLifetimeReplicatedProps(OutLifetimeProps);\n" % completo
+        )
+        for nome_prop in replicate:
+            corpo_cpp.append("    DOREPLIFETIME(%s, %s);\n" % (completo, nome_prop))
+        corpo_cpp.append("}\n\n")
+
+    for on_rep in on_reps:
+        nome_prop = on_rep.split("OnRep_")[1].split("(")[0]
+        corpo_cpp.append("void %s::OnRep_%s()\n{\n}\n\n" % (completo, nome_prop))
+
+    corpo_cpp.extend(definizioni_funzioni)
+
+    header.write_text("".join(corpo_header), encoding="utf-8")
+    implementazione.write_text("".join(corpo_cpp), encoding="utf-8")
+    creati.extend([str(header), str(implementazione)])
+
+    return {
+        "class": completo,
+        "parent": parent,
+        "module": nome_modulo,
+        "header": str(header),
+        "source": str(implementazione),
+        "files_created": creati,
+        "module_created": modulo_nuovo,
+        "replicated_properties": replicate,
+        "notes": note,
+        "next_steps": [
+            "ue_editor_close",
+            "ue_build_start",
+            "ue_build_status (until running=false)",
+            "ue_editor_open",
+            "ue_reparent_blueprint (to attach a Blueprint to %s)" % completo,
+        ],
     }
 
 
@@ -557,6 +957,42 @@ def set_project_plugins(uproject: str, enable: list[str], disable: list[str] | N
 
 
 BUILD_STATE_FILE = STATE_DIR / "build.json"
+
+
+def _batch_file(engine: EngineInstall, stem: str) -> Path:
+    """Script di build del motore per la piattaforma corrente.
+
+    Epic distribuisce `Build.bat`/`RunUAT.bat` su Windows e gli equivalenti
+    `.sh` su Linux/macOS, nella stessa cartella.
+    """
+    cartella = Path(engine.root) / "Engine/Build/BatchFiles"
+    if platform.system() == "Windows":
+        candidati = [cartella / f"{stem}.bat"]
+    else:
+        # Su macOS gli script stanno in una sottocartella Mac/, su Linux in Linux/.
+        sistema = "Mac" if platform.system() == "Darwin" else "Linux"
+        candidati = [cartella / sistema / f"{stem}.sh", cartella / f"{stem}.sh"]
+
+    for candidato in candidati:
+        if candidato.exists():
+            return candidato
+
+    raise LocalError(
+        "Script %s non trovato per questa piattaforma. Cercato in: %s"
+        % (stem, ", ".join(str(c) for c in candidati))
+    )
+
+
+def _invoke(comando: str) -> str:
+    """Prefissa `call` solo dove serve: è sintassi di cmd.exe, non di sh."""
+    return ("call " + comando) if platform.system() == "Windows" else comando
+
+
+def default_target_platform() -> str:
+    """Piattaforma di build predefinita, dedotta dal sistema corrente."""
+    return {"Windows": "Win64", "Darwin": "Mac", "Linux": "Linux"}.get(
+        platform.system(), "Win64"
+    )
 
 #: Righe che indicano un vero problema di compilazione nel log di UnrealBuildTool.
 _BUILD_ERROR_MARKERS = ("error C", "error LNK", "error :", ": error", "Error:", "fatal error")
@@ -604,9 +1040,7 @@ def start_build(
         engine_root,
         path.parent,
     )
-    build_bat = Path(engine.root) / "Engine/Build/BatchFiles/Build.bat"
-    if not build_bat.exists():
-        raise LocalError("Build.bat non trovato in %s" % build_bat)
+    build_bat = _batch_file(engine, "Build")
 
     target_name = target or f"{path.stem}Editor"
     log_path = path.parent / "Saved/Logs/mcp_build.log"
@@ -614,11 +1048,11 @@ def start_build(
     if log_path.exists():
         log_path.unlink()
 
-    comando = (
-        f'call "{build_bat}" {target_name} {platform} {configuration} '
-        f'-Project="{path}" -WaitMutex'
+    comando = _invoke(
+        f'"{build_bat}" {target_name} {platform or default_target_platform()} '
+        f'{configuration} -Project="{path}" -WaitMutex'
     )
-    script, args = _write_launch_script(
+    _script, args = _write_launch_script(
         path.parent / "Saved" / "mcp_build_run", comando, log_path
     )
 
@@ -636,7 +1070,7 @@ def start_build(
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    return {**state, "nota": "compilazione avviata: consulta ue_build_status"}
+    return {**state, "note": "build started: poll ue_build_status"}
 
 
 def platform_module_is_windows() -> bool:
@@ -656,8 +1090,8 @@ def build_status(tail_lines: int = 30) -> dict:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     running = _process_alive(int(state.get("pid", 0)))
-    errors = [l.strip() for l in lines if any(m in l for m in _BUILD_ERROR_MARKERS)]
-    warnings = [l.strip() for l in lines if "warning" in l.lower()]
+    errors = [r.strip() for r in lines if any(m in r for m in _BUILD_ERROR_MARKERS)]
+    warnings = [r.strip() for r in lines if "warning" in r.lower()]
 
     exit_code = None
     for line in reversed(lines):
@@ -666,8 +1100,8 @@ def build_status(tail_lines: int = 30) -> dict:
             break
 
     succeeded = (not running) and not errors and any(
-        "Total execution time" in l or "Build succeeded" in l or l.startswith("EXITCODE=0")
-        for l in lines
+        "Total execution time" in r or "Build succeeded" in r or r.startswith("EXITCODE=0")
+        for r in lines
     )
 
     return {
@@ -761,9 +1195,7 @@ def start_package(
         engine_root,
         path.parent,
     )
-    run_uat = Path(engine.root) / "Engine/Build/BatchFiles/RunUAT.bat"
-    if not run_uat.exists():
-        raise LocalError("RunUAT non trovato in %s" % run_uat)
+    run_uat = _batch_file(engine, "RunUAT")
 
     archive_dir = Path(output_dir).expanduser() if output_dir else path.parent / "Packaged"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -782,15 +1214,16 @@ def start_package(
         "-cook", "-build", "-stage", "-pak", "-archive",
         f'-archivedirectory="{archive_dir}"',
     ]
-    # Cuocere solo le mappe che servono: il progetto contiene 7 arene importate,
-    # cuocerle tutte allungherebbe molto senza motivo.
+    # Cuocere solo le mappe che servono: senza questo elenco il cook prende
+    # tutte quelle referenziate dalle impostazioni di progetto, e su un progetto
+    # con molti livelli il tempo si allunga parecchio senza motivo.
     for mappa in maps or []:
         argomenti.append(f"-map={mappa}")
     if dedicated_server:
         argomenti += ["-server", f"-serverconfig={configuration}"]
 
-    script, args = _write_launch_script(
-        path.parent / "Saved" / "mcp_package_run", "call " + " ".join(argomenti), log_path
+    _script, args = _write_launch_script(
+        path.parent / "Saved" / "mcp_package_run", _invoke(" ".join(argomenti)), log_path
     )
 
     kwargs: dict[str, Any] = {"cwd": str(path.parent)}
@@ -809,7 +1242,7 @@ def start_package(
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     PACKAGE_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    return {**state, "nota": "packaging avviato: consulta ue_package_status"}
+    return {**state, "note": "packaging started: poll ue_package_status"}
 
 
 def package_status(tail_lines: int = 30) -> dict:
@@ -825,7 +1258,7 @@ def package_status(tail_lines: int = 30) -> dict:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     running = _process_alive(int(state.get("pid", 0)))
-    errors = [l.strip() for l in lines if any(m in l for m in _PACKAGE_ERROR_MARKERS)]
+    errors = [r.strip() for r in lines if any(m in r for m in _PACKAGE_ERROR_MARKERS)]
 
     exit_code = None
     for line in reversed(lines):
@@ -881,7 +1314,7 @@ def _process_alive(pid: int) -> bool:
         return False
     try:
         if platform.system() == "Windows":
-            output = subprocess.run(
+            output = subprocess.run(  # noqa: S603
                 ["tasklist", "/FI", "PID eq %d" % pid],
                 capture_output=True, text=True, timeout=15,
             ).stdout
@@ -934,28 +1367,55 @@ def launch_editor(
     }
 
 
+def _process_name_variants(name: str) -> list[str]:
+    """Nomi con cui lo stesso processo compare sulle varie piattaforme.
+
+    Su Windows è `UnrealEditor.exe`, su Linux/macOS `UnrealEditor` — chi chiama
+    usa il nome Windows, qui si normalizza.
+    """
+    base = name[:-4] if name.lower().endswith(".exe") else name
+    return [name, base] if base != name else [name]
+
+
 def process_running_by_name(name: str) -> bool:
-    """Un processo con questo nome è in esecuzione? (solo Windows)"""
-    if platform.system() != "Windows":
-        return False
+    """Un processo con questo nome è in esecuzione?"""
+    varianti = _process_name_variants(name)
     try:
-        output = subprocess.run(  # noqa: S603
-            ["tasklist", "/FI", "IMAGENAME eq %s" % name],
-            capture_output=True, text=True, timeout=20,
-        )
-        return name.lower() in ((output.stdout or "") + (output.stderr or "")).lower()
+        if platform.system() == "Windows":
+            output = subprocess.run(  # noqa: S603
+                ["tasklist", "/FI", "IMAGENAME eq %s" % name],
+                capture_output=True, text=True, timeout=20,
+            )
+            testo = ((output.stdout or "") + (output.stderr or "")).lower()
+            return any(v.lower() in testo for v in varianti)
+
+        # Senza questo, su Linux/macOS il controllo "editor chiuso" prima di una
+        # compilazione passava sempre, e il build falliva più avanti.
+        for variante in varianti:
+            output = subprocess.run(  # noqa: S603
+                ["pgrep", "-f", variante], capture_output=True, text=True, timeout=20
+            )
+            if output.returncode == 0 and (output.stdout or "").strip():
+                return True
+        return False
     except Exception:  # noqa: BLE001
         return False
 
 
 def terminate_process_by_name(name: str) -> bool:
     """Termina un processo per nome. Ritorna True se ce n'era uno da chiudere."""
-    if platform.system() != "Windows" or not process_running_by_name(name):
+    if not process_running_by_name(name):
         return False
     try:
-        subprocess.run(  # noqa: S603
-            ["taskkill", "/F", "/IM", name], capture_output=True, timeout=30
-        )
+        if platform.system() == "Windows":
+            subprocess.run(  # noqa: S603
+                ["taskkill", "/F", "/IM", name], capture_output=True, timeout=30
+            )
+        else:
+            for variante in _process_name_variants(name):
+                subprocess.run(  # noqa: S603
+                    ["pkill", "-f", variante], capture_output=True, timeout=30
+                )
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -986,7 +1446,7 @@ def kill_editor(timeout: float = 30.0) -> dict:
         return {"killed": False, "reason": "nessun editor avviato da questo MCP risulta attivo"}
 
     if platform.system() == "Windows":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)  # noqa: S603,S607
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)  # noqa: S603
     else:
         os.kill(pid, 15)
 

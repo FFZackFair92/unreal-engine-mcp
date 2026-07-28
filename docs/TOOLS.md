@@ -1,6 +1,6 @@
 # Tool reference
 
-49 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+58 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -19,8 +19,8 @@ the Unreal convention (`/Game/...`).
 | Tool | Parameters | What it does |
 |---|---|---|
 | `ue_engine_list` | — | Engine installs found via `UE_MCP_ENGINE_DIRS`, the Epic Launcher manifest and the Windows registry (including hand-registered builds keyed by GUID). |
-| `ue_engine_templates` | `engine_version` | Official templates shipped with the engine (`TP_Blank`, `TP_ThirdPerson`, …). |
-| `ue_project_create` | `name`, `directory`, `engine_version`, `template`, `blueprint_only`, `plugins`, `default_map`, `default_game_mode`, `description`, `force` | Creates a project already wired for the bridge: `.uproject` with the required plugins, `DefaultRemoteControl.ini` with the two security flags, and `Content/Python/init_unreal.py`. Optionally copies an engine template, dropping its `Source/` for a Blueprint-only project. |
+| `ue_engine_templates` | `engine_version`, `engine_root` | Official templates shipped with the engine (`TP_Blank`, `TP_ThirdPerson`, …). |
+| `ue_project_create` | `name`, `directory`, `engine_version`, `template`, `blueprint_only`, `plugins`, `default_map`, `default_game_mode`, `description`, `force`, `engine_root` | Creates a project already wired for the bridge: `.uproject` with the required plugins, `DefaultRemoteControl.ini` with the two security flags, and `Content/Python/init_unreal.py`. Optionally copies an engine template, dropping its `Source/` for a Blueprint-only project. |
 | `ue_project_find` | `directory`, `max_depth` | Finds `.uproject` files under a folder. |
 | `ue_project_info` | `uproject` | Engine association, enabled plugins, whether the bridge is ready, whether the project has C++. |
 | `ue_project_set_plugins` | `uproject`, `enable`, `disable` | Enables/disables plugins by editing the `.uproject`. Requires an editor restart. |
@@ -29,18 +29,37 @@ the Unreal convention (`/Game/...`).
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args` | Launches the editor and **waits until the bridge answers**, so the next call is safe. First launch compiles shaders and can take minutes. |
+| `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args`, `engine_root` | Launches the editor and **waits until the bridge answers**, so the next call is safe. First launch compiles shaders and can take minutes. |
 | `ue_editor_status` | — | Whether the editor process is alive (including one you started by hand), whether Live Coding is running, whether the bridge answers. |
 | `ue_editor_close` | `save_all`, `force` | Clean shutdown: saves, then `quit_editor` over the bridge. Falls back to killing the process. |
+
+## C++ (local)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_cpp_class_create` | `uproject`, `class_name`, `parent_class`, `module`, `properties`, `functions`, `with_tick`, `force` | Generates a compilable class with the Unreal boilerplate written correctly: `UCLASS`, `GENERATED_BODY`, the `MODULE_API` macro, the right parent header (`AIController.h` is not under `GameFramework/`), and the `A`/`U` prefix by hierarchy. Replicated properties also get `GetLifetimeReplicatedProps` and their `DOREPLIFETIME` entries — forget those and replication silently does nothing. If the project is Blueprint-only, the entire C++ module is created. |
+
+`properties` entries take `name`, `type`, and optionally `category`, `default`,
+`replicated`, `rep_notify`, `read_only`. `functions` entries take `name`,
+`return_type`, `params`, `specifiers` (default `BlueprintCallable`) and `body`
+— a `BlueprintCallable` function becomes callable from Blueprint graphs, which
+is how generated logic reaches a designer's hands.
+
+This is the workaround for Blueprint graphs not being scriptable. Full flow:
+
+```
+ue_cpp_class_create → ue_editor_close → ue_build_start
+→ ue_build_status (until running=false) → ue_editor_open → ue_reparent_blueprint
+```
 
 ## Compiling and packaging (local)
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `ue_build_start` | `uproject`, `engine_version`, `target`, `configuration` | Compiles the C++ module in the background. **Editor must be closed.** Kills `LiveCodingConsole.exe` first — it outlives the editor and keeps a lock on the DLLs. |
+| `ue_build_start` | `uproject`, `engine_version`, `target`, `configuration`, `engine_root` | Compiles the C++ module in the background. **Editor must be closed.** Kills `LiveCodingConsole.exe` first — it outlives the editor and keeps a lock on the DLLs. |
 | `ue_build_status` | `tail_lines` | Running or finished, exit code, parsed compiler errors and warnings, log tail. |
 | `ue_live_compile` | `max_wait_seconds` | Recompiles **with the editor open**, via Live Coding. Only patches function bodies: adding or changing `UCLASS`/`UFUNCTION`/`UPROPERTY` changes reflection data and still needs `ue_build_start`. |
-| `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version` | Cook + build + stage + pak via `RunUAT BuildCookRun`. Produces a standalone executable. **Editor must be closed.** |
+| `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version`, `engine_root`, `target_platform` | Cook + build + stage + pak via `RunUAT BuildCookRun`. Produces a standalone executable. **Editor must be closed.** |
 | `ue_package_status` | `tail_lines` | Current phase (Cook, Stage, Package, Archive), errors, and the path of the produced `.exe`. |
 
 Neither build nor package waits for completion inside the call: they would blow
@@ -70,9 +89,15 @@ past the MCP timeout. They start and you poll the status tool.
 | Tool | Parameters | What it does |
 |---|---|---|
 | `ue_spawn_actor` | `class_ref`, `location`, `rotation`, `scale`, `label` | Spawns from a class name, a `/Script/...` path, a Blueprint path, or a static mesh asset. The `label` is how other tools find it again. |
+| `ue_spawn_many` | `actors` | Spawns a list of actors in **one round trip and one undo transaction**. Each entry is `{class_ref, location, rotation, scale, label}`. A failing entry is reported without losing the rest. |
 | `ue_list_actors` | `name_contains`, `class_contains` | Lists level actors with optional filters. |
 | `ue_set_actor_transform` | `label`, `location`, `rotation`, `scale` | Moves, rotates and scales an actor by label. |
+| `ue_set_actor_property` | `label`, `properties`, `component` | Sets properties on a **placed** actor or one of its components — a mesh, a light's intensity, a trigger radius. Vectors are `{"x":…}`, colours `{"r":…}`, and `/Game/...` strings are loaded as assets. |
+| `ue_list_actor_components` | `label` | Components of a placed actor, with name and class — tells you what to pass as `component` above. |
 | `ue_delete_actor` | `label` | Removes an actor from the level. |
+
+Actor edits are wrapped in `ScopedEditorTransaction`, so everything above is
+undoable with Ctrl+Z by whoever is watching the editor.
 
 ## Blueprints (editor)
 
@@ -82,6 +107,7 @@ past the MCP timeout. They start and you poll the status tool.
 | `ue_add_component` | `blueprint_path`, `component_class`, `name` | Adds a component through `SubobjectDataSubsystem` and recompiles. |
 | `ue_add_variable` | `blueprint_path`, `var_name`, `var_type`, `sub_type`, `replicated`, `instance_editable`, `default_value` | Typed member variable with replication and instance-editable flags. Types: `bool`, `int`, `int64`, `float`, `string`, `name`, `text`, `byte`, `struct`, `object`, `class`. **UE 5.4+** — earlier engines have no Python API for this; the tool fails with an explicit message. |
 | `ue_set_class_defaults` | `blueprint_path`, `properties` | Writes Class Defaults on the CDO. |
+| `ue_reparent_blueprint` | `blueprint_path`, `new_parent`, `remove_unused_variables` | Reassigns the parent class, typically to a generated C++ class. Variables matching a `UPROPERTY` on the new parent are absorbed; the rest survive renamed with `_0`. Reports which were absorbed. |
 | `ue_compile_blueprint` | `blueprint_path` | Compiles and saves. |
 | `ue_set_replication` | `blueprint_path`, `replicates`, `replicate_movement`, `always_relevant` | Networking flags on the CDO. |
 
@@ -89,6 +115,23 @@ past the MCP timeout. They start and you poll the status tool.
 Python — `EdGraph.Nodes` is protected, pin types are not exposed and there is no
 API to link pins. These tools cover variables, components and defaults; the logic
 itself belongs in C++ or in the editor by hand. See [UNREAL-NOTES.md](UNREAL-NOTES.md).
+
+## Materials (editor)
+
+Unlike Blueprint graphs, **material graphs are fully scriptable** — these tools
+really do create and wire the nodes.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_material` | `package_path`, `name`, `textures`, `scalars`, `two_sided` | Creates a material and connects textures to PBR channels (`base_color`, `normal`, `roughness`, `metallic`, `ambient_occlusion`, `emissive`, `opacity`). Use the key `"auto"` to infer the channel from the filename — this matches the ambientCG and Poly Haven naming, so downloaded assets wire themselves up. Normal maps get sRGB off and the right sampler type. |
+| `ue_create_material_instance` | `package_path`, `name`, `parent_path`, `parameters` | Material Instance from a parent material. A number is a scalar, `{"r","g","b"}` a colour, a bool a static switch, a `/Game/...` path a texture. |
+| `ue_assign_material` | `label`, `material_path`, `slot`, `component` | Assigns a material to a placed actor. |
+
+## Screenshots (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_screenshot` | `filename`, `width`, `height` | Captures the editor viewport to a PNG under `<Project>/Saved/Screenshots/MCP` and returns its path. Capture happens a frame or two later, so the tool waits for the file and tells you if it never appeared. |
 
 ## Play In Editor (editor)
 

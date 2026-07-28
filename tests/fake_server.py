@@ -39,13 +39,13 @@ class FakeUnrealServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 if self.path == "/remote/info":
                     self._send({"HttpServerPort": 30010, "Name": "FakeUnreal"})
                 else:
                     self._send({"error": "not found"}, 404)
 
-            def do_PUT(self):  # noqa: N802
+            def do_PUT(self):
                 length = int(self.headers.get("Content-Length", 0))
                 request = json.loads(self.rfile.read(length) or b"{}")
                 server_self.calls.append(request)

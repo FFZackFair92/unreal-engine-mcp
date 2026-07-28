@@ -1,0 +1,47 @@
+"""Test della superficie MCP del server.
+
+Le istruzioni e le descrizioni dei tool sono l'unica cosa che il modello legge
+prima di decidere cosa chiamare: se si perdono, il server continua a funzionare
+e l'agente inizia a usarlo male. Qui si verifica che arrivino davvero.
+"""
+
+from unreal_mcp import server as mcp_server
+
+
+async def test_le_istruzioni_arrivano_al_modello():
+    istruzioni = mcp_server.mcp.instructions or ""
+
+    assert "Unreal Engine 5" in istruzioni
+    # I due limiti che l'agente deve conoscere prima di provarci.
+    assert "ue_cpp_class_create" in istruzioni
+    assert "Blueprint node graphs cannot be scripted" in istruzioni
+
+
+async def test_il_nome_del_server_e_esplicito():
+    """È l'identità con cui il server compare nei client e nei log."""
+    assert mcp_server.mcp.name == "unreal-mcp"
+
+
+async def test_i_tool_sono_registrati_con_le_descrizioni():
+    tools = await mcp_server.mcp.list_tools()
+    per_nome = {t.name: t for t in tools}
+
+    # Un campione che copre entrambi i livelli, locale ed editor.
+    for atteso in (
+        "ue_status",
+        "ue_project_create",
+        "ue_cpp_class_create",
+        "ue_reparent_blueprint",
+        "ue_create_material",
+        "ue_screenshot",
+        "ue_spawn_many",
+        "ue_set_actor_property",
+    ):
+        assert atteso in per_nome, "tool mancante: %s" % atteso
+        # Senza descrizione il modello non sa quando usarlo.
+        assert (per_nome[atteso].description or "").strip()
+
+
+async def test_ogni_tool_ha_uno_schema_di_input():
+    for tool in await mcp_server.mcp.list_tools():
+        assert tool.inputSchema is not None, tool.name

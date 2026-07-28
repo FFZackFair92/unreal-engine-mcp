@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a new tool or a change to an existing one
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you write: Blueprint **node graphs** cannot be
+        authored from Python — the engine does not expose graph editing, so no
+        tool can be built for it. See
+        [UNREAL-NOTES.md](https://github.com/FFZackFair92/unreal-engine-mcp/blob/main/docs/UNREAL-NOTES.md).
+        The supported route for logic is a C++ parent class plus
+        `ue_reparent_blueprint`.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The task, not the solution — it often has a shorter path.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Tool name, arguments, what it would return.
+
+  - type: input
+    id: api
+    attributes:
+      label: Unreal API it would use, if you know it
+      placeholder: "unreal.MaterialEditingLibrary.create_material_expression"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked [docs/TOOLS.md](https://github.com/FFZackFair92/unreal-engine-mcp/blob/main/docs/TOOLS.md) and no existing tool covers this
+        - label: This is scriptable from the editor's Python API (or I am not sure — say so above)

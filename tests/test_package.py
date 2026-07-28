@@ -4,21 +4,16 @@ import json
 from pathlib import Path
 
 import pytest
+from test_local import _make_batch_files, _make_engine
 
 from unreal_mcp import local
-
-from test_local import _make_engine
 
 
 @pytest.fixture
 def progetto(tmp_path, monkeypatch):
     root = tmp_path / "engines"
     root.mkdir()
-    engine_root = _make_engine(root, "5.8")
-    for nome in ("Build.bat", "RunUAT.bat"):
-        script = engine_root / "Engine/Build/BatchFiles" / nome
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("@echo off", encoding="utf-8")
+    _make_batch_files(_make_engine(root, "5.8"))
 
     monkeypatch.setenv("UE_MCP_ENGINE_DIRS", str(root))
     monkeypatch.setattr(local, "STATE_DIR", tmp_path / "state")
@@ -56,7 +51,7 @@ def test_package_comando_generato(progetto, monkeypatch):
     avvio = local.start_package(
         progetto["uproject"],
         configuration="Development",
-        maps=["/Game/MyGame/Levels/L_CortileScolastico"],
+        maps=["/Game/MyGame/Levels/L_Main"],
     )
     assert avvio["pid"] == 999
     assert avvio["configuration"] == "Development"
@@ -66,7 +61,7 @@ def test_package_comando_generato(progetto, monkeypatch):
     comando = script.read_text(encoding="utf-8")
     assert "BuildCookRun" in comando
     assert "-clientconfig=Development" in comando
-    assert "-map=/Game/MyGame/Levels/L_CortileScolastico" in comando
+    assert "-map=/Game/MyGame/Levels/L_Main" in comando
     assert "-archivedirectory=" in comando
     assert "-server" not in comando
 

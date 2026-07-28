@@ -4,10 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+from test_local import _make_batch_files, _make_engine  # riusa il finto albero del motore
 
 from unreal_mcp import local
-
-from test_local import _make_engine  # riusa il finto albero del motore
 
 
 @pytest.fixture
@@ -15,10 +14,7 @@ def progetto(tmp_path, monkeypatch):
     root = tmp_path / "engines"
     root.mkdir()
     engine_root = _make_engine(root, "5.8")
-    # Build.bat deve esistere: start_build lo verifica
-    build_bat = engine_root / "Engine/Build/BatchFiles/Build.bat"
-    build_bat.parent.mkdir(parents=True, exist_ok=True)
-    build_bat.write_text("@echo off", encoding="utf-8")
+    _make_batch_files(engine_root)
 
     monkeypatch.setenv("UE_MCP_ENGINE_DIRS", str(root))
     monkeypatch.setattr(local, "STATE_DIR", tmp_path / "state")

@@ -50,7 +50,7 @@ class FakeWebServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):  # noqa: N802, C901
+            def do_GET(self):
                 server_self.hits.append(self.path)
                 parsed = urlparse(self.path)
                 query = parse_qs(parsed.query)

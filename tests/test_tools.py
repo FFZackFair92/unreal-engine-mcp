@@ -3,7 +3,6 @@ sia eseguibile e produca lo stato atteso nell'editor."""
 
 import pytest
 
-
 # ------------------------------------------------------------------ core
 
 
@@ -34,10 +33,10 @@ async def test_live_compile(tools, unreal):
     per iterare, senza chiudere e riaprire."""
     esito = await tools.ue_live_compile(max_wait_seconds=3)
     assert "LiveCoding.Compile" in unreal.state["console"]
-    assert esito["riuscito"] is True
-    assert esito["fallito"] is False
+    assert esito["succeeded"] is True
+    assert esito["failed"] is False
     # Il limite va detto: le modifiche alla reflection non passano da qui.
-    assert "UFUNCTION" in esito["nota"]
+    assert "UFUNCTION" in esito["note"]
 
 
 async def test_save_all(tools, unreal):
@@ -50,11 +49,11 @@ async def test_save_all(tools, unreal):
 
 async def test_import_assets(tools, unreal):
     report = await tools.ue_import_assets(
-        ["C:/tmp/four_corners_export/Arena_Tetto.glb", "C:/tmp/four_corners_export/Characters.glb"],
-        destination="/Game/MyGame/Levels",
+        ["C:/Assets/Props/crate.glb", "C:/Assets/Props/barrel.glb"],
+        destination="/Game/MyGame/Props",
     )
     assert [r["count"] for r in report] == [1, 1]
-    assert "/Game/MyGame/Levels/Arena_Tetto" in unreal.state["imports"]
+    assert "/Game/MyGame/Props/crate" in unreal.state["imports"]
 
 
 async def test_list_assets_con_filtro(tools):
@@ -69,11 +68,11 @@ async def test_list_assets_con_filtro(tools):
 
 
 async def test_livelli(tools, unreal):
-    creato = await tools.ue_new_level("/Game/MyGame/Levels/L_Cortile")
+    creato = await tools.ue_new_level("/Game/MyGame/Levels/L_Main")
     assert creato["created"] is True
-    aperto = await tools.ue_open_level("/Game/MyGame/Levels/L_Cortile")
+    aperto = await tools.ue_open_level("/Game/MyGame/Levels/L_Main")
     assert aperto["opened"] is True
-    assert unreal.state["current_level"] == "/Game/MyGame/Levels/L_Cortile"
+    assert unreal.state["current_level"] == "/Game/MyGame/Levels/L_Main"
 
 
 # ---------------------------------------------------------------- attori

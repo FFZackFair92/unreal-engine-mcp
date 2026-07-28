@@ -135,12 +135,12 @@ def extract_archive(archive: str, destination: str | None = None) -> dict:
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive_file:
             members = [m for m in archive_file.namelist() if not m.startswith(("/", "..")) and ".." not in Path(m).parts]
-            archive_file.extractall(target, members=members)
+            archive_file.extractall(target, members=members)  # noqa: S202 - membri già filtrati sopra
         extracted = members
     elif tarfile.is_tarfile(path):
         with tarfile.open(path) as archive_file:
             members = [m for m in archive_file.getmembers() if not m.name.startswith(("/", "..")) and ".." not in Path(m.name).parts]
-            archive_file.extractall(target, members=members)
+            archive_file.extractall(target, members=members)  # noqa: S202 - membri già filtrati sopra
         extracted = [m.name for m in members]
     elif path.suffix.lower() == ".rar":
         raise AssetError(

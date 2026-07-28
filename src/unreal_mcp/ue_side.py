@@ -8,7 +8,7 @@ usare liberamente il modulo ``unreal``, disponibile solo nell'editor.
 import json
 import os
 
-import unreal  # noqa: F401  (disponibile solo dentro l'editor)
+import unreal
 
 # ---------------------------------------------------------------- subsystems
 
@@ -29,6 +29,31 @@ def mcp_asset_lib():
     return unreal.EditorAssetLibrary
 
 
+# -------------------------------------------------------------- transazioni
+
+
+class _McpNullTransaction:
+    """Fallback quando ScopedEditorTransaction non è disponibile."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def mcp_transaction(description):
+    """Raggruppa le modifiche in una transazione annullabile con Ctrl+Z.
+
+    Senza questo, ogni modifica fatta dall'agente è irreversibile per chi sta
+    guardando l'editor: `ScopedEditorTransaction` la registra nell'undo stack
+    come una singola voce con un nome leggibile.
+    """
+    if hasattr(unreal, "ScopedEditorTransaction"):
+        return unreal.ScopedEditorTransaction(str(description))
+    return _McpNullTransaction()
+
+
 # --------------------------------------------------------- versione e capacità
 
 
@@ -38,7 +63,7 @@ def mcp_engine_minor():
         parts = str(unreal.SystemLibrary.get_engine_version()).split(".")
         if parts[0] == "5":
             return int(parts[1])
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - versione non riconoscibile: si degrada a None
         pass
     return None
 
@@ -188,7 +213,7 @@ def mcp_import_assets(files, destination, replace_existing=True, import_as_skele
     mcp_asset_tools().import_asset_tasks(tasks)
 
     out = []
-    for task, path in zip(tasks, files):
+    for task, path in zip(tasks, files, strict=False):
         imported = [str(p) for p in (task.get_editor_property("imported_object_paths") or [])]
         entry = {"file": path, "imported": imported, "count": len(imported)}
         if not imported and path.lower().endswith((".glb", ".gltf")):
@@ -213,7 +238,8 @@ def mcp_list_assets(path, recursive=True, class_filter=None):
     return out
 
 
-def mcp_spawn(class_or_asset, location=None, rotation=None, scale=None, label=None):
+def mcp_spawn_one(class_or_asset, location=None, rotation=None, scale=None, label=None):
+    """Spawn di un singolo attore, senza aprire una transazione propria."""
     loc = mcp_to_vector(location)
     rot = mcp_to_rotator(rotation)
     subsystem = mcp_actor_subsystem()
@@ -236,6 +262,50 @@ def mcp_spawn(class_or_asset, location=None, rotation=None, scale=None, label=No
     return mcp_actor_info(actor)
 
 
+def mcp_spawn(class_or_asset, location=None, rotation=None, scale=None, label=None):
+    with mcp_transaction("MCP: spawn %s" % class_or_asset):
+        return mcp_spawn_one(class_or_asset, location, rotation, scale, label)
+
+
+def mcp_spawn_many(items, transaction_label="MCP: spawn multiplo"):
+    """Spawna molti attori in un solo round-trip e in una sola transazione.
+
+    Costruire un livello un attore per chiamata significa un round-trip HTTP
+    ciascuno; qui la lista arriva tutta insieme. Un fallimento su un elemento
+    non ferma gli altri: viene riportato nel risultato.
+
+    Ogni elemento è un dict con: class_ref (obbligatorio), location, rotation,
+    scale, label.
+    """
+    spawned = []
+    failed = []
+    with mcp_transaction(transaction_label):
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or not item.get("class_ref"):
+                failed.append({"index": index, "error": "manca 'class_ref'", "item": item})
+                continue
+            try:
+                spawned.append(
+                    mcp_spawn_one(
+                        item["class_ref"],
+                        item.get("location"),
+                        item.get("rotation"),
+                        item.get("scale"),
+                        item.get("label"),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed.append(
+                    {"index": index, "error": "%s: %s" % (type(exc).__name__, exc), "item": item}
+                )
+    return {
+        "requested": len(items),
+        "spawned": len(spawned),
+        "actors": spawned,
+        "failed": failed,
+    }
+
+
 def mcp_find_actors(name_contains=None, class_contains=None):
     out = []
     for actor in mcp_actor_subsystem().get_all_level_actors():
@@ -253,6 +323,141 @@ def mcp_actor_by_label(label):
         if actor.get_actor_label() == label:
             return actor
     return None
+
+
+def mcp_require_actor(label):
+    actor = mcp_actor_by_label(label)
+    if actor is None:
+        etichette = [a.get_actor_label() for a in mcp_actor_subsystem().get_all_level_actors()]
+        raise ValueError(
+            "Nessun attore con label '%s' nel livello corrente. Presenti: %s"
+            % (label, ", ".join(sorted(etichette)[:20]) or "nessuno")
+        )
+    return actor
+
+
+def mcp_set_transform(label, location=None, rotation=None, scale=None):
+    """Sposta/ruota/scala un attore, in una transazione annullabile."""
+    actor = mcp_require_actor(label)
+    with mcp_transaction("MCP: trasforma %s" % label):
+        if location is not None:
+            actor.set_actor_location(mcp_to_vector(location), False, False)
+        if rotation is not None:
+            actor.set_actor_rotation(mcp_to_rotator(rotation), False)
+        if scale is not None:
+            actor.set_actor_scale3d(mcp_to_vector(scale, (1.0, 1.0, 1.0)))
+    return mcp_actor_info(actor)
+
+
+def mcp_delete_actor(label):
+    actor = mcp_require_actor(label)
+    with mcp_transaction("MCP: elimina %s" % label):
+        mcp_actor_subsystem().destroy_actor(actor)
+    return {"deleted": label}
+
+
+def mcp_coerce_value(value):
+    """Converte i valori JSON nei tipi Unreal attesi dalle proprietà.
+
+    Il ponte MCP trasporta solo JSON: un Vector arriva come dict e un asset
+    come stringa di path. Senza questa conversione `set_editor_property`
+    rifiuta il valore.
+    """
+    if isinstance(value, dict):
+        chiavi = {k.lower() for k in value}
+        if {"x", "y", "z"} <= chiavi:
+            return mcp_to_vector(value)
+        if {"pitch", "yaw", "roll"} <= chiavi:
+            return mcp_to_rotator(value)
+        if {"r", "g", "b"} <= chiavi:
+            return unreal.LinearColor(
+                float(value.get("r", 0.0)),
+                float(value.get("g", 0.0)),
+                float(value.get("b", 0.0)),
+                float(value.get("a", 1.0)),
+            )
+        return value
+    if isinstance(value, str) and value.startswith(("/Game/", "/Engine/")):
+        if mcp_asset_lib().does_asset_exist(value):
+            return mcp_asset_lib().load_asset(value)
+    return value
+
+
+def mcp_actor_components(actor):
+    """Componenti dell'attore, con nome e classe."""
+    try:
+        componenti = actor.get_components_by_class(unreal.ActorComponent)
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for componente in componenti or []:
+        try:
+            out.append(
+                {
+                    "name": str(componente.get_name()),
+                    "class": str(componente.get_class().get_name()),
+                    "object": componente,
+                }
+            )
+        except Exception:  # noqa: BLE001, S112 - un componente illeggibile non deve nascondere gli altri
+            continue
+    return out
+
+
+def mcp_find_component(actor, riferimento):
+    """Trova un componente per nome o per nome di classe (match parziale)."""
+    componenti = mcp_actor_components(actor)
+    cercato = str(riferimento).lower()
+    for componente in componenti:
+        if componente["name"].lower() == cercato:
+            return componente["object"]
+    for componente in componenti:
+        if cercato in componente["class"].lower() or cercato in componente["name"].lower():
+            return componente["object"]
+    disponibili = ", ".join("%s (%s)" % (c["name"], c["class"]) for c in componenti)
+    raise ValueError(
+        "Nessun componente '%s' su '%s'. Disponibili: %s"
+        % (riferimento, actor.get_actor_label(), disponibili or "nessuno")
+    )
+
+
+def mcp_set_actor_property(label, properties, component=None):
+    """Imposta proprietà su un attore già piazzato (o su un suo componente).
+
+    Serve per tutto ciò che non sono i Class Defaults di un Blueprint: la mesh
+    di uno StaticMeshActor, l'intensità di una luce, il raggio di un trigger.
+    """
+    actor = mcp_require_actor(label)
+    target = actor if component is None else mcp_find_component(actor, component)
+
+    applied = {}
+    failed = {}
+    with mcp_transaction("MCP: proprietà di %s" % label):
+        for chiave, valore in (properties or {}).items():
+            try:
+                target.set_editor_property(chiave, mcp_coerce_value(valore))
+                applied[chiave] = valore
+            except Exception as exc:  # noqa: BLE001
+                failed[chiave] = "%s: %s" % (type(exc).__name__, exc)
+
+    return {
+        "actor": label,
+        "component": component,
+        "applied": applied,
+        "failed": failed,
+        "info": mcp_actor_info(actor),
+    }
+
+
+def mcp_actor_component_list(label):
+    """Elenca i componenti di un attore piazzato, per sapere cosa si può impostare."""
+    actor = mcp_require_actor(label)
+    return {
+        "actor": label,
+        "components": [
+            {"name": c["name"], "class": c["class"]} for c in mcp_actor_components(actor)
+        ],
+    }
 
 
 # ----------------------------------------------------------------- blueprint
@@ -286,6 +491,49 @@ def mcp_compile_blueprint(path):
     unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
     mcp_asset_lib().save_asset(path)
     return {"path": path, "compiled": True}
+
+
+def mcp_reparent_blueprint(blueprint_path, new_parent, remove_unused_variables=False):
+    """Riassegna il parent di un Blueprint, tipicamente a una classe C++.
+
+    È il modo per dare logica a un Blueprint senza poterne scrivere il grafo:
+    la logica sta nella classe C++ padre, il Blueprint resta il contenitore di
+    dati e componenti. Le variabili del Blueprint con lo stesso nome di una
+    UPROPERTY del nuovo padre vengono assorbite; le altre sopravvivono con un
+    suffisso `_0`, e `remove_unused_variables` le ripulisce.
+    """
+    library = unreal.BlueprintEditorLibrary
+    if not hasattr(library, "reparent_blueprint"):
+        raise RuntimeError(
+            "BlueprintEditorLibrary.reparent_blueprint non è disponibile in questa "
+            "versione del motore (%s): cambia il parent da Class Settings "
+            "nell'editor del Blueprint." % unreal.SystemLibrary.get_engine_version()
+        )
+
+    blueprint = mcp_load_blueprint(blueprint_path)
+    classe = mcp_resolve_class(new_parent)
+
+    prima = [str(n) for n in (library.list_member_variable_names(blueprint) or [])]
+    library.reparent_blueprint(blueprint, classe)
+    library.compile_blueprint(blueprint)
+
+    rimosse = False
+    if remove_unused_variables and hasattr(library, "remove_unused_variables"):
+        library.remove_unused_variables(blueprint)
+        library.compile_blueprint(blueprint)
+        rimosse = True
+
+    dopo = [str(n) for n in (library.list_member_variable_names(blueprint) or [])]
+    mcp_asset_lib().save_asset(blueprint_path)
+
+    return {
+        "blueprint": blueprint_path,
+        "new_parent": str(new_parent),
+        "variables_before": prima,
+        "variables_after": dopo,
+        "absorbed_by_parent": sorted(set(prima) - set(dopo)),
+        "unused_removed": rimosse,
+    }
 
 
 def mcp_add_component(blueprint_path, component_class, name=None):
@@ -475,6 +723,261 @@ def mcp_set_class_defaults(blueprint_path, properties):
     return {"blueprint": blueprint_path, "applied": applied}
 
 
+# ----------------------------------------------------------------- materiali
+
+#: Mappa nome amichevole -> proprietà di FMaterialEditingLibrary.
+#: I nomi corrispondono a EMaterialProperty (senza il prefisso MP_).
+MCP_MATERIAL_SLOTS = {
+    "base_color": "MP_BASE_COLOR",
+    "metallic": "MP_METALLIC",
+    "specular": "MP_SPECULAR",
+    "roughness": "MP_ROUGHNESS",
+    "emissive": "MP_EMISSIVE_COLOR",
+    "emissive_color": "MP_EMISSIVE_COLOR",
+    "opacity": "MP_OPACITY",
+    "opacity_mask": "MP_OPACITY_MASK",
+    "normal": "MP_NORMAL",
+    "ambient_occlusion": "MP_AMBIENT_OCCLUSION",
+}
+
+#: Suffissi tipici dei file PBR scaricati da ambientCG / Poly Haven,
+#: usati per collegare automaticamente le texture ai canali giusti.
+MCP_TEXTURE_HINTS = (
+    ("normalgl", "normal"), ("normaldx", "normal"), ("normal", "normal"), ("_nrm", "normal"),
+    ("basecolor", "base_color"), ("albedo", "base_color"), ("diffuse", "base_color"),
+    ("_col", "base_color"), ("color", "base_color"),
+    ("roughness", "roughness"), ("_rgh", "roughness"),
+    ("metalness", "metallic"), ("metallic", "metallic"), ("_mtl", "metallic"),
+    ("ambientocclusion", "ambient_occlusion"), ("_ao", "ambient_occlusion"),
+    ("displacement", None), ("height", None),
+)
+
+
+def mcp_material_lib():
+    if not hasattr(unreal, "MaterialEditingLibrary"):
+        raise RuntimeError(
+            "MaterialEditingLibrary non disponibile in questa versione del motore: "
+            "i materiali vanno creati a mano nell'editor."
+        )
+    return unreal.MaterialEditingLibrary
+
+
+def mcp_material_property(nome):
+    slot = MCP_MATERIAL_SLOTS.get(str(nome).lower())
+    if slot is None:
+        raise ValueError(
+            "Canale materiale '%s' non riconosciuto. Disponibili: %s"
+            % (nome, ", ".join(sorted(MCP_MATERIAL_SLOTS)))
+        )
+    return getattr(unreal.MaterialProperty, slot)
+
+
+def mcp_guess_channel(percorso_texture):
+    """Deduce il canale PBR dal nome file (convenzioni ambientCG / Poly Haven)."""
+    nome = str(percorso_texture).rsplit("/", 1)[-1].lower()
+    for indizio, canale in MCP_TEXTURE_HINTS:
+        if indizio in nome:
+            return canale
+    return None
+
+
+def mcp_create_material(package_path, name, textures=None, scalars=None, two_sided=False):
+    """Crea un materiale e vi collega le texture indicate.
+
+    `textures` è una mappa canale -> path della texture importata; se il canale
+    è `"auto"` viene dedotto dal nome del file. `scalars` imposta costanti
+    (es. {"roughness": 0.4}) sui canali senza texture.
+
+    Il grafo *materiale* è pienamente scriptabile da Python, a differenza di
+    quello Blueprint: qui si costruiscono davvero i nodi e i collegamenti.
+    """
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    library = mcp_material_lib()
+
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    materiale = mcp_asset_tools().create_asset(
+        name, package_path, unreal.Material, unreal.MaterialFactoryNew()
+    )
+    if materiale is None:
+        raise RuntimeError("Creazione del materiale '%s' fallita." % full)
+
+    if two_sided:
+        materiale.set_editor_property("two_sided", True)
+
+    collegate = {}
+    saltate = []
+    altezza = -350
+
+    for canale, percorso in (textures or {}).items():
+        effettivo = mcp_guess_channel(percorso) if str(canale).lower() == "auto" else canale
+        if effettivo is None:
+            saltate.append({"texture": percorso, "reason": "canale non deducibile dal nome"})
+            continue
+        if not mcp_asset_lib().does_asset_exist(percorso):
+            saltate.append({"texture": percorso, "reason": "asset non trovato"})
+            continue
+
+        texture = mcp_asset_lib().load_asset(percorso)
+        nodo = library.create_material_expression(
+            materiale, unreal.MaterialExpressionTextureSampleParameter2D, -400, altezza
+        )
+        nodo.set_editor_property("texture", texture)
+        nodo.set_editor_property("parameter_name", unreal.Name(effettivo))
+        # Le normal map hanno una compressione e uno spazio colore diversi:
+        # senza questo il canale normale viene interpretato come colore.
+        if effettivo == "normal":
+            texture.set_editor_property("srgb", False)
+            nodo.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+
+        library.connect_material_property(nodo, "", mcp_material_property(effettivo))
+        collegate[effettivo] = percorso
+        altezza += 250
+
+    for canale, valore in (scalars or {}).items():
+        if canale in collegate:
+            continue
+        nodo = library.create_material_expression(
+            materiale, unreal.MaterialExpressionScalarParameter, -400, altezza
+        )
+        nodo.set_editor_property("parameter_name", unreal.Name(canale))
+        nodo.set_editor_property("default_value", float(valore))
+        library.connect_material_property(nodo, "", mcp_material_property(canale))
+        collegate[canale] = float(valore)
+        altezza += 150
+
+    library.recompile_material(materiale)
+    mcp_asset_lib().save_asset(full)
+    return {
+        "path": full,
+        "created": True,
+        "connected": collegate,
+        "skipped": saltate,
+    }
+
+
+def mcp_create_material_instance(package_path, name, parent_path, parameters=None):
+    """Crea una Material Instance da un materiale padre e ne imposta i parametri.
+
+    I parametri sono la via economica per variare un materiale: niente
+    ricompilazione del grafo, e si possono cambiare a runtime.
+    """
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    library = mcp_material_lib()
+
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    padre = mcp_asset_lib().load_asset(parent_path)
+    if padre is None:
+        raise ValueError("Materiale padre '%s' non trovato." % parent_path)
+
+    istanza = mcp_asset_tools().create_asset(
+        name, package_path, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew()
+    )
+    if istanza is None:
+        raise RuntimeError("Creazione della material instance '%s' fallita." % full)
+
+    library.set_material_instance_parent(istanza, padre)
+
+    applicati = {}
+    for chiave, valore in (parameters or {}).items():
+        nome = unreal.Name(chiave)
+        if isinstance(valore, str) and mcp_asset_lib().does_asset_exist(valore):
+            library.set_material_instance_texture_parameter_value(
+                istanza, nome, mcp_asset_lib().load_asset(valore)
+            )
+        elif isinstance(valore, dict):
+            library.set_material_instance_vector_parameter_value(
+                istanza, nome, mcp_coerce_value(valore)
+            )
+        elif isinstance(valore, bool):
+            library.set_material_instance_static_switch_parameter_value(istanza, nome, valore)
+        else:
+            library.set_material_instance_scalar_parameter_value(istanza, nome, float(valore))
+        applicati[chiave] = valore
+
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "parent": parent_path, "parameters": applicati}
+
+
+def mcp_assign_material(label, material_path, slot=0, component=None):
+    """Assegna un materiale a un attore piazzato."""
+    actor = mcp_require_actor(label)
+    materiale = mcp_asset_lib().load_asset(material_path)
+    if materiale is None:
+        raise ValueError("Materiale '%s' non trovato." % material_path)
+
+    target = mcp_find_component(actor, component or "MeshComponent")
+    with mcp_transaction("MCP: materiale su %s" % label):
+        target.set_material(int(slot), materiale)
+
+    return {
+        "actor": label,
+        "material": material_path,
+        "slot": int(slot),
+        "component": str(target.get_name()),
+    }
+
+
+# ---------------------------------------------------------------- screenshot
+
+
+def mcp_screenshot(filename=None, width=1280, height=720):
+    """Cattura la viewport dell'editor in un file PNG e ne restituisce il path.
+
+    È l'unico modo perché l'agente veda il risultato di quello che costruisce,
+    invece di dedurlo dalle coordinate.
+    """
+    cartella = os.path.join(unreal.Paths.project_saved_dir(), "Screenshots", "MCP")
+    if not os.path.isdir(cartella):
+        os.makedirs(cartella)
+
+    nome = filename or ("mcp_%d.png" % int(_mcp_time().time() * 1000))
+    if not nome.lower().endswith(".png"):
+        nome += ".png"
+    destinazione = os.path.join(cartella, nome)
+
+    if hasattr(unreal, "AutomationLibrary"):
+        unreal.AutomationLibrary.take_high_res_screenshot(
+            int(width), int(height), destinazione
+        )
+    else:
+        mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        unreal.SystemLibrary.execute_console_command(
+            mondo, 'HighResShot %dx%d filename="%s"' % (int(width), int(height), destinazione)
+        )
+
+    # La cattura è asincrona: il file compare uno o due frame dopo la richiesta.
+    scadenza = _mcp_time().time() + 15.0
+    while _mcp_time().time() < scadenza:
+        if os.path.exists(destinazione) and os.path.getsize(destinazione) > 0:
+            break
+        _mcp_time().sleep(0.25)
+
+    esiste = os.path.exists(destinazione)
+    return {
+        "file": destinazione if esiste else None,
+        "requested": destinazione,
+        "width": int(width),
+        "height": int(height),
+        "captured": esiste,
+        "note": None
+        if esiste
+        else (
+            "Screenshot non ancora scritto su disco. In editor la cattura avviene al "
+            "frame successivo: riprova, oppure controlla che la viewport sia visibile."
+        ),
+    }
+
+
+def _mcp_time():
+    import time as modulo
+
+    return modulo
+
+
 # ---------------------------------------------------------------- networking
 
 
@@ -527,7 +1030,7 @@ def mcp_configure_pie(num_players=1, net_mode="standalone", one_process=True):
     # PlayNetMode è una ByteProperty su EPlayNetMode, enum non esposto al Python
     # di UE 5.8: non si può assegnare a runtime, si scrive nella config utente.
     mode_name = {0: "PIE_Standalone", 1: "PIE_ListenServer", 2: "PIE_Client"}[mode]
-    nota = None
+    note = None
     try:
         settings.set_editor_property("PlayNetMode", mode)
         applied_now = True
@@ -539,18 +1042,18 @@ def mcp_configure_pie(num_players=1, net_mode="standalone", one_process=True):
             mode_name,
             "EditorPerProjectUserSettings",
         )
-        nota = (
-            "net_mode scritto in Config/DefaultEditorPerProjectUserSettings.ini: "
-            "attivo al prossimo avvio dell'editor. Per usarlo subito, cambialo dal menu "
-            "a tendina accanto al pulsante Play (Net Mode: Play As Listen Server)."
+        note = (
+            "net_mode written to Config/DefaultEditorPerProjectUserSettings.ini: it "
+            "takes effect on the next editor start. To use it right away, pick it from "
+            "the dropdown next to the Play button (Net Mode: Play As Listen Server)."
         )
 
     return {
         "num_players": settings.get_editor_property("PlayNumberOfClients"),
         "net_mode": mode_name,
-        "net_mode_attivo_subito": applied_now,
+        "net_mode_active_now": applied_now,
         "one_process": settings.get_editor_property("RunUnderOneProcess"),
-        "nota": nota,
+        "note": note,
     }
 
 
@@ -592,7 +1095,7 @@ def mcp_live_compile(attesa_massima=20.0):
     file_log = max((os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".log")),
                    key=os.path.getmtime)
 
-    with open(file_log, "r", encoding="utf-8", errors="replace") as handle:
+    with open(file_log, encoding="utf-8", errors="replace") as handle:
         righe_prima = len(handle.read().splitlines())
 
     mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
@@ -604,7 +1107,7 @@ def mcp_live_compile(attesa_massima=20.0):
 
     while _time.time() < scadenza:
         _time.sleep(1.0)
-        with open(file_log, "r", encoding="utf-8", errors="replace") as handle:
+        with open(file_log, encoding="utf-8", errors="replace") as handle:
             righe = handle.read().splitlines()
         nuove = [r.split("]")[-1].strip() for r in righe[righe_prima:] if "LiveCoding" in r]
         if any(any(e in r.lower() for e in esiti) for r in nuove):
@@ -614,15 +1117,15 @@ def mcp_live_compile(attesa_massima=20.0):
     fallito = any("failed" in r.lower() or "error" in r.lower() for r in nuove)
 
     return {
-        "avviato": True,
-        "riuscito": riuscito,
-        "fallito": fallito,
-        "in_corso": not (riuscito or fallito),
+        "started": True,
+        "succeeded": riuscito,
+        "failed": fallito,
+        "in_progress": not (riuscito or fallito),
         "log": nuove[-10:],
-        "nota": (
-            "Live Coding applica patch alle funzioni esistenti. Se hai aggiunto o "
-            "modificato UCLASS/UFUNCTION/UPROPERTY serve comunque ue_build_start "
-            "a editor chiuso."
+        "note": (
+            "Live Coding patches existing function bodies. If you added or changed a "
+            "UCLASS/UFUNCTION/UPROPERTY you still need ue_build_start with the editor "
+            "closed."
         ),
     }
 
@@ -633,7 +1136,7 @@ def mcp_set_project_setting(section, key, value, config="Game"):
     ini_path = os.path.join(config_dir, "Default%s.ini" % config)
     lines = []
     if os.path.exists(ini_path):
-        with open(ini_path, "r", encoding="utf-8-sig") as handle:
+        with open(ini_path, encoding="utf-8-sig") as handle:
             lines = handle.read().splitlines()
 
     header = "[%s]" % section
@@ -739,13 +1242,13 @@ def mcp_tail_log(lines=80, only_errors=False):
     if not candidates:
         return {"file": None, "lines": []}
     newest = max(candidates, key=os.path.getmtime)
-    with open(newest, "r", encoding="utf-8", errors="replace") as handle:
+    with open(newest, encoding="utf-8", errors="replace") as handle:
         content = handle.read().splitlines()
     if only_errors:
-        content = [l for l in content if "Error" in l or "Warning" in l]
+        content = [r for r in content if "Error" in r or "Warning" in r]
     # Le righe del log contengono le sentinelle delle chiamate MCP precedenti:
     # vanno neutralizzate, altrimenti confondono il parser della risposta.
-    pulite = [l.replace("<<<MCP_JSON", "<<<mcp-json") for l in content[-int(lines) :]]
+    pulite = [r.replace("<<<MCP_JSON", "<<<mcp-json") for r in content[-int(lines) :]]
     return {"file": newest, "lines": pulite}
 
 
