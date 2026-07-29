@@ -148,3 +148,28 @@ async def test_attach_attore_inesistente(tools):
     await _due_attori(tools)
     with pytest.raises(RuntimeError, match="Nessun attore"):
         await tools.ue_attach_actor("Fantasma", "Lampione")
+
+
+async def test_delete_protegge_dagli_attori_nel_livello_aperto(tools, unreal):
+    """Il caso che la protezione mancava, ed è quello che capita davvero.
+
+    `find_package_referencers_for_asset` guarda solo il disco. Mentre un agente
+    costruisce, il livello è aperto e non salvato: gli attori appena spawnati da
+    un Blueprint non risultano da nessuna parte, il tool dà via libera, e con
+    l'asset spariscono anche loro.
+    """
+    await tools.ue_create_blueprint("/Game/T", "BP_Usato")
+    await tools.ue_spawn_actor("/Game/T/BP_Usato", label="Istanza")
+
+    with pytest.raises(RuntimeError, match="nel livello"):
+        await tools.ue_delete_asset("/Game/T/BP_Usato")
+
+    esito = await tools.ue_delete_asset("/Game/T/BP_Usato", force=True)
+    assert esito["deleted"] is True
+    assert any("Istanza" in r for r in esito["referencers"])
+
+
+async def test_delete_di_asset_non_istanziato_resta_libero(tools, unreal):
+    await tools.ue_create_blueprint("/Game/T", "BP_MaiUsato")
+    esito = await tools.ue_delete_asset("/Game/T/BP_MaiUsato")
+    assert esito["deleted"] is True

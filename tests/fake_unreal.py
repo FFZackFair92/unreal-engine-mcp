@@ -90,9 +90,10 @@ class ActorComponent(FakeObject):
 
 
 class Actor(FakeObject):
-    def __init__(self, class_name="Actor", label="Actor_0"):
+    def __init__(self, class_name="Actor", label="Actor_0", class_path=None):
         super().__init__()
         self._class_name = class_name
+        self._class_path = class_path
         self._label = label
         self._location = Vector()
         self._rotation = Rotator()
@@ -118,7 +119,17 @@ class Actor(FakeObject):
         return self._label
 
     def get_class(self):
-        return types.SimpleNamespace(get_name=lambda: self._class_name)
+        """Come nel motore: la classe ha anche un path, non solo un nome.
+
+        Per un attore nato da un Blueprint il path è `<pacchetto>.<Nome>_C`, ed
+        è l'unico modo di risalire dall'istanza all'asset che l'ha generata —
+        cioè quello che serve per non cancellare un Blueprint ancora in uso.
+        """
+        percorso = self._class_path or ("/Script/Engine." + self._class_name)
+        return types.SimpleNamespace(
+            get_name=lambda: self._class_name,
+            get_path_name=lambda: percorso,
+        )
 
     def get_path_name(self):
         return "/Game/Levels/L_Test.L_Test:PersistentLevel." + self._label
@@ -360,7 +371,18 @@ def build_fake_unreal(tmp_path):
     class EditorActorSubsystem:
         def spawn_actor_from_class(self, cls, location, rotation):
             name = getattr(cls, "__unreal_name__", getattr(cls, "__name__", str(cls)))
-            actor = Actor(class_name=str(name), label="%s_%d" % (name, len(state["actors"])))
+            # mcp_resolve_class restituisce la stringa "<pacchetto>_C" per i
+            # Blueprint: da lì si ricava il path di classe come lo dà il motore.
+            percorso = None
+            if isinstance(cls, str) and cls.endswith("_C"):
+                pacchetto = cls[:-2]
+                percorso = "%s.%s_C" % (pacchetto, pacchetto.rsplit("/", 1)[-1])
+                name = pacchetto.rsplit("/", 1)[-1] + "_C"
+            actor = Actor(
+                class_name=str(name),
+                label="%s_%d" % (name, len(state["actors"])),
+                class_path=percorso,
+            )
             actor._location, actor._rotation = location, rotation
             state["actors"].append(actor)
             return actor

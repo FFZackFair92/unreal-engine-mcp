@@ -274,7 +274,7 @@ def mcp_console_command(command, wait_seconds=1.0):
     return {
         "command": str(command),
         "log_lines": nuove[-80:],
-        "log_bytes": len(nuove),
+        "log_line_count": len(nuove),
         "note": None
         if nuove
         else "nessun output nel log: molti comandi non stampano nulla, e alcuni "
@@ -377,6 +377,29 @@ def _mcp_normalizza_path_asset(path):
     return testo
 
 
+def mcp_level_users_of(asset_path):
+    """Attori del livello corrente che sono istanze dell'asset indicato.
+
+    `find_package_referencers_for_asset` guarda solo i riferimenti **su disco**.
+    Mentre un agente costruisce, il livello è aperto e modificato ma non
+    salvato: gli attori appena spawnati da un Blueprint non compaiono da
+    nessuna parte, la protezione contro le cancellazioni pericolose dà via
+    libera, e con l'asset spariscono anche loro. È esattamente il momento in cui
+    quella protezione dovrebbe funzionare.
+    """
+    percorso = _mcp_normalizza_path_asset(asset_path)
+    usati = []
+    for attore in mcp_actor_subsystem().get_all_level_actors():
+        try:
+            nome_classe = str(attore.get_class().get_path_name())
+        except Exception:  # noqa: BLE001
+            nome_classe = ""  # attore in uno stato strano: non lo si può attribuire
+        # Un Blueprint genera <path>.<Nome>_C: basta il prefisso del pacchetto.
+        if nome_classe.startswith(percorso + "."):
+            usati.append(attore.get_actor_label())
+    return usati
+
+
 def mcp_delete_asset(path, force=False):
     """Elimina un asset o una cartella dal Content Browser.
 
@@ -399,11 +422,15 @@ def mcp_delete_asset(path, force=False):
             referenti = [str(r) for r in libreria.find_package_referencers_for_asset(percorso, False)]
         except Exception:  # noqa: BLE001
             referenti = []
+        nel_livello = mcp_level_users_of(percorso)
+        if nel_livello:
+            referenti = referenti + ["(nel livello) %s" % etichetta for etichetta in nel_livello]
         if referenti and not force:
             raise ValueError(
-                "%s è referenziato da %d asset (%s). Cancellarlo lascerebbe "
-                "riferimenti rotti: usa force=True se è quello che vuoi."
-                % (percorso, len(referenti), ", ".join(referenti[:5]))
+                "%s è referenziato da %d elementi (%s). Cancellarlo lascerebbe "
+                "riferimenti rotti, e gli attori che lo istanziano nel livello "
+                "aperto sparirebbero insieme a lui: usa force=True se è quello "
+                "che vuoi." % (percorso, len(referenti), ", ".join(referenti[:5]))
             )
 
     with mcp_transaction("MCP: elimina %s" % percorso):
@@ -948,6 +975,55 @@ def mcp_pin_type(type_name, sub_type=None):
     return pin
 
 
+def mcp_coerce_to_var_type(value, var_type):
+    """Porta un valore JSON al tipo dichiarato della variabile Blueprint.
+
+    Il ponte trasporta JSON e i client non sono coerenti: lo stesso `100` può
+    arrivare come numero o come `"100"` a seconda di come il client serializza
+    un parametro dallo schema aperto. `set_editor_property` non perdona:
+    assegnare una stringa a una DoubleProperty solleva
+
+        TypeError: Cannot nativize 'str' as 'double'
+
+    Convertire qui, in base al tipo che è stato appena creato, costa poco ed
+    evita che il tool dipenda dai capricci di serializzazione del client.
+    """
+    if value is None:
+        return None
+    tipo = str(var_type or "").lower()
+
+    if tipo == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "si", "sì")
+        return bool(value)
+
+    if tipo in ("int", "int64", "byte"):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            raise ValueError(
+                "default_value %r non è convertibile in un intero per una "
+                "variabile di tipo %s" % (value, var_type)
+            ) from None
+
+    if tipo in ("float", "double", "real"):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "default_value %r non è convertibile in un numero per una "
+                "variabile di tipo %s" % (value, var_type)
+            ) from None
+
+    if tipo in ("string", "name", "text"):
+        return str(value)
+
+    # struct, object, class: ci pensa mcp_coerce_value (dict -> Vector, path -> asset)
+    return mcp_coerce_value(value)
+
+
 def mcp_add_variable(
     blueprint_path,
     var_name,
@@ -1004,10 +1080,11 @@ def mcp_add_variable(
 
     applied_default = None
     if default_value is not None:
+        valore = mcp_coerce_to_var_type(default_value, var_type)
         cdo = unreal.get_default_object(blueprint.generated_class())
-        cdo.set_editor_property(var_name, default_value)
+        cdo.set_editor_property(var_name, valore)
         library.compile_blueprint(blueprint)
-        applied_default = default_value
+        applied_default = valore
 
     mcp_asset_lib().save_asset(blueprint_path)
     return {

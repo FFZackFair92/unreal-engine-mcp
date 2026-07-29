@@ -264,3 +264,43 @@ async def test_console_command_senza_output_lo_dice(tools, unreal, monkeypatch):
     esito = await tools.ue_console_command("r.ScreenPercentage 50", wait_seconds=0)
     assert esito["log_lines"] == []
     assert "non stampano nulla" in esito["note"]
+
+
+# ------------------------------- il default della variabile arriva come JSON
+
+
+@pytest.mark.parametrize(
+    "tipo,inviato,atteso",
+    [
+        ("float", "100", 100.0),      # il client serializza il numero come stringa
+        ("float", 100, 100.0),
+        ("float", 2.5, 2.5),
+        ("int", "7", 7),
+        ("int", 7.9, 7),
+        ("bool", "true", True),
+        ("bool", "false", False),
+        ("bool", 1, True),
+        ("string", 42, "42"),
+    ],
+)
+async def test_default_convertito_al_tipo_della_variabile(tools, unreal, tipo, inviato, atteso):
+    """Su Unreal vero un default arrivato come stringa fa esplodere il set.
+
+        TypeError: Cannot nativize 'str' as 'double'
+
+    Lo stesso 100 può arrivare come numero o come "100" a seconda di come il
+    client serializza un parametro dallo schema aperto: la conversione va fatta
+    qui, non sperata a monte.
+    """
+    await tools.ue_create_blueprint("/Game/T", "BP_Var_%s_%s" % (tipo, abs(hash(str(inviato)))))
+    nome = list(unreal.state["assets"])[-1]
+    esito = await tools.ue_add_variable(nome, "V", var_type=tipo, default_value=inviato)
+    assert esito["default"] == atteso
+    assert type(esito["default"]) is type(atteso)
+
+
+async def test_default_non_convertibile_lo_dice(tools, unreal):
+    await tools.ue_create_blueprint("/Game/T", "BP_VarRotta")
+    nome = list(unreal.state["assets"])[-1]
+    with pytest.raises(RuntimeError, match="non è convertibile"):
+        await tools.ue_add_variable(nome, "V", var_type="float", default_value="parecchio")

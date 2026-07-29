@@ -4,6 +4,51 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-07-29
+
+First session driving a real Unreal editor end to end. Most tools worked on the
+first try; these did not, and none of the failures could have been caught by the
+suite as it stood.
+
+### Fixed
+
+- **Paths coming out of the editor are now absolute.** `unreal.Paths.*` returns
+  paths relative to the *engine binaries* directory, not the project, so
+  `project_saved_dir()` arrives as `../../../../../../Users/…/Saved/`. Inside
+  the editor that resolves; handed to a process living elsewhere it does not.
+  `ue_screenshot` reported `captured: false` for a PNG the engine had written
+  correctly, and `ue_status` returned a `project_file` nobody could open.
+  Everything now goes through `Paths.convert_relative_path_to_full` and is
+  normalised, separators included.
+
+- **Blueprint variable defaults are coerced to the variable's type.** The same
+  `100` arrives as a number or as `"100"` depending on how a client serialises
+  a parameter with an open schema, and `set_editor_property` does not forgive:
+
+      TypeError: Cannot nativize 'str' as 'double'
+
+  The value is now converted according to the type just created, rather than
+  hoping the client sent the right thing.
+
+- **`ue_delete_asset` sees actors in the open level.**
+  `find_package_referencers_for_asset` only reports references **on disk**.
+  While an agent builds, the level is open and unsaved, so actors just spawned
+  from a Blueprint appear nowhere: the guard that exists to prevent broken
+  references gave a clear all-clear, the asset was deleted, and the instances
+  in the level vanished with it. Level actors are now checked too and listed
+  among the referencers.
+
+- `ue_console_command` reported the number of new log lines under the key
+  `log_bytes`. It is now `log_line_count`.
+
+### Changed
+
+- **The fake engine used in tests now behaves like the real one** where it used
+  to be more forgiving: relative paths from `unreal.Paths.*`, a class object
+  that exposes `get_path_name`, console commands that write to the log. Every
+  one of the bugs above was invisible because the fake was kinder than Unreal —
+  the tests were green on a world that does not exist.
+
 ## [0.5.4] — 2026-07-29
 
 ### Fixed
