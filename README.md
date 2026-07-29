@@ -27,7 +27,7 @@ editor that is **already running**: creating a project, launching it, compiling
 and packaging all have to happen at the process level.
 
 - **68 tools** and **5 resources** — [full reference](docs/TOOLS.md)
-- **210 tests**, none of which need Unreal installed
+- **212 tests**, none of which need Unreal installed
 - **[Unreal automation notes](docs/UNREAL-NOTES.md)** — the API traps found the hard way
 
 ---

@@ -138,3 +138,49 @@ def test_package_rifiuta_argomenti_iniettabili(progetto, monkeypatch, kwargs):
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
     with pytest.raises(local.LocalError):
         local.start_package(progetto["uproject"], **kwargs)
+
+
+def _pyproject() -> dict:
+    """pyproject.toml letto come dati. `tomllib` è stdlib solo da 3.11."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - solo su 3.10
+        import tomli as tomllib
+
+    radice = Path(__file__).resolve().parents[1]
+    return tomllib.loads((radice / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+def test_i_comandi_installati_coprono_il_nome_della_distribuzione():
+    """`uvx <pacchetto>` esegue un eseguibile che si chiama come il pacchetto.
+
+    La distribuzione è `unreal-engine-mcp` ma lo script storico è `unreal-mcp`:
+    senza un alias, `uvx unreal-engine-mcp` — il comando che il README consiglia
+    — non trova niente ed esce, e il client MCP lo riporta solo come "Server
+    disconnected". È già successo una volta.
+    """
+    dati = _pyproject()
+    nome = dati["project"]["name"]
+    scripts = dati["project"]["scripts"]
+
+    assert nome in scripts, (
+        "manca un console script chiamato %r: `uvx %s` fallirebbe" % (nome, nome)
+    )
+    # Tutti gli alias devono puntare allo stesso entry point.
+    assert len(set(scripts.values())) == 1
+
+
+def test_il_readme_consiglia_un_comando_che_esiste():
+    """Il comando pubblicizzato nel README dev'essere davvero installato."""
+    import re
+
+    radice = Path(__file__).resolve().parents[1]
+    scripts = set(_pyproject()["project"]["scripts"])
+
+    for readme in ("README.md", "README.it.md"):
+        testo = (radice / readme).read_text(encoding="utf-8")
+        for comando in re.findall(r"^uvx (\S+)$", testo, re.MULTILINE):
+            assert comando in scripts, (
+                "%s consiglia `uvx %s`, ma i comandi installati sono %s"
+                % (readme, comando, sorted(scripts))
+            )

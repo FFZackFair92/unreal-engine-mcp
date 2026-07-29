@@ -3,7 +3,7 @@
 # esiste gia'. Il nome coincide con quello del repo, il modulo Python resta
 # `unreal_mcp` e il comando installato resta `unreal-mcp`.
 name = "unreal-engine-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -55,10 +55,19 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
+    # tomllib è nella stdlib solo da 3.11; i test leggono pyproject.toml per
+    # verificare che i comandi consigliati nel README esistano davvero.
+    'tomli>=2.0; python_version < "3.11"',
 ]
 
 [project.scripts]
 unreal-mcp = "unreal_mcp.server:main"
+# Alias con lo stesso nome della distribuzione. `uvx <pacchetto>` cerca un
+# eseguibile che si chiami come il pacchetto: senza questo, `uvx
+# unreal-engine-mcp` non trova niente ed esce, e il client MCP lo riporta solo
+# come "Server disconnected". Serve la forma lunga `uvx --from
+# unreal-engine-mcp unreal-mcp`, che nessuno indovina.
+unreal-engine-mcp = "unreal_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
