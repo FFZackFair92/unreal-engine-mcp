@@ -136,6 +136,18 @@ really do create and wire the nodes.
 | `ue_create_material_instance` | `package_path`, `name`, `parent_path`, `parameters` | Material Instance from a parent material. A number is a scalar, `{"r","g","b"}` a colour, a bool a static switch, a `/Game/...` path a texture. |
 | `ue_assign_material` | `label`, `material_path`, `slot`, `component` | Assigns a material to a placed actor. |
 
+## Console and rendering
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_console_command` | `command`, `wait_seconds` | Runs an editor console command and returns **what it printed**. Console commands do not return values, they write to the log, so the tool diffs the log around the call; a command that prints nothing says so instead of leaving it ambiguous. Goes through the editor's Python interpreter, not the `bAllowConsoleCommandRemoteExecution` gate — same caveat as `ue_exec_python`. |
+| `ue_render_sequence` | `uproject`, `sequence`, `config`, `map_path`, `output_dir`, `resolution`, `force` | Renders a Level Sequence through the Movie Render Queue in a headless `UnrealEditor-Cmd` process. In-editor MRQ is asynchronous and would hold the editor for the whole render; a separate process is followed like a build. `config` (a saved Movie Pipeline preset) is how format, resolution and output directory are chosen — without one, MRQ uses project defaults and may write nothing. |
+| `ue_render_status` | `tail_lines`, `uproject`, `wait_seconds` | Progress of the render. `succeeded` is decided by **files produced**, not the exit code: a headless MRQ run can exit 0 having rendered zero frames. New files are found by diffing the output directory against a snapshot taken at start, not by modification time — comparing a process clock against a filesystem's finds nothing on a network share. |
+
+> These two are the least verified tools in the project. Their pure parts are
+> tested — format mapping, command construction, path validation, output
+> collection — but no test here has ever rendered a frame with a real engine.
+
 ## Viewport camera (editor)
 
 | Tool | Parameters | What it does |

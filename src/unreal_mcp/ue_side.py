@@ -238,6 +238,50 @@ def mcp_list_assets(path, recursive=True, class_filter=None):
     return out
 
 
+# ------------------------------------------------------- comandi di console
+
+
+def mcp_console_command(command, wait_seconds=1.0):
+    """Esegue un comando della console dell'editor e restituisce ciò che stampa.
+
+    Il valore non torna mai come risultato: i comandi di console scrivono nel
+    log e basta. Qui si misura la lunghezza del log prima, si esegue, si aspetta
+    un attimo che il motore abbia scritto, e si restituisce solo la coda nuova —
+    altrimenti chi chiama riceve "fatto" e nessuna informazione.
+
+    Passa da `unreal.SystemLibrary.execute_console_command`, cioè dall'interprete
+    Python interno: **non** dal gate `bAllowConsoleCommandRemoteExecution` della
+    Remote Control API, che resta spento. Vale la stessa avvertenza di
+    mcp_exec_python: da qui si può fare tutto quello che si fa dalla console,
+    `quit` compreso.
+    """
+    percorso = mcp_log_path()
+    prima = 0
+    if percorso and os.path.isfile(percorso):
+        prima = os.path.getsize(percorso)
+
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    unreal.SystemLibrary.execute_console_command(mondo, str(command))
+
+    _mcp_time().sleep(max(0.0, float(wait_seconds)))
+
+    nuove = []
+    if percorso and os.path.isfile(percorso):
+        with open(percorso, encoding="utf-8", errors="replace") as handle:
+            handle.seek(prima)
+            nuove = [riga.rstrip("\n") for riga in handle.readlines()]
+
+    return {
+        "command": str(command),
+        "log_lines": nuove[-80:],
+        "log_bytes": len(nuove),
+        "note": None
+        if nuove
+        else "nessun output nel log: molti comandi non stampano nulla, e alcuni "
+        "hanno effetto solo in Play In Editor",
+    }
+
+
 # ------------------------------------------------------- camera della viewport
 
 
@@ -1501,12 +1545,25 @@ def mcp_project_status():
     }
 
 
-def mcp_tail_log(lines=80, only_errors=False):
+def mcp_log_path():
+    """Il file di log dell'editor attualmente in scrittura, o None.
+
+    Non è sempre `<Progetto>.log`: quando gira una seconda istanza Unreal
+    aggiunge un suffisso (`_2`), quindi si prende il più recente della cartella.
+    """
     log_dir = unreal.Paths.project_log_dir()
+    if not os.path.isdir(log_dir):
+        return None
     candidates = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".log")]
     if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def mcp_tail_log(lines=80, only_errors=False):
+    newest = mcp_log_path()
+    if newest is None:
         return {"file": None, "lines": []}
-    newest = max(candidates, key=os.path.getmtime)
     with open(newest, encoding="utf-8", errors="replace") as handle:
         content = handle.read().splitlines()
     if only_errors:

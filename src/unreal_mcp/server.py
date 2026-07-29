@@ -1210,6 +1210,104 @@ async def ue_assign_material(
 MAX_SCREENSHOT_BYTES = int(os.environ.get("UE_MCP_MAX_SCREENSHOT", 1_500_000))
 
 
+# ============================================================ console e render
+
+
+@mcp.tool()
+async def ue_console_command(command: str, wait_seconds: float = 1.0) -> dict:
+    """Esegue un comando della console dell'editor e restituisce ciò che stampa.
+
+    I comandi di console non restituiscono valori: scrivono nel log. Questo tool
+    misura il log prima e dopo e riporta solo le righe nuove, altrimenti la
+    risposta sarebbe "fatto" e nient'altro.
+
+    Utile per `stat unit`, `r.ScreenPercentage 50`, `showflag.*`, `DumpConsoleCommands`.
+    Passa dall'interprete Python dell'editor, non dal gate
+    `bAllowConsoleCommandRemoteExecution` della Remote Control API, che resta
+    spento: da qui si può fare tutto quello che si fa dalla console, `quit`
+    compreso.
+
+    Args:
+        command: il comando, es. "stat fps".
+        wait_seconds: quanto attendere che il motore scriva nel log.
+    """
+    return await run(
+        f"result = mcp_console_command({lit(command)}, {float(wait_seconds)})"
+    )
+
+
+@mcp.tool()
+async def ue_render_sequence(
+    uproject: str,
+    sequence: str,
+    config: str | None = None,
+    map_path: str | None = None,
+    output_dir: str | None = None,
+    resolution: list[int] | None = None,
+    engine_version: str | None = None,
+    engine_root: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Renderizza una Level Sequence con la Movie Render Queue, in background.
+
+    Gira in un processo `UnrealEditor-Cmd` headless, non nell'editor aperto: la
+    MRQ in-editor è asincrona e terrebbe l'editor occupato per tutta la durata,
+    senza un modo pulito di attenderla dal bridge. Come per le build, si avvia e
+    si consulta ue_render_status.
+
+    Args:
+        uproject: percorso del file .uproject.
+        sequence: la Level Sequence, es. "/Game/Cinematics/LS_Intro".
+        config: preset di Movie Pipeline salvato, es.
+            "/Game/Cinematics/MRQ_Preset". **È il modo di scegliere formato,
+            risoluzione e cartella di uscita**: senza, la MRQ usa le
+            impostazioni predefinite del progetto e potrebbe non scrivere nulla.
+        map_path: livello da caricare; default quello di avvio del progetto.
+        output_dir: dove cercare i file prodotti; default <Progetto>/Saved/MovieRenders.
+        resolution: [larghezza, altezza]; default [1920, 1080].
+        force: avvia anche se risulta già un render in corso.
+    """
+    return local_call(
+        local.start_render,
+        uproject,
+        sequence,
+        config,
+        map_path,
+        output_dir,
+        resolution,
+        engine_version,
+        engine_root,
+        force,
+    )
+
+
+@mcp.tool()
+async def ue_render_status(
+    tail_lines: int = 30,
+    uproject: str | None = None,
+    wait_seconds: float = 0,
+    ctx: Context | None = None,
+) -> dict:
+    """Stato del render avviato con ue_render_sequence.
+
+    `succeeded` guarda i file prodotti, non il codice di uscita: la MRQ headless
+    può chiudere con 0 senza aver scritto un fotogramma, se la config non aveva
+    nodi di output.
+
+    Args:
+        tail_lines: quante righe finali del log restituire.
+        uproject: a quale progetto si riferisce; se omesso, l'ultimo render avviato.
+        wait_seconds: se > 0 attende la fine fino a questo limite riportando
+            l'avanzamento, invece di restituire subito.
+    """
+    def leggi() -> dict:
+        return local_call(local.render_status, tail_lines, uproject)
+
+    if wait_seconds > 0:
+        return await _attendi_job(leggi, wait_seconds, ctx, "render")
+    return leggi()
+
+
 # ================================================================ viewport
 
 

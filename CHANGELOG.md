@@ -4,6 +4,46 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-07-29
+
+### Added
+
+- **`ue_console_command`** — runs an editor console command and returns what it
+  printed. Console commands do not return values, they write to the log, so the
+  tool measures the log before and after and hands back only the new lines;
+  otherwise the answer would be "done" and nothing else, which tells an agent
+  nothing. When a command prints nothing the response says so rather than
+  leaving it ambiguous. Goes through the editor's Python interpreter, not the
+  `bAllowConsoleCommandRemoteExecution` gate of the Remote Control API, which
+  stays off — the same caveat as `ue_exec_python` applies.
+
+- **`ue_render_sequence` and `ue_render_status`** — Movie Render Queue renders
+  of a Level Sequence, in a headless `UnrealEditor-Cmd` process rather than in
+  the open editor. In-editor MRQ is asynchronous and would hold the editor for
+  the whole render with no clean way to await it over the bridge; a separate
+  process starts, writes and finishes, and is followed exactly like a build.
+
+  `config` — a saved Movie Pipeline preset — is how output format, resolution
+  and directory are chosen; without one, MRQ falls back to the project defaults
+  and may write nothing at all. Which is why `succeeded` is decided by the
+  files produced, not by the exit code: a headless MRQ run can exit 0 having
+  rendered zero frames. Produced files are identified by diffing the output
+  directory against a snapshot taken at start, not by modification time —
+  comparing a process clock against a filesystem's finds nothing at all on a
+  network share or a mount with a skewed clock.
+
+  Content paths are validated before they reach the command line: the engine
+  re-tokenizes its own command line on whitespace, so a path containing a space
+  and a dash would become another switch.
+
+### Note on what is verified
+
+The render tools are covered by tests of the pure parts — format mapping,
+command construction, path validation, output collection, status logic — with a
+faked process. **No test in this project has ever rendered a frame with a real
+engine.** What remains unverified is whether this command line produces output
+against a live Unreal installation.
+
 ## [0.4.4] — 2026-07-29
 
 Three failures from one afternoon of driving a real editor, all variations on

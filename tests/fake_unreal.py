@@ -637,6 +637,11 @@ def build_fake_unreal(tmp_path):
     # ---- varie
     def execute_console_command(world, cmd):
         state.setdefault("console", []).append(cmd)
+        # I comandi di console non restituiscono niente: scrivono nel log. Il
+        # finto ne stampa una riga, che è quello che mcp_console_command rilegge.
+        log = tmp_path / "Saved" / "Logs" / "MyGame.log"
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write("[0]LogConsoleResponse: eseguito %s\n" % cmd)
         # Live Coding scrive l'esito nel log dell'editor: lo simuliamo.
         if cmd == "LiveCoding.Compile":
             log = tmp_path / "Saved" / "Logs" / "MyGame.log"

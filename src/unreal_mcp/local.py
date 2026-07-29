@@ -1381,6 +1381,253 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
     return esito
 
 
+# ---------------------------------------------------- render (Movie Render Queue)
+
+RENDER_STATE_FILE = STATE_DIR / "render.json"
+
+#: Formato di uscita -> classi di output da mettere nella config della Movie
+#: Pipeline. `mp4` non ha un nodo nativo: si rendono PNG e si lascia che
+#: l'encoder da riga di comando del progetto (ffmpeg) li unisca.
+RENDER_OUTPUT_CLASSES = {
+    "png": ["MoviePipelineImageSequenceOutput_PNG"],
+    "jpg": ["MoviePipelineImageSequenceOutput_JPG"],
+    "exr": ["MoviePipelineImageSequenceOutput_EXR"],
+    "bmp": ["MoviePipelineImageSequenceOutput_BMP"],
+    "prores": ["MoviePipelineAppleProResOutput"],
+    "mp4": ["MoviePipelineImageSequenceOutput_PNG", "MoviePipelineCommandLineEncoder"],
+}
+
+
+def render_output_classes(output_format: str) -> list[str]:
+    chiave = str(output_format).lower().lstrip(".")
+    if chiave not in RENDER_OUTPUT_CLASSES:
+        raise LocalError(
+            "output_format %r sconosciuto. Ammessi: %s."
+            % (output_format, ", ".join(sorted(RENDER_OUTPUT_CLASSES)))
+        )
+    return list(RENDER_OUTPUT_CLASSES[chiave])
+
+
+def to_object_path(asset_path: str) -> str:
+    """Da path di contenuto (/Game/X/Cfg) a object path (/Game/X/Cfg.Cfg).
+
+    È la forma che vuole la riga di comando di UnrealEditor-Cmd: il pacchetto,
+    un punto, e il nome dell'oggetto dentro il pacchetto.
+    """
+    pacchetto = str(asset_path).split(".")[0]
+    nome = pacchetto.rstrip("/").rsplit("/", 1)[-1]
+    return "%s.%s" % (pacchetto, nome)
+
+
+def editor_cmd_executable(engine: EngineInstall) -> str:
+    """`UnrealEditor-Cmd`, la variante da riga di comando accanto all'editor.
+
+    Rende senza aprire una finestra. Se non c'è si ripiega sull'editor normale,
+    che con -RenderOffscreen fa lo stesso lavoro ma pesa di più.
+    """
+    editor = Path(engine.editor)
+    candidato = editor.with_name(editor.stem + "-Cmd" + editor.suffix)
+    return str(candidato if candidato.exists() else editor)
+
+
+def build_render_command(
+    editor_cmd: str,
+    uproject: str,
+    map_object: str,
+    sequence_object: str,
+    config_object: str | None,
+    resolution: list[int] | None,
+) -> list[str]:
+    """Riga di comando per un render offscreen della Movie Render Queue.
+
+    Gli argomenti sono passati come lista, non come stringa: il motore ricostruisce
+    e ri-tokenizza la propria riga di comando sugli spazi, quindi un path di
+    contenuto con uno spazio e un trattino diventerebbe un altro switch. Per
+    questo i path passano prima da :func:`_check_token`.
+    """
+    larghezza, altezza = (resolution or [1920, 1080])[:2]
+    args = [
+        editor_cmd,
+        uproject,
+        map_object,
+        "-game",
+        "-NoSplash",
+        "-RenderOffscreen",
+        "-Unattended",
+        "-NoLoadingScreen",
+        "-resx=%d" % int(larghezza),
+        "-resy=%d" % int(altezza),
+        "-LevelSequence=%s" % sequence_object,
+    ]
+    if config_object:
+        args.append("-MoviePipelineConfig=%s" % config_object)
+    return args
+
+
+def collect_render_output(output_dir: str | None, exclude: list[str] | None = None) -> list[str]:
+    """File presenti sotto `output_dir`, meno quelli da escludere.
+
+    L'esclusione è un confronto fra insiemi e non un filtro sul tempo di
+    modifica: `mtime >= avvio` sembra più naturale ma confronta l'orologio del
+    processo con quello del filesystem, e basta una cartella di rete o un
+    montaggio con clock diverso perché non trovi niente pur essendoci i file.
+    """
+    if not output_dir:
+        return []
+    base = Path(output_dir)
+    if not base.is_dir():
+        return []
+    ignorati = set(exclude or [])
+    return sorted(
+        str(f) for f in base.rglob("*") if f.is_file() and str(f) not in ignorati
+    )
+
+
+def start_render(
+    uproject: str,
+    sequence: str,
+    config: str | None = None,
+    map_path: str | None = None,
+    output_dir: str | None = None,
+    resolution: list[int] | None = None,
+    engine_version: str | None = None,
+    engine_root: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Avvia un render della Movie Render Queue in un processo separato.
+
+    Non in-editor: la MRQ in-editor è asincrona e bloccherebbe l'editor per
+    tutta la durata, e non c'è modo pulito di attenderla attraverso il bridge.
+    Un `UnrealEditor-Cmd` headless invece è un processo come un altro — parte,
+    scrive, finisce — e si segue con ue_render_status come una build.
+    """
+    path = Path(uproject).expanduser()
+    if not path.exists():
+        raise LocalError("File .uproject non trovato: %s" % path)
+
+    _check_token("sequence", sequence, _UE_PATH_RE)
+    if config:
+        _check_token("config", config, _UE_PATH_RE)
+    if map_path:
+        _check_token("map_path", map_path, _UE_PATH_RE)
+    _check_path_arg("uproject", path)
+
+    if not force:
+        precedente = render_status(tail_lines=0, uproject=str(path))
+        if precedente.get("running"):
+            raise LocalError(
+                "C'è già un render di questo progetto in corso (pid %s, da %.0fs). "
+                "Seguilo con ue_render_status, o passa force=True."
+                % (precedente.get("pid") or "?", precedente.get("elapsed_seconds") or 0)
+            )
+
+    engine = resolve_engine(
+        engine_version or project_info(str(path)).get("engine_association"),
+        engine_root,
+        path.parent,
+    )
+    editor_cmd = editor_cmd_executable(engine)
+    _check_path_arg("UnrealEditor-Cmd", Path(editor_cmd))
+
+    destinazione = Path(output_dir).expanduser() if output_dir else path.parent / "Saved/MovieRenders"
+    _check_path_arg("output_dir", destinazione)
+    destinazione.mkdir(parents=True, exist_ok=True)
+    gia_presenti = collect_render_output(str(destinazione))
+
+    log_path = path.parent / "Saved/Logs/mcp_render.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        log_path.unlink()
+
+    comando = build_render_command(
+        editor_cmd,
+        str(path),
+        to_object_path(map_path) if map_path else "",
+        to_object_path(sequence),
+        to_object_path(config) if config else None,
+        resolution,
+    )
+    comando = [a for a in comando if a != ""]
+
+    _script, args = _write_launch_script(
+        path.parent / "Saved" / "mcp_render_run",
+        _invoke(" ".join('"%s"' % a if " " in a else a for a in comando)),
+        log_path,
+    )
+
+    kwargs: dict[str, Any] = {"cwd": str(path.parent)}
+    if platform_module_is_windows():
+        kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
+
+    process = subprocess.Popen(args, **kwargs)  # noqa: S603
+    state = {
+        "pid": process.pid,
+        "uproject": str(path),
+        "sequence": sequence,
+        "config": config,
+        "output_dir": str(destinazione),
+        "log": str(log_path),
+        "command": comando,
+        # Fotografia della cartella prima di partire: quello che comparirà in
+        # più è il prodotto di questo render, senza dover confrontare orologi.
+        "preexisting": gia_presenti,
+        "started_at": time.time(),
+    }
+    _save_job(RENDER_STATE_FILE, str(path), state)
+    return {**state, "note": "render started: poll ue_render_status"}
+
+
+#: Righe che in un log di MRQ indicano che il render non è partito.
+_RENDER_ERROR_MARKERS = (
+    "Failed to load",
+    "LogMoviePipeline: Error",
+    "Fatal error",
+    "Assertion failed",
+    "was not found",
+)
+
+
+def render_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+    """Stato del render avviato da :func:`start_render`."""
+    state = _load_job(RENDER_STATE_FILE, uproject)
+    if state is None:
+        return {"running": False, "reason": "nessun render avviato da questo MCP"}
+
+    log_path = Path(state.get("log", ""))
+    lines: list[str] = []
+    if log_path.exists():
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    running = _process_alive(int(state.get("pid", 0)))
+    errors = [r.strip() for r in lines if any(m in r for m in _RENDER_ERROR_MARKERS)]
+    prodotti = collect_render_output(state.get("output_dir"), state.get("preexisting"))
+
+    exit_code = None
+    for line in reversed(lines):
+        if line.startswith("EXITCODE="):
+            exit_code = line.split("=", 1)[1].strip()
+            break
+
+    return {
+        "running": running,
+        "pid": state.get("pid"),
+        "uproject": state.get("uproject"),
+        "sequence": state.get("sequence"),
+        "output_dir": state.get("output_dir"),
+        "log": str(log_path),
+        "elapsed_seconds": round(time.time() - float(state.get("started_at", time.time())), 1),
+        "exit_code": exit_code,
+        # Il criterio è il prodotto, non il codice di uscita: MRQ headless può
+        # chiudere con 0 senza aver scritto un fotogramma se la config non
+        # aveva nodi di output.
+        "succeeded": (not running) and bool(prodotti) and not errors,
+        "frames_written": len(prodotti),
+        "files": prodotti[:20],
+        "errors": errors[:20],
+        "tail": lines[-int(tail_lines):] if tail_lines else [],
+    }
+
+
 PACKAGE_STATE_FILE = STATE_DIR / "package.json"
 
 #: Righe che segnalano un fallimento in un log di AutomationTool.

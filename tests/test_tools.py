@@ -238,3 +238,29 @@ async def test_sound_cue_wave_mancante(tools):
 async def test_metasound_source(tools):
     esito = await tools.ue_create_metasound_source("/Game/MyGame/Audio", "MS_Steps")
     assert esito["created"] is True
+
+
+# ------------------------------------------------------ comandi di console
+
+
+async def test_console_command_restituisce_le_righe_nuove(tools, unreal):
+    """Un comando di console non torna un valore: scrive nel log.
+
+    Senza rileggere il log, la risposta sarebbe "fatto" e nient'altro — inutile
+    per l'agente, che non saprebbe se il comando ha avuto effetto.
+    """
+    esito = await tools.ue_console_command("stat fps", wait_seconds=0)
+    assert esito["command"] == "stat fps"
+    assert any("stat fps" in riga for riga in esito["log_lines"])
+    assert "stat fps" in unreal.state["console"]
+
+
+async def test_console_command_senza_output_lo_dice(tools, unreal, monkeypatch):
+    """Molti comandi non stampano nulla: va detto, non lasciato ambiguo."""
+    def _muto(world, cmd):
+        unreal.state.setdefault("console", []).append(cmd)
+
+    monkeypatch.setattr(unreal.unreal.SystemLibrary, "execute_console_command", _muto)
+    esito = await tools.ue_console_command("r.ScreenPercentage 50", wait_seconds=0)
+    assert esito["log_lines"] == []
+    assert "non stampano nulla" in esito["note"]
