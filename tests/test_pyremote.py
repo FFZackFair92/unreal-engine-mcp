@@ -220,3 +220,52 @@ async def test_auto_senza_niente_nomina_entrambi(monkeypatch):
 def test_transport_non_valido_e_rifiutato_subito():
     with pytest.raises(ValueError, match="transport"):
         BridgeConfig(transport="carrozza")
+
+
+# ------------------------------------- il trasporto scelto va rivalutato
+
+
+async def test_l_http_che_fallisce_fa_riprovare_il_nativo(config, nodo, unreal, monkeypatch):
+    """La scelta cade sulla prima chiamata, che spesso è la meno informata.
+
+    Con ue_editor_open la prima chiamata avviene mentre l'editor sta ancora
+    caricando: il canale nativo non risponde, l'HTTP sì, e la decisione
+    resterebbe congelata anche dopo che il nativo è diventato disponibile.
+    """
+    monkeypatch.setenv("UE_MCP_MULTICAST_PORT", str(nodo.port))
+    monkeypatch.setenv("UE_MCP_DISCOVERY_TIMEOUT", "3")
+    # HTTP su una porta chiusa: qualunque chiamata su quel trasporto fallisce.
+    bridge = UnrealBridge(BridgeConfig(port=1, timeout=15, transport="auto"))
+    # Si finge la decisione già presa a favore dell'HTTP.
+    bridge._trasporto_scelto = "remotecontrol"
+    try:
+        assert await bridge.run("result = 'recuperato'") == "recuperato"
+        assert bridge.transport == "pyremote"
+    finally:
+        await bridge.aclose()
+
+
+async def test_con_trasporto_fissato_a_mano_non_si_ripiega(unreal, monkeypatch):
+    """Chi ha scritto transport=remotecontrol vuole quello, non una sorpresa."""
+    monkeypatch.setenv("UE_MCP_MULTICAST_PORT", str(_porta_libera()))
+    bridge = UnrealBridge(BridgeConfig(port=1, timeout=5, transport="remotecontrol"))
+    try:
+        with pytest.raises(UnrealNotConnected):
+            await bridge.run("result = 1")
+        assert bridge.transport == "remotecontrol"
+    finally:
+        await bridge.aclose()
+
+
+async def test_se_falliscono_entrambi_resta_l_errore_dell_http(monkeypatch):
+    monkeypatch.setenv("UE_MCP_MULTICAST_PORT", str(_porta_libera()))
+    monkeypatch.setenv("UE_MCP_DISCOVERY_TIMEOUT", "0.5")
+    bridge = UnrealBridge(BridgeConfig(port=1, timeout=3, transport="auto"))
+    bridge._trasporto_scelto = "remotecontrol"
+    try:
+        with pytest.raises(pyremote.PyRemoteError):
+            await bridge.run("result = 1")
+        # Non resta in uno stato ambiguo: torna a quello che almeno era scelto.
+        assert bridge.transport == "remotecontrol"
+    finally:
+        await bridge.aclose()

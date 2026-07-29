@@ -370,8 +370,30 @@ class UnrealBridge:
         """
         if self._trasporto_scelto == "pyremote":
             return await self._pyremote_exec(code)
+
         if self._trasporto_scelto == "remotecontrol":
-            log, _ = await self.exec_python_raw(code)
+            try:
+                log, _ = await self.exec_python_raw(code)
+            except UnrealBridgeError:
+                # Un trasporto scelto una volta non va creduto per sempre. La
+                # scelta cade spesso sulla prima chiamata, che con
+                # ue_editor_open avviene mentre l'editor sta ancora caricando:
+                # il canale nativo non risponde ancora, l'HTTP sì, e la
+                # decisione resterebbe congelata anche dopo che il nativo è
+                # diventato disponibile — o dopo che l'HTTP ha smesso di
+                # funzionare, per esempio perché manca il gate della Remote
+                # Control API. Se quello scelto fallisce, si riprova l'altro.
+                if self.config.transport != "auto":
+                    raise
+                self._trasporto_scelto = None
+                self._helpers_digest = None
+                try:
+                    log = await self._pyremote_exec(code)
+                except PyRemoteError:
+                    self._trasporto_scelto = "remotecontrol"
+                    self._pyremote = None
+                    raise
+                self._trasporto_scelto = "pyremote"
             return log
 
         try:

@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] — 2026-07-29
+
+### Fixed
+
+- **A transport that starts failing is re-evaluated instead of trusted
+  forever.** With `UE_MCP_TRANSPORT=auto` the choice was made on the first call
+  and frozen. That first call is usually the least informed one: `ue_editor_open`
+  probes while the editor is still loading, so the native channel has not come
+  up yet, HTTP answers, and `remotecontrol` is pinned for the rest of the
+  session — including after the native channel becomes available a minute
+  later, and including when the HTTP path cannot actually do anything because
+  the project has no `DefaultRemoteControl.ini` and every call comes back
+
+      Object Default__PythonScriptLibrary cannot be accessed remotely
+
+  Now a failure on the pinned transport clears the choice and tries the other
+  one once. An explicitly configured `transport` is never second-guessed: asking
+  for `remotecontrol` means wanting `remotecontrol`, not a surprise.
+
+  Found by driving a real editor: the build compiled, the editor opened, the
+  bridge reported ready, and every tool still failed on a gate that the default
+  transport was designed to make irrelevant.
+
 ## [0.5.2] — 2026-07-29
 
 ### Fixed
