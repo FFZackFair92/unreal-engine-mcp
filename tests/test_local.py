@@ -315,3 +315,55 @@ def test_kill_editor_senza_processo(engines, tmp_path):
 def test_editor_executable_multipiattaforma(engines):
     engine = local.resolve_engine("5.4")
     assert Path(engine.editor).exists()
+
+
+def test_launch_editor_basta_il_plugin_python(engines, tmp_path, monkeypatch):
+    """Con il solo PythonScriptPlugin il canale nativo funziona: non rifiutare.
+
+    È il caso di un progetto esistente configurato secondo il README nuovo —
+    plugin Python e la casella *Enable Remote Execution*, senza Remote Control.
+    Pretendere anche quel plugin lo rendeva impossibile da aprire.
+    """
+    created = local.create_project("SoloPython", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    path.write_text(
+        json.dumps(
+            {
+                "FileVersion": 3,
+                "EngineAssociation": "5.8",
+                "Plugins": [{"Name": "PythonScriptPlugin", "Enabled": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = local.project_info(str(path))
+    assert info["pyremote_ready"] is True
+    assert info["remotecontrol_ready"] is False
+
+    catturato = {}
+
+    class _Cattura(_FakePopen):
+        def __init__(self, args, **kwargs):
+            catturato["args"] = args
+            super().__init__(args, **kwargs)
+
+    monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
+    local.launch_editor(str(path))  # non solleva
+
+    # Senza il plugin Remote Control i suoi flag non vanno sulla riga di comando.
+    assert not [a for a in catturato["args"] if "RCWeb" in str(a)]
+
+
+def test_launch_editor_con_remote_control_passa_i_flag(engines, tmp_path, monkeypatch):
+    created = local.create_project("Completo", str(tmp_path / "P"))
+    catturato = {}
+
+    class _Cattura(_FakePopen):
+        def __init__(self, args, **kwargs):
+            catturato["args"] = args
+            super().__init__(args, **kwargs)
+
+    monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
+    local.launch_editor(created["uproject"])
+    assert "-RCWebControlEnable" in catturato["args"]

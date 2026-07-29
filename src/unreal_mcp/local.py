@@ -537,7 +537,12 @@ def project_info(uproject: str) -> dict:
         "root": str(path.parent),
         "engine_association": data.get("EngineAssociation"),
         "plugins_enabled": plugins,
-        "bridge_ready": {"PythonScriptPlugin", "RemoteControl"}.issubset(set(plugins)),
+        # Il canale nativo (trasporto predefinito) chiede solo il plugin Python;
+        # la Remote Control API ne vuole due. Distinguerli evita di rifiutare un
+        # progetto che è configurato bene per il trasporto che userà davvero.
+        "pyremote_ready": "PythonScriptPlugin" in plugins,
+        "remotecontrol_ready": {"PythonScriptPlugin", "RemoteControl"}.issubset(set(plugins)),
+        "bridge_ready": "PythonScriptPlugin" in plugins,
         "has_source": (path.parent / "Source").is_dir(),
     }
 
@@ -1448,18 +1453,24 @@ def launch_editor(
         raise LocalError("File .uproject non trovato: %s" % path)
 
     info = project_info(str(path))
-    if not info["bridge_ready"]:
+    if not info["pyremote_ready"]:
         raise LocalError(
-            "Il progetto non ha i plugin del bridge abilitati (%s). "
-            "Chiama prima ue_project_set_plugins con "
-            "['PythonScriptPlugin', 'RemoteControl']."
-            % ", ".join(info["plugins_enabled"]) or "nessuno"
+            "Il progetto non ha il 'Python Editor Script Plugin' abilitato; "
+            "attivi ci sono solo: %s. Senza quello nessuno dei due trasporti "
+            "funziona. Chiama ue_project_set_plugins con ['PythonScriptPlugin'] "
+            "(aggiungi 'RemoteControl' solo se ti serve il trasporto HTTP)."
+            % (", ".join(info["plugins_enabled"]) or "nessuno")
         )
 
     engine = resolve_engine(
         engine_version or info.get("engine_association"), engine_root, path.parent
     )
-    args = [engine.editor, str(path), "-RCWebControlEnable", "-RCWebInterfaceEnable"]
+    args = [engine.editor, str(path)]
+    # I flag del web server Remote Control hanno senso solo se quel plugin è
+    # attivo: passarli a un progetto che usa il canale nativo non rompe niente,
+    # ma sporca la riga di comando e il log con avvisi che sembrano errori.
+    if info["remotecontrol_ready"]:
+        args += ["-RCWebControlEnable", "-RCWebInterfaceEnable"]
     args += extra_args or []
 
     kwargs: dict[str, Any] = {"cwd": str(path.parent)}
