@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -80,7 +81,9 @@ async def download_file(
     folder = Path(destination).expanduser() if destination else library_dir()
     folder.mkdir(parents=True, exist_ok=True)
 
-    name = filename or Path(urlparse(url).path).name or "download.bin"
+    # Path(...).name su entrambi i rami: un `filename` con "../" o un URL
+    # costruito ad arte scriverebbe fuori dalla cartella di destinazione.
+    name = Path(filename or urlparse(url).path).name or "download.bin"
     target = folder / name
     if target.exists() and not overwrite:
         return {
@@ -140,7 +143,17 @@ def extract_archive(archive: str, destination: str | None = None) -> dict:
     elif tarfile.is_tarfile(path):
         with tarfile.open(path) as archive_file:
             members = [m for m in archive_file.getmembers() if not m.name.startswith(("/", "..")) and ".." not in Path(m.name).parts]
-            archive_file.extractall(target, members=members)  # noqa: S202 - membri già filtrati sopra
+            # Il filtro sui nomi non basta: un membro symlink o hardlink può
+            # puntare fuori dalla destinazione pur avendo un nome innocuo.
+            # `filter="data"` è il comportamento predefinito da Python 3.14,
+            # ma qui il minimo supportato è 3.10.
+            if sys.version_info >= (3, 12):
+                archive_file.extractall(target, members=members, filter="data")
+            else:  # pragma: no cover - solo su 3.10/3.11
+                members = [
+                    m for m in members if not (m.issym() or m.islnk() or m.isdev())
+                ]
+                archive_file.extractall(target, members=members)  # noqa: S202 - membri già filtrati sopra
         extracted = [m.name for m in members]
     elif path.suffix.lower() == ".rar":
         raise AssetError(

@@ -81,7 +81,9 @@ def test_build_avvio_e_stato(progetto, monkeypatch):
     avvio = local.start_build(progetto["uproject"])
     assert avvio["pid"] == 777
     assert avvio["target"] == "MyGameEditor"
-    assert json.loads(local.BUILD_STATE_FILE.read_text())["pid"] == 777
+    salvato = json.loads(local.BUILD_STATE_FILE.read_text())
+    assert salvato["jobs"][progetto["uproject"]]["pid"] == 777
+    assert salvato["last"] == progetto["uproject"]
 
     # Il comando passa da uno script su file: la citazione annidata via `cmd /c`
     # perdeva la redirezione e lasciava il log vuoto.
@@ -133,3 +135,46 @@ def test_build_riporta_errori_di_compilazione(progetto, monkeypatch):
 def test_build_status_senza_compilazioni(tmp_path, monkeypatch):
     monkeypatch.setattr(local, "BUILD_STATE_FILE", tmp_path / "mai-avviata.json")
     assert local.build_status()["running"] is False
+
+
+# ---------------------------------------------------- validazione argomenti shell
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"configuration": "Development & whoami"},
+        {"configuration": "Development; id"},
+        {"configuration": "Sviluppo"},
+        {"target": "MyGameEditor && calc.exe"},
+        {"target": "My Game Editor"},
+        {"platform": "Win64 | id"},
+        {"platform": "PlayStation5"},
+    ],
+)
+def test_build_rifiuta_argomenti_iniettabili(progetto, monkeypatch, kwargs):
+    """Gli argomenti finiscono in uno script di shell: vanno su allowlist.
+
+    Senza questo, `configuration="Development & whoami"` non è una build con un
+    nome strano, è un comando in più eseguito dalla shell.
+    """
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    with pytest.raises(local.LocalError):
+        local.start_build(progetto["uproject"], **kwargs)
+
+
+def test_build_stato_separato_per_progetto(progetto, tmp_path, monkeypatch):
+    """Due progetti in parallelo non devono sovrascriversi lo stato."""
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    primo = progetto["uproject"]
+    secondo_creato = local.create_project("AltroGioco", str(tmp_path / "Projects2"))
+    secondo = secondo_creato["uproject"]
+    (Path(secondo).parent / "Source").mkdir(parents=True, exist_ok=True)
+
+    local.start_build(primo)
+    local.start_build(secondo)
+
+    assert local.build_status(uproject=primo)["target"] == "MyGameEditor"
+    assert local.build_status(uproject=secondo)["target"] == "AltroGiocoEditor"
+    # senza argomento: l'ultimo avviato
+    assert local.build_status()["target"] == "AltroGiocoEditor"

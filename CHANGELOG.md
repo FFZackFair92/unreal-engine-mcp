@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Build and packaging arguments are now validated against an allowlist.**
+  `target`, `platform`/`target_platform`, `configuration`, `maps` and
+  `output_dir` are interpolated into the body of the generated `.bat`/`.sh`
+  launch script, so a value like `configuration="Development & whoami"` was not
+  a build with an odd name — it was an extra command run by the shell. An
+  allowlist is both simpler and more robust than trying to quote portably
+  across `cmd.exe` and `sh`. Paths containing quotes or newlines are rejected
+  for the same reason.
+- **`extract_archive` no longer trusts tar link members.** The existing name
+  filter caught `..` and absolute paths, but a symlink or hardlink member can
+  point outside the destination while having a perfectly innocuous name. Now
+  uses `filter="data"` on Python 3.12+ and drops link/device members on 3.10
+  and 3.11, where that argument does not exist.
+- **`download_file` sanitises the destination filename.** A `filename` of
+  `../../x` escaped the library directory; both the explicit argument and the
+  name derived from the URL now go through `Path(...).name`.
+
+### Fixed
+
+- **Build and package state is keyed by project.** `~/.unreal-mcp/build.json`
+  and `package.json` held a single slot, so two projects built in parallel — or
+  two MCP clients on the same machine — overwrote each other's state and
+  `ue_build_status` answered about the wrong build. Both files now store one
+  entry per `.uproject`; `ue_build_status` and `ue_package_status` accept an
+  optional `uproject` argument and default to the most recently started job.
+  The previous single-entry format is still read.
+
 ## [0.2.0] — 2026-07-29
 
 ### Added

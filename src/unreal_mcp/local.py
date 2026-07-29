@@ -959,6 +959,52 @@ def create_cpp_class(
 BUILD_STATE_FILE = STATE_DIR / "build.json"
 
 
+def _save_job(state_file: Path, uproject: str, state: dict) -> None:
+    """Registra lo stato di un job, indicizzato per progetto.
+
+    Uno slot solo significava che due progetti compilati in parallelo — o due
+    client MCP sulla stessa macchina — si sovrascrivevano lo stato a vicenda, e
+    il secondo ue_build_status rispondeva sul build sbagliato.
+    """
+    jobs = _load_jobs(state_file)
+    jobs[str(uproject)] = state
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(
+        json.dumps({"jobs": jobs, "last": str(uproject)}, indent=2), encoding="utf-8"
+    )
+
+
+def _load_jobs(state_file: Path) -> dict:
+    try:
+        raw = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(raw, dict) and "jobs" in raw:
+        return raw.get("jobs") or {}
+    # Formato precedente: un singolo stato in cima al file.
+    if isinstance(raw, dict) and raw.get("uproject"):
+        return {str(raw["uproject"]): raw}
+    return {}
+
+
+def _load_job(state_file: Path, uproject: str | None) -> dict | None:
+    """Stato di un job. Senza `uproject` restituisce il più recente."""
+    try:
+        raw = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    jobs = _load_jobs(state_file)
+    if not jobs:
+        return None
+    if uproject:
+        chiave = str(Path(uproject).expanduser())
+        return jobs.get(chiave) or jobs.get(str(uproject))
+    ultimo = raw.get("last") if isinstance(raw, dict) else None
+    if ultimo and ultimo in jobs:
+        return jobs[ultimo]
+    return max(jobs.values(), key=lambda j: float(j.get("started_at", 0)))
+
+
 def _batch_file(engine: EngineInstall, stem: str) -> Path:
     """Script di build del motore per la piattaforma corrente.
 
@@ -981,6 +1027,58 @@ def _batch_file(engine: EngineInstall, stem: str) -> Path:
         "Script %s non trovato per questa piattaforma. Cercato in: %s"
         % (stem, ", ".join(str(c) for c in candidati))
     )
+
+
+#: Configurazioni di build accettate da UnrealBuildTool / BuildCookRun.
+VALID_CONFIGURATIONS = frozenset({"Debug", "DebugGame", "Development", "Test", "Shipping"})
+
+#: Piattaforme di destinazione accettate.
+VALID_PLATFORMS = frozenset(
+    {"Win64", "Win32", "Linux", "LinuxArm64", "Mac", "Android", "IOS", "TVOS"}
+)
+
+#: Un target UBT è un identificatore C++: niente spazi, niente metacaratteri.
+_TARGET_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+#: Un path del Content Browser: /Game/..., lettere, cifre, _ - . e /
+_UE_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+
+
+def _check_choice(nome: str, valore: str, ammessi: frozenset[str]) -> str:
+    """Verifica che `valore` sia uno dei valori ammessi.
+
+    Questi argomenti vengono interpolati nel corpo di uno script .bat/.sh: senza
+    controllo, un `configuration="Development & qualcosa"` diventerebbe un
+    comando in più eseguito dalla shell. Una allowlist è più semplice — e più
+    robusta — di qualsiasi tentativo di quoting portabile fra cmd.exe e sh.
+    """
+    if valore not in ammessi:
+        raise LocalError(
+            "%s non valido: %r. Valori ammessi: %s."
+            % (nome, valore, ", ".join(sorted(ammessi)))
+        )
+    return valore
+
+
+def _check_token(nome: str, valore: str, pattern: re.Pattern[str]) -> str:
+    """Come :func:`_check_choice`, ma per valori liberi con una forma nota."""
+    if not pattern.match(valore):
+        raise LocalError(
+            "%s non valido: %r. Ammessi solo i caratteri della forma %s."
+            % (nome, valore, pattern.pattern)
+        )
+    return valore
+
+
+def _check_path_arg(nome: str, valore: Path) -> Path:
+    """Rifiuta i percorsi che romperebbero il quoting dello script."""
+    testo = str(valore)
+    if '"' in testo or "\n" in testo or "\r" in testo:
+        raise LocalError(
+            "%s contiene virgolette o a capo e non può essere passato alla shell: %r"
+            % (nome, testo)
+        )
+    return valore
 
 
 def _invoke(comando: str) -> str:
@@ -1042,14 +1140,21 @@ def start_build(
     )
     build_bat = _batch_file(engine, "Build")
 
-    target_name = target or f"{path.stem}Editor"
+    target_name = _check_token("target", target or f"{path.stem}Editor", _TARGET_RE)
+    platform_name = _check_choice(
+        "platform", platform or default_target_platform(), VALID_PLATFORMS
+    )
+    _check_choice("configuration", configuration, VALID_CONFIGURATIONS)
+    _check_path_arg("uproject", path)
+    _check_path_arg("Build script", build_bat)
+
     log_path = path.parent / "Saved/Logs/mcp_build.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
         log_path.unlink()
 
     comando = _invoke(
-        f'"{build_bat}" {target_name} {platform or default_target_platform()} '
+        f'"{build_bat}" {target_name} {platform_name} '
         f'{configuration} -Project="{path}" -WaitMutex'
     )
     _script, args = _write_launch_script(
@@ -1068,8 +1173,7 @@ def start_build(
         "log": str(log_path),
         "started_at": time.time(),
     }
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    BUILD_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    _save_job(BUILD_STATE_FILE, str(path), state)
     return {**state, "note": "build started: poll ue_build_status"}
 
 
@@ -1077,11 +1181,13 @@ def platform_module_is_windows() -> bool:
     return platform.system() == "Windows"
 
 
-def build_status(tail_lines: int = 30) -> dict:
-    """Stato della compilazione avviata da :func:`start_build`."""
-    try:
-        state = json.loads(BUILD_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+    """Stato della compilazione avviata da :func:`start_build`.
+
+    Senza `uproject` risponde sull'ultima compilazione avviata.
+    """
+    state = _load_job(BUILD_STATE_FILE, uproject)
+    if state is None:
         return {"running": False, "reason": "nessuna compilazione avviata da questo MCP"}
 
     log_path = Path(state.get("log", ""))
@@ -1106,6 +1212,7 @@ def build_status(tail_lines: int = 30) -> dict:
 
     return {
         "running": running,
+        "uproject": state.get("uproject"),
         "target": state.get("target"),
         "log": str(log_path),
         "elapsed_seconds": round(time.time() - float(state.get("started_at", time.time())), 1),
@@ -1177,10 +1284,11 @@ def start_package(
     if not path.exists():
         raise LocalError("File .uproject non trovato: %s" % path)
 
-    if configuration not in {"Development", "Shipping", "DebugGame", "Test"}:
-        raise LocalError(
-            "configuration deve essere Development, Shipping, DebugGame o Test."
-        )
+    _check_choice("configuration", configuration, VALID_CONFIGURATIONS)
+    _check_choice("target_platform", platform_name, VALID_PLATFORMS)
+    _check_path_arg("uproject", path)
+    for mappa in maps or []:
+        _check_token("maps", mappa, _UE_PATH_RE)
 
     status = editor_status()
     if status.get("running") or status.get("editor_process_detected"):
@@ -1198,6 +1306,8 @@ def start_package(
     run_uat = _batch_file(engine, "RunUAT")
 
     archive_dir = Path(output_dir).expanduser() if output_dir else path.parent / "Packaged"
+    _check_path_arg("output_dir", archive_dir)
+    _check_path_arg("RunUAT script", run_uat)
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = path.parent / "Saved/Logs/mcp_package.log"
@@ -1240,16 +1350,17 @@ def start_package(
         "log": str(log_path),
         "started_at": time.time(),
     }
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    PACKAGE_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    _save_job(PACKAGE_STATE_FILE, str(path), state)
     return {**state, "note": "packaging started: poll ue_package_status"}
 
 
-def package_status(tail_lines: int = 30) -> dict:
-    """Stato del packaging avviato da :func:`start_package`."""
-    try:
-        state = json.loads(PACKAGE_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+def package_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+    """Stato del packaging avviato da :func:`start_package`.
+
+    Senza `uproject` risponde sull'ultimo packaging avviato.
+    """
+    state = _load_job(PACKAGE_STATE_FILE, uproject)
+    if state is None:
         return {"running": False, "reason": "nessun packaging avviato da questo MCP"}
 
     log_path = Path(state.get("log", ""))

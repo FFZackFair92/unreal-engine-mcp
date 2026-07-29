@@ -202,3 +202,36 @@ def test_fab_errore_legendary(monkeypatch):
     with pytest.raises(assets.AssetError) as excinfo:
         assets.fab_list_vault()
     assert "not logged in" in str(excinfo.value)
+
+
+async def test_download_filename_traversal(web, tmp_path):
+    """Un `filename` con ../ deve restare dentro la cartella di destinazione."""
+    destinazione = tmp_path / "libreria"
+    esito = await assets.download_file(
+        web.base + "/files/diff_2k.jpg",
+        destination=str(destinazione),
+        filename="../../fuori.jpg",
+    )
+    scritto = Path(esito["file"]).resolve()
+    assert destinazione.resolve() in scritto.parents
+    assert scritto.name == "fuori.jpg"
+    assert not (tmp_path.parent / "fuori.jpg").exists()
+
+
+def test_extract_tar_scarta_symlink_fuori_target(tmp_path):
+    """Un membro symlink può puntare fuori pur avendo un nome innocuo."""
+    import tarfile as _tar
+
+    archivio = tmp_path / "malevolo.tar"
+    with _tar.open(archivio, "w") as tf:
+        collegamento = _tar.TarInfo("innocuo.txt")
+        collegamento.type = _tar.SYMTYPE
+        collegamento.linkname = "../../../../etc/passwd"
+        tf.addfile(collegamento)
+
+    destinazione = tmp_path / "estratto"
+    try:
+        assets.extract_archive(str(archivio), str(destinazione))
+    except assets.AssetError:
+        pass  # rifiutare l'archivio è una risposta accettabile
+    assert not (destinazione / "innocuo.txt").is_symlink()

@@ -24,7 +24,7 @@ editor già aperto**: creare un progetto, avviarlo, compilare e produrre il
 pacchetto sono tutte operazioni a livello di processo.
 
 - **58 tool** — [riferimento completo](docs/TOOLS.it.md)
-- **141 test**, nessuno dei quali richiede Unreal installato
+- **153 test**, nessuno dei quali richiede Unreal installato
 - **[Note sull'automazione di Unreal](docs/UNREAL-NOTES.md)** — le trappole delle API trovate sul campo
 
 ---

@@ -55,7 +55,8 @@ def test_package_comando_generato(progetto, monkeypatch):
     )
     assert avvio["pid"] == 999
     assert avvio["configuration"] == "Development"
-    assert json.loads(local.PACKAGE_STATE_FILE.read_text())["pid"] == 999
+    salvato = json.loads(local.PACKAGE_STATE_FILE.read_text())
+    assert salvato["jobs"][progetto["uproject"]]["pid"] == 999
 
     script = next((Path(progetto["root"]) / "Saved").glob("mcp_package_run.*"))
     comando = script.read_text(encoding="utf-8")
@@ -121,3 +122,19 @@ def test_package_stato_fallimento(progetto, monkeypatch):
 def test_package_status_senza_avvii(tmp_path, monkeypatch):
     monkeypatch.setattr(local, "PACKAGE_STATE_FILE", tmp_path / "mai.json")
     assert local.package_status()["running"] is False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"configuration": "Shipping && whoami"},
+        {"platform_name": "Win64; id"},
+        {"maps": ["/Game/L_Main -execcmds=quit"]},
+        {"maps": ["/Game/L_Main && calc.exe"]},
+        {"output_dir": '/tmp/out" & whoami & "'},
+    ],
+)
+def test_package_rifiuta_argomenti_iniettabili(progetto, monkeypatch, kwargs):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    with pytest.raises(local.LocalError):
+        local.start_package(progetto["uproject"], **kwargs)

@@ -316,9 +316,14 @@ async def ue_build_start(
 
 
 @mcp.tool()
-async def ue_build_status(tail_lines: int = 30) -> dict:
-    """Stato della compilazione avviata con ue_build_start: in corso, errori, coda del log."""
-    return local_call(local.build_status, tail_lines)
+async def ue_build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+    """Stato della compilazione avviata con ue_build_start: in corso, errori, coda del log.
+
+    Args:
+        tail_lines: quante righe finali del log restituire.
+        uproject: a quale progetto si riferisce; se omesso, l'ultima compilazione avviata.
+    """
+    return local_call(local.build_status, tail_lines, uproject)
 
 
 @mcp.tool()
@@ -382,13 +387,17 @@ async def ue_package_start(
 
 
 @mcp.tool()
-async def ue_package_status(tail_lines: int = 30) -> dict:
+async def ue_package_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
     """Stato del packaging avviato con ue_package_start.
 
     Riporta la fase corrente (Cook, Stage, Package, Archive), gli errori e,
     a fine corsa, il percorso dell'eseguibile prodotto.
+
+    Args:
+        tail_lines: quante righe finali del log restituire.
+        uproject: a quale progetto si riferisce; se omesso, l'ultimo packaging avviato.
     """
-    return local_call(local.package_status, tail_lines)
+    return local_call(local.package_status, tail_lines, uproject)
 
 
 @mcp.tool()
