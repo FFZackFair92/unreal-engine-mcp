@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-07-29
+
+### Fixed
+
+- **`ue_editor_open` no longer demands the Remote Control plugin.** The native
+  transport added in 0.4.0 needs only the *Python Editor Script Plugin*, but
+  the precondition in `launch_editor` still required *Remote Control* as well —
+  so a project set up exactly as the 0.4.0 README describes could not be opened
+  by this server's own tool. Found on the first real attempt to use it.
+
+  `ue_project_info` now reports `pyremote_ready` and `remotecontrol_ready`
+  separately (`bridge_ready` stays, meaning the former), `launch_editor` asks
+  only for the Python plugin, and the `-RCWebControlEnable` /
+  `-RCWebInterfaceEnable` flags go on the editor command line only when that
+  plugin is actually enabled — passing them otherwise just fills the log with
+  warnings that read like errors.
+
 ## [0.4.1] — 2026-07-29
 
 ### Fixed
