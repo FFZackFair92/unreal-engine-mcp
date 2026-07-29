@@ -10,6 +10,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are on their v7 lines because v5/v6 moved the runtime to Node 24;
+# staying on the older majors means every run logs a Node 20 deprecation
+# warning. Neither breaking change touches this workflow: `pip-install` was
+# dropped from setup-python v7 and we use `cache: pip`, and checkout v7 only
+# restricts fork checkouts under pull_request_target / workflow_run, which
+# this workflow does not use.
 jobs:
   test:
     name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -21,9 +27,9 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -40,8 +46,8 @@ jobs:
     name: ruff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
