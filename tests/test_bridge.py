@@ -1,9 +1,11 @@
+import httpx
 import pytest
 
 from unreal_mcp.bridge import (
     HELPERS_MODULE,
     BridgeConfig,
     UnrealBridge,
+    UnrealBridgeError,
     UnrealNotConnected,
     UnrealPythonError,
     build_install_payload,
@@ -129,3 +131,46 @@ async def test_editor_non_raggiungibile():
         await bridge.info()
     assert "Remote Control API" in str(excinfo.value)
     await bridge.aclose()
+
+
+@pytest.mark.parametrize(
+    "errore",
+    [
+        httpx.ConnectError("connection refused"),
+        # ConnectTimeout non discende da ConnectError ma da TimeoutException.
+        # Una porta chiusa di solito rifiuta la connessione, ma se un firewall
+        # scarta i pacchetti si ottiene questo — ed è il caso in cui l'utente
+        # ha più bisogno della diagnosi, non di un errore httpx grezzo.
+        httpx.ConnectTimeout("timed out"),
+    ],
+)
+async def test_connessione_fallita_spiega_sempre_il_perche(bridge, monkeypatch, errore):
+    async def esplodi(*args, **kwargs):
+        raise errore
+
+    client = await bridge._http()
+    monkeypatch.setattr(client, "request", esplodi)
+
+    with pytest.raises(UnrealNotConnected) as excinfo:
+        await bridge.info()
+
+    messaggio = str(excinfo.value)
+    assert "Remote Control API" in messaggio
+    assert "WebControl.StartServer" in messaggio
+    if isinstance(errore, httpx.ConnectTimeout):
+        assert "firewall" in messaggio
+
+
+async def test_timeout_di_lettura_distinto_dalla_disconnessione(bridge, monkeypatch):
+    """Un editor occupato non è un editor spento: il messaggio deve dirlo."""
+
+    async def esplodi(*args, **kwargs):
+        raise httpx.ReadTimeout("too slow")
+
+    client = await bridge._http()
+    monkeypatch.setattr(client, "request", esplodi)
+
+    with pytest.raises(UnrealBridgeError) as excinfo:
+        await bridge.info()
+    assert not isinstance(excinfo.value, UnrealNotConnected)
+    assert "occupato" in str(excinfo.value)

@@ -214,11 +214,25 @@ class UnrealBridge:
         client = await self._http()
         try:
             response = await client.request(method, path, json=payload)
-        except httpx.ConnectError as exc:
+        # ConnectTimeout non discende da ConnectError ma da TimeoutException:
+        # vanno catturate entrambe. Una porta chiusa di solito rifiuta la
+        # connessione (ConnectError), ma se un firewall scarta i pacchetti
+        # invece di rifiutarli — comune su Windows — si ottiene un timeout, e
+        # senza questo l'utente vedrebbe un'eccezione httpx grezza al posto
+        # della diagnosi.
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            scaduto = isinstance(exc, httpx.ConnectTimeout)
             raise UnrealNotConnected(
                 f"Nessuna risposta da {self.config.base_url}. Controlla che l'editor Unreal sia "
                 "aperto, che i plugin 'Remote Control API' e 'Python Editor Script Plugin' siano "
                 "attivi e che il web server sia in ascolto (console: WebControl.StartServer)."
+                + (
+                    " La connessione è scaduta invece di essere rifiutata: di solito è un "
+                    "firewall che filtra la porta, o un host/porta sbagliati "
+                    "(UE_MCP_HOST / UE_MCP_PORT)."
+                    if scaduto
+                    else ""
+                )
             ) from exc
         except httpx.ReadTimeout as exc:
             raise UnrealBridgeError(

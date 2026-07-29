@@ -89,6 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A failed connection now always explains itself.** `httpx.ConnectTimeout`
+  does not inherit from `ConnectError` — it is a `TimeoutException` — so it
+  fell through the handler and reached the user as a raw httpx traceback. A
+  closed port usually *refuses* the connection, but a firewall that drops
+  packets instead produces a timeout, which is precisely the case where the
+  diagnosis is most needed. Caught in the first CI run on Windows.
+- **The test suite no longer reads the machine's real Unreal installs.**
+  `find_engines()` queries the Windows registry and the Epic Launcher manifest,
+  so the suite passed on a clean runner and failed on the developer's own
+  machine — where it matters most. Isolation is now an autouse fixture, applied
+  to every test rather than one at a time.
 - `USER_AGENT` said `0.2` while the package version was `0.1.0`.
 
 ### Repository
