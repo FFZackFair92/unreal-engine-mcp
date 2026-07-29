@@ -370,6 +370,7 @@ async def ue_build_start(
     target: str | None = None,
     configuration: str = "Development",
     engine_root: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Avvia la compilazione del modulo C++ del progetto (in background).
 
@@ -385,6 +386,9 @@ async def ue_build_start(
         configuration: "Development" | "DebugGame" | "Shipping".
         engine_root: percorso del motore, quando non è registrato nel sistema
             e la ricerca automatica non lo trova.
+        force: avvia anche se risulta già una compilazione in corso. Serve solo
+            quando la precedente è rimasta bloccata e ne hai chiuso i processi:
+            due Build.bat insieme si accodano sullo stesso mutex.
     """
     return local_call(
         local.start_build,
@@ -394,6 +398,7 @@ async def ue_build_start(
         None,
         configuration,
         engine_root,
+        force,
     )
 
 

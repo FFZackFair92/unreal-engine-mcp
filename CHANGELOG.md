@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.4] — 2026-07-29
+
+Three failures from one afternoon of driving a real editor, all variations on
+the same theme: something was stuck and the tools reported it as progress.
+
+### Added
+
+- **A build blocked on a lock is no longer reported as a build in progress.**
+  Epic's batch files take a global lock; when a previous instance is orphaned —
+  typically a child of an editor killed with `taskkill`, which `/T` does not
+  always reach — it never releases it. `Build.bat` waits forever, the log stays
+  one line long, and `ue_build_status` said `running: true` indefinitely while
+  suggesting a longer `wait_seconds`, which is precisely the advice that cannot
+  work. There is now a `blocked` flag and a `reason` naming the processes to
+  look for, including the `dotnet.exe` that runs UnrealBuildTool on UE 5 and so
+  never appears under its own name.
+- **`ue_build_start` refuses to start a second build of the same project.**
+  Both take the same lock, so the new one queues behind the stuck one and the
+  symptom becomes "the build never starts". `force=True` after cleaning up the
+  leftovers.
+- **`ue_editor_close(force=True)` cleans up the processes it orphans.** The
+  forced kill is what creates them, so that is where they get cleared;
+  `orphans_cleaned` reports what was terminated.
+
 ## [0.4.3] — 2026-07-29
 
 ### Fixed

@@ -1187,6 +1187,24 @@ def default_target_platform() -> str:
 #: Righe che indicano un vero problema di compilazione nel log di UnrealBuildTool.
 _BUILD_ERROR_MARKERS = ("error C", "error LNK", "error :", ": error", "Error:", "fatal error")
 
+#: Righe con cui gli script di Epic dicono che stanno aspettando un mutex.
+#: `Build.bat -WaitMutex` attende **all'infinito** che un UnrealBuildTool
+#: precedente lo rilasci, e se quel processo è orfano non lo rilascia mai: il
+#: log resta di una riga e lo stato direbbe "in corso" per sempre.
+_BUILD_MUTEX_MARKERS = (
+    "is already running, waiting for existing script",
+    "Waiting for another instance",
+    "waiting for existing instance",
+)
+
+#: Processi che possono restare appesi e tenere il lock della build.
+#:
+#: `dotnet.exe` non è in elenco di proposito: su UE 5 UnrealBuildTool gira
+#: proprio come `dotnet UnrealBuildTool.dll`, ma terminare tutti i dotnet della
+#: macchina spegnerebbe anche cose che non c'entrano niente. Quando il lock
+#: resiste alla pulizia automatica è quello il processo da cercare a mano.
+BUILD_LOCK_PROCESSES = ("UnrealBuildTool.exe", "LiveCodingConsole.exe")
+
 
 def start_build(
     uproject: str,
@@ -1195,6 +1213,7 @@ def start_build(
     platform: str = "Win64",
     configuration: str = "Development",
     engine_root: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Avvia la compilazione del modulo C++ in background.
 
@@ -1219,6 +1238,25 @@ def start_build(
             "L'editor Unreal è ancora aperto: con Live Coding attivo la compilazione "
             "fallisce. Chiudilo con ue_editor_close e riprova."
         )
+
+    # Una compilazione già in corso non va affiancata da una seconda: Build.bat
+    # prende un mutex globale, quindi la nuova si mette in coda dietro la
+    # vecchia. Se la vecchia era già bloccata, se ne accodano due — è successo,
+    # e da fuori sembra soltanto che "la build non parta mai".
+    if not force:
+        precedente = build_status(tail_lines=0, uproject=str(path))
+        if precedente.get("running"):
+            raise LocalError(
+                "C'è già una compilazione di questo progetto in corso (pid %s, da "
+                "%.0fs)%s. Avviarne un'altra la metterebbe solo in coda sullo "
+                "stesso mutex. Segui quella con ue_build_status, oppure passa "
+                "force=True dopo aver chiuso i processi rimasti."
+                % (
+                    precedente.get("pid") or "?",
+                    precedente.get("elapsed_seconds") or 0,
+                    " ed è bloccata su un mutex" if precedente.get("blocked") else "",
+                )
+            )
 
     # Il processo di console di Live Coding sopravvive alla chiusura dell'editor e
     # continua a tenere il lock sulle DLL: senza questo, il build fallisce con
@@ -1291,6 +1329,16 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
     errors = [r.strip() for r in lines if any(m in r for m in _BUILD_ERROR_MARKERS)]
     warnings = [r.strip() for r in lines if "warning" in r.lower()]
 
+    # Bloccata su mutex: il processo è vivo ma non sta compilando, e aspettare
+    # non serve. Va distinto da "lenta", altrimenti si consiglia proprio la cosa
+    # che non funziona.
+    bloccata = bool(
+        running
+        and lines
+        and any(m in riga for riga in lines for m in _BUILD_MUTEX_MARKERS)
+        and not any("Compiling" in riga or "Building " in riga for riga in lines)
+    )
+
     exit_code = None
     for line in reversed(lines):
         if line.startswith("EXITCODE="):
@@ -1302,8 +1350,10 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
         for r in lines
     )
 
-    return {
+    esito = {
         "running": running,
+        "blocked": bloccata,
+        "pid": state.get("pid"),
         "uproject": state.get("uproject"),
         "target": state.get("target"),
         "log": str(log_path),
@@ -1314,6 +1364,21 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
         "warnings": warnings[:10],
         "tail": lines[-int(tail_lines):],
     }
+    if bloccata:
+        esito["reason"] = (
+            "La compilazione non è lenta: è ferma su un lock. Gli script di Epic "
+            "aspettano che un'istanza precedente termini, e se quella è orfana — "
+            "tipicamente figlia di un editor chiuso a forza — non termina mai. "
+            "Aspettare di più non serve, e nemmeno rilanciare: una seconda build "
+            "si accoda sullo stesso lock.\n"
+            "Chiudi i processi rimasti e poi ue_build_start con force=True. "
+            "Cerca, in quest'ordine: %s, i `cmd.exe` con Build.bat o RunUAT nella "
+            "riga di comando, e il `dotnet.exe` che esegue UnrealBuildTool.dll "
+            "(su UE 5 UBT gira lì dentro, quindi non compare con il suo nome). "
+            "Un riavvio li azzera tutti."
+            % ", ".join(BUILD_LOCK_PROCESSES)
+        )
+    return esito
 
 
 PACKAGE_STATE_FILE = STATE_DIR / "package.json"
@@ -1689,5 +1754,18 @@ def kill_editor(timeout: float = 30.0) -> dict:
     while time.time() < deadline and _process_alive(pid):
         time.sleep(0.5)
 
+    # `taskkill /T` chiude l'albero, ma i processi che l'editor lancia staccati —
+    # la Turnkey SDK detection passa da RunUAT, e UnrealBuildTool resta appeso —
+    # ne escono e sopravvivono. Restano a tenere il mutex globale della build, e
+    # il prossimo ue_build_start si pianta su "Build.bat is already running"
+    # senza che nulla dica perché. Ripulirli qui è il posto giusto: è questa
+    # terminazione forzata a produrli.
+    orfani = [nome for nome in BUILD_LOCK_PROCESSES if terminate_process_by_name(nome)]
+
     _save_state({})
-    return {"killed": True, "pid": pid, "still_alive": _process_alive(pid)}
+    return {
+        "killed": True,
+        "pid": pid,
+        "still_alive": _process_alive(pid),
+        "orphans_cleaned": orfani,
+    }

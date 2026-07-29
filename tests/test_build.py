@@ -178,3 +178,97 @@ def test_build_stato_separato_per_progetto(progetto, tmp_path, monkeypatch):
     assert local.build_status(uproject=secondo)["target"] == "AltroGiocoEditor"
     # senza argomento: l'ultimo avviato
     assert local.build_status()["target"] == "AltroGiocoEditor"
+
+
+# ------------------------------------------------ build bloccata su mutex
+
+
+def _log_build(progetto, righe):
+    log = Path(progetto["uproject"]).parent / "Saved/Logs/mcp_build.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("\n".join(righe) + "\n", encoding="utf-8")
+
+
+def test_build_ferma_su_mutex_non_e_una_build_lenta(progetto, monkeypatch):
+    """Il consiglio "aspetta di più" qui è esattamente quello sbagliato.
+
+    Build.bat con -WaitMutex aspetta all'infinito che un UnrealBuildTool
+    precedente lo rilasci. Se quel processo è orfano non lo rilascia mai: il
+    log resta di una riga e lo stato direbbe "in corso" per sempre.
+    """
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.start_build(progetto["uproject"])
+    _log_build(progetto, ["Build.bat is already running, waiting for existing script to terminate..."])
+    monkeypatch.setattr(local, "_process_alive", lambda pid: True)
+
+    stato = local.build_status()
+    assert stato["running"] is True
+    assert stato["blocked"] is True
+    assert "lock" in stato["reason"]
+    assert "UnrealBuildTool.exe" in stato["reason"]
+
+
+def test_build_che_sta_davvero_compilando_non_e_bloccata(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.start_build(progetto["uproject"])
+    _log_build(progetto, [
+        "Build.bat is already running, waiting for existing script to terminate...",
+        "Building IndovinaChi3DEditor...",
+        "Compiling 12 actions",
+    ])
+    monkeypatch.setattr(local, "_process_alive", lambda pid: True)
+
+    stato = local.build_status()
+    assert stato["blocked"] is False
+    assert "reason" not in stato
+
+
+def test_seconda_build_rifiutata_mentre_la_prima_e_viva(progetto, monkeypatch):
+    """Accodarne una seconda sullo stesso mutex peggiora e basta."""
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.start_build(progetto["uproject"])
+    _log_build(progetto, ["Build.bat is already running, waiting for existing script to terminate..."])
+    monkeypatch.setattr(local, "_process_alive", lambda pid: True)
+
+    with pytest.raises(local.LocalError) as errore:
+        local.start_build(progetto["uproject"])
+    testo = str(errore.value)
+    assert "già una compilazione" in testo
+    assert "bloccata su un mutex" in testo
+    assert "force=True" in testo
+
+    # force resta la via d'uscita dopo aver ripulito i processi
+    local.start_build(progetto["uproject"], force=True)
+
+
+def test_chiusura_forzata_ripulisce_i_processi_che_tengono_il_mutex(progetto, monkeypatch):
+    """È la nostra taskkill a lasciare orfani: la pulizia va fatta qui."""
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.launch_editor(progetto["uproject"], skip_module_check=True)
+
+    # Vivo al controllo iniziale (altrimenti kill_editor non ha niente da fare),
+    # morto subito dopo la taskkill.
+    chiamate = {"n": 0}
+
+    def _vivo(pid):
+        chiamate["n"] += 1
+        return chiamate["n"] == 1
+
+    monkeypatch.setattr(local, "_process_alive", _vivo)
+    monkeypatch.setattr(local.subprocess, "run", lambda *a, **k: None)
+    # Su Linux kill_editor usa os.kill: il pid finto non esiste.
+    monkeypatch.setattr(local.os, "kill", lambda *a: None)
+    monkeypatch.setattr(local.platform, "system", lambda: "Windows")
+
+    uccisi = []
+
+    def _finto_kill(nome):
+        uccisi.append(nome)
+        return True
+
+    monkeypatch.setattr(local, "terminate_process_by_name", _finto_kill)
+    esito = local.kill_editor(timeout=0.1)
+
+    assert esito["killed"] is True
+    assert "UnrealBuildTool.exe" in esito["orphans_cleaned"]
+    assert uccisi == list(local.BUILD_LOCK_PROCESSES)
