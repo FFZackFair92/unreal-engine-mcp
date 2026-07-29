@@ -148,11 +148,26 @@ def extract_archive(archive: str, destination: str | None = None) -> dict:
             # `filter="data"` è il comportamento predefinito da Python 3.14,
             # ma qui il minimo supportato è 3.10.
             if sys.version_info >= (3, 12):
-                archive_file.extractall(target, members=members, filter="data")
+                try:
+                    archive_file.extractall(target, members=members, filter="data")
+                except tarfile.TarError as exc:
+                    # Su 3.12+ il filtro solleva le sue eccezioni (per esempio
+                    # LinkOutsideDestinationError), che non sono AssetError e
+                    # arriverebbero al chiamante come traceback grezzo: qui
+                    # l'archivio è semplicemente ostile, e va detto così.
+                    raise AssetError(
+                        "Archivio rifiutato: %s. Un membro esce dalla cartella di "
+                        "destinazione (symlink, hardlink o percorso assoluto)." % exc
+                    ) from exc
             else:  # pragma: no cover - solo su 3.10/3.11
-                members = [
-                    m for m in members if not (m.issym() or m.islnk() or m.isdev())
-                ]
+                # Stesso esito senza `filter`, che qui non esiste: i membri che
+                # possono puntare fuori dalla destinazione si scartano a mano.
+                pericolosi = [m for m in members if m.issym() or m.islnk() or m.isdev()]
+                if pericolosi:
+                    raise AssetError(
+                        "Archivio rifiutato: %s esce dalla cartella di destinazione "
+                        "(symlink, hardlink o file speciale)." % pericolosi[0].name
+                    )
                 archive_file.extractall(target, members=members)  # noqa: S202 - membri già filtrati sopra
         extracted = [m.name for m in members]
     elif path.suffix.lower() == ".rar":

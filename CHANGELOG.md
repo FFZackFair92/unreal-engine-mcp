@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-07-29
+
+### Fixed
+
+- **`extract_archive` raises `AssetError` on every Python version.** On 3.12+
+  the `filter="data"` pass raises tarfile's own exceptions —
+  `LinkOutsideDestinationError` and friends — which are not `AssetError` and
+  reached the caller as a raw traceback. The archive was still refused, so the
+  protection held; only the error type leaked. Caught in CI, which runs 3.10
+  through 3.13: the 0.3.0 fix had only been exercised on the 3.10/3.11 branch.
+
 ## [0.3.0] — 2026-07-29
 
 ### Added

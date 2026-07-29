@@ -230,8 +230,8 @@ def test_extract_tar_scarta_symlink_fuori_target(tmp_path):
         tf.addfile(collegamento)
 
     destinazione = tmp_path / "estratto"
-    try:
+    # Deve essere un AssetError su ogni versione: su 3.12+ il filtro di tarfile
+    # solleva LinkOutsideDestinationError, che il chiamante non conosce.
+    with pytest.raises(assets.AssetError, match="destinazione"):
         assets.extract_archive(str(archivio), str(destinazione))
-    except assets.AssetError:
-        pass  # rifiutare l'archivio è una risposta accettabile
     assert not (destinazione / "innocuo.txt").is_symlink()
