@@ -540,6 +540,8 @@ def project_info(uproject: str) -> dict:
         # Il canale nativo (trasporto predefinito) chiede solo il plugin Python;
         # la Remote Control API ne vuole due. Distinguerli evita di rifiutare un
         # progetto che è configurato bene per il trasporto che userà davvero.
+        "modules_build_id": project_modules_build_id(path.parent),
+        "binaries_present": (path.parent / "Binaries" / "Win64").is_dir(),
         "pyremote_ready": "PythonScriptPlugin" in plugins,
         "remotecontrol_ready": {"PythonScriptPlugin", "RemoteControl"}.issubset(set(plugins)),
         "bridge_ready": "PythonScriptPlugin" in plugins,
@@ -962,6 +964,91 @@ def create_cpp_class(
 
 
 BUILD_STATE_FILE = STATE_DIR / "build.json"
+
+
+# ------------------------------------------- allineamento moduli / motore
+
+
+def project_modules_build_id(project_dir: str | Path) -> str | None:
+    """BuildId dei binari del progetto, da `Binaries/Win64/UnrealEditor.modules`.
+
+    È il numero che Unreal confronta con quello del motore all'avvio. Se non
+    coincidono i moduli sono considerati "built with a different engine
+    version".
+    """
+    percorso = Path(project_dir) / "Binaries" / "Win64" / "UnrealEditor.modules"
+    try:
+        return str(json.loads(percorso.read_text(encoding="utf-8-sig")).get("BuildId") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def engine_build_id(engine: EngineInstall) -> str | None:
+    """BuildId del motore, da `Engine/Build/Build.version`."""
+    percorso = Path(engine.root) / "Engine" / "Build" / "Build.version"
+    try:
+        dati = json.loads(percorso.read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        return None
+    return str(dati.get("BuildId") or "") or None
+
+
+def modules_status(uproject: str | Path, engine: EngineInstall) -> dict:
+    """Verifica che i binari del progetto corrispondano al motore che lo aprirà.
+
+    Perché serve un controllo esplicito: quando non corrispondono, l'editor non
+    fallisce e non stampa un errore. Apre una finestra modale che chiede se
+    ricompilare — e quella finestra sta **dietro allo splash screen**. Dal di
+    fuori si vede solo un editor fermo a "0% - Initializing.." per sempre, e nel
+    log l'ultima riga è la SDK detection. È un blocco silenzioso che costa
+    mezz'ora a chi non sa dove guardare.
+    """
+    path = Path(uproject).expanduser()
+    cartella = path.parent
+    ha_sorgenti = (cartella / "Source").is_dir()
+    binari = (cartella / "Binaries" / "Win64").is_dir()
+    progetto_id = project_modules_build_id(cartella)
+    motore_id = engine_build_id(engine)
+
+    stato = {
+        "has_source": ha_sorgenti,
+        "binaries_present": binari,
+        "project_build_id": progetto_id,
+        "engine_build_id": motore_id,
+        "engine_root": engine.root,
+        "match": None,
+        "reason": "",
+    }
+
+    if not ha_sorgenti:
+        stato["match"] = True
+        stato["reason"] = "progetto senza C++: non ci sono moduli da allineare"
+        return stato
+    if not binari or progetto_id is None:
+        stato["match"] = False
+        stato["reason"] = (
+            "il progetto ha una cartella Source ma nessun modulo compilato: "
+            "l'editor chiederà di compilarlo con una finestra che resta dietro "
+            "allo splash"
+        )
+        return stato
+    if motore_id is None:
+        stato["match"] = None
+        stato["reason"] = (
+            "impossibile leggere il BuildId del motore da %s: controllo saltato"
+            % (Path(engine.root) / "Engine/Build/Build.version")
+        )
+        return stato
+
+    stato["match"] = progetto_id == motore_id
+    if not stato["match"]:
+        stato["reason"] = (
+            "i moduli del progetto sono compilati con BuildId %s, il motore in "
+            "%s ha BuildId %s" % (progetto_id, engine.root, motore_id)
+        )
+    else:
+        stato["reason"] = "moduli allineati (BuildId %s)" % progetto_id
+    return stato
 
 
 def _save_job(state_file: Path, uproject: str, state: dict) -> None:
@@ -1446,8 +1533,15 @@ def launch_editor(
     engine_version: str | None = None,
     extra_args: list[str] | None = None,
     engine_root: str | None = None,
+    skip_module_check: bool = False,
 ) -> dict:
-    """Avvia l'editor su un progetto, con il web server Remote Control attivo."""
+    """Avvia l'editor su un progetto.
+
+    Prima di lanciare verifica che i moduli C++ compilati corrispondano al
+    motore: se non corrispondono l'editor si pianta a "0% - Initializing.."
+    dietro una modale invisibile, e conviene dirlo qui invece di lasciar
+    aspettare. `skip_module_check=True` disattiva il controllo.
+    """
     path = Path(uproject).expanduser()
     if not path.exists():
         raise LocalError("File .uproject non trovato: %s" % path)
@@ -1465,6 +1559,24 @@ def launch_editor(
     engine = resolve_engine(
         engine_version or info.get("engine_association"), engine_root, path.parent
     )
+
+    moduli = modules_status(path, engine)
+    if not skip_module_check and moduli["match"] is False:
+        raise LocalError(
+            "I moduli C++ del progetto non corrispondono al motore che lo aprirebbe: %s.\n\n"
+            "Non è un errore che vedrai a schermo: l'editor si ferma a "
+            "\"0%% - Initializing..\" perché sta aspettando una risposta alla "
+            "finestra \"the following modules are missing or built with a "
+            "different engine version\", che compare dietro allo splash.\n\n"
+            "Come uscirne, in ordine di preferenza:\n"
+            "  1. ricompila con questo motore: ue_build_start (a editor chiuso), "
+            "poi ue_build_status, poi riapri;\n"
+            "  2. apri con il motore giusto passando engine_root o engine_version;\n"
+            "  3. skip_module_check=True per lanciare comunque e rispondere a mano "
+            "alla finestra (Alt-Tab per trovarla)."
+            % moduli["reason"]
+        )
+
     args = [engine.editor, str(path)]
     # I flag del web server Remote Control hanno senso solo se quel plugin è
     # attivo: passarli a un progetto che usa il canale nativo non rompe niente,
@@ -1486,6 +1598,7 @@ def launch_editor(
         "uproject": str(path),
         "engine": engine.as_dict(),
         "command": args,
+        "modules": moduli,
     }
 
 

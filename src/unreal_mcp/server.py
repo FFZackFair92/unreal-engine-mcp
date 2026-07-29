@@ -243,25 +243,37 @@ async def ue_project_set_plugins(
 async def ue_editor_open(
     uproject: str,
     engine_version: str | None = None,
-    wait_seconds: int = 240,
+    wait_seconds: int = 50,
     extra_args: list[str] | None = None,
     engine_root: str | None = None,
+    skip_module_check: bool = False,
     ctx: Context | None = None,
 ) -> dict:
-    """Apre un progetto nell'editor e attende che il bridge Remote Control risponda.
+    """Apre un progetto nell'editor e attende che il bridge risponda.
+
+    L'attesa predefinita è breve di proposito: molti client MCP interrompono una
+    richiesta dopo 60 secondi, e un `wait_seconds` più lungo faceva fallire la
+    chiamata con "Request timed out" **anche quando l'editor era partito
+    benissimo**. Se il bridge non è ancora pronto la risposta lo dice e basta
+    richiamare ue_editor_status finché `running` diventa `bridge_ready`.
 
     Args:
         uproject: percorso del file .uproject.
         engine_version: forza una versione del motore diversa da quella associata.
-        wait_seconds: quanto attendere l'apertura (il primo avvio compila gli shader
-            e può richiedere diversi minuti; con 0 non attende).
+        wait_seconds: quanto attendere il bridge. Il primo avvio compila gli
+            shader e può volerci molto di più: in quel caso non alzarlo oltre il
+            timeout del client, si fa polling con ue_editor_status.
         extra_args: argomenti aggiuntivi per la riga di comando dell'editor.
         engine_root: percorso del motore, quando non è registrato nel sistema.
+        skip_module_check: lancia anche se i moduli C++ non corrispondono al
+            motore (l'editor resterà bloccato su una modale dietro allo splash).
     """
     # L'editor riparte da zero: gli helper installati nella sessione precedente
     # non ci sono più.
     _bridge.forget_helpers()
-    launched = local_call(local.launch_editor, uproject, engine_version, extra_args, engine_root)
+    launched = local_call(
+        local.launch_editor, uproject, engine_version, extra_args, engine_root, skip_module_check
+    )
 
     if wait_seconds <= 0:
         return {**launched, "bridge_ready": False, "note": "launch not awaited"}
@@ -288,9 +300,12 @@ async def ue_editor_open(
         **launched,
         "bridge_ready": False,
         "note": (
-            "Editor launched but the bridge did not answer within %d s. The first "
-            "launch compiles shaders and takes a while: retry with ue_status in a "
-            "few minutes." % wait_seconds
+            "Editor avviato (pid %s), ma il bridge non ha risposto entro %d s. "
+            "Non è un errore: il primo avvio compila gli shader e ci mette "
+            "minuti. Richiama ue_editor_status per seguirlo, e ue_status quando "
+            "risulta pronto. Se resta fermo a '0%% - Initializing..' cerca con "
+            "Alt-Tab una finestra dell'editor dietro allo splash."
+            % (launched.get("pid"), wait_seconds)
         ),
     }
 

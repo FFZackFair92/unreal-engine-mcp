@@ -66,3 +66,19 @@ async def test_lo_screenshot_non_ha_output_strutturato():
     tools = await mcp_server.mcp.list_tools()
     screenshot = next(t for t in tools if t.name == "ue_screenshot")
     assert screenshot.outputSchema is None
+
+
+async def test_attesa_di_apertura_sotto_il_timeout_dei_client():
+    """`wait_seconds` alto faceva fallire la chiamata anche a lancio riuscito.
+
+    Molti client MCP interrompono una richiesta dopo 60 secondi: con il vecchio
+    default di 240 il client rispondeva "Request timed out" mentre l'editor era
+    partito e stava caricando. Il default deve stare sotto quella soglia.
+    """
+    import inspect
+
+    firma = inspect.signature(mcp_server.ue_editor_open)
+    default = firma.parameters["wait_seconds"].default
+    assert default < 60, (
+        "wait_seconds=%s supera il timeout tipico di un client MCP" % default
+    )

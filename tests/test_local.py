@@ -367,3 +367,101 @@ def test_launch_editor_con_remote_control_passa_i_flag(engines, tmp_path, monkey
     monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
     local.launch_editor(created["uproject"])
     assert "-RCWebControlEnable" in catturato["args"]
+
+
+# --------------------------------------- allineamento moduli / motore
+
+
+def _scrivi_modules(cartella: Path, build_id: str) -> None:
+    d = cartella / "Binaries" / "Win64"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "UnrealEditor.modules").write_text(
+        json.dumps({"BuildId": build_id, "Modules": {"X": "UnrealEditor-X.dll"}}),
+        encoding="utf-8",
+    )
+
+
+def _scrivi_build_version(engine_root: Path, build_id: str) -> None:
+    d = engine_root / "Engine" / "Build"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Build.version").write_text(
+        json.dumps({"MajorVersion": 5, "MinorVersion": 8, "BuildId": build_id}),
+        encoding="utf-8",
+    )
+
+
+def test_moduli_disallineati_bloccano_il_lancio(engines, tmp_path, monkeypatch):
+    """Il sintomo vero è un editor fermo a 0% dietro una modale invisibile.
+
+    Senza questo controllo il tool lancia, non torna nessun errore, e chi
+    guarda vede solo uno splash screen che non avanza mai.
+    """
+    created = local.create_project("Disallineato", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    (path.parent / "Source").mkdir(exist_ok=True)
+    _scrivi_modules(path.parent, "11111111")
+
+    engine = local.resolve_engine("5.8")
+    _scrivi_build_version(Path(engine.root), "99999999")
+
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    with pytest.raises(local.LocalError) as errore:
+        local.launch_editor(str(path))
+    testo = str(errore.value)
+    assert "0% - Initializing" in testo
+    assert "11111111" in testo and "99999999" in testo
+    assert "ue_build_start" in testo
+
+    # L'escape hatch resta: si può lanciare comunque e rispondere a mano.
+    esito = local.launch_editor(str(path), skip_module_check=True)
+    assert esito["modules"]["match"] is False
+
+
+def test_moduli_allineati_passano(engines, tmp_path, monkeypatch):
+    created = local.create_project("Allineato", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    (path.parent / "Source").mkdir(exist_ok=True)
+    _scrivi_modules(path.parent, "55116800")
+    _scrivi_build_version(Path(local.resolve_engine("5.8").root), "55116800")
+
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    esito = local.launch_editor(str(path))
+    assert esito["modules"]["match"] is True
+
+
+def test_progetto_blueprint_only_non_ha_moduli_da_allineare(engines, tmp_path, monkeypatch):
+    """Senza cartella Source non c'è niente da confrontare: non inventare problemi."""
+    created = local.create_project("SoloBP", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    _scrivi_build_version(Path(local.resolve_engine("5.8").root), "55116800")
+
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    esito = local.launch_editor(str(path))
+    assert esito["modules"]["match"] is True
+    assert "senza C++" in esito["modules"]["reason"]
+
+
+def test_sorgenti_senza_binari_e_un_problema(engines, tmp_path):
+    created = local.create_project("MaiCompilato", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    (path.parent / "Source").mkdir(exist_ok=True)
+    engine = local.resolve_engine("5.8")
+    _scrivi_build_version(Path(engine.root), "55116800")
+
+    stato = local.modules_status(path, engine)
+    assert stato["match"] is False
+    assert "nessun modulo compilato" in stato["reason"]
+
+
+def test_build_id_del_motore_illeggibile_non_blocca(engines, tmp_path, monkeypatch):
+    """Se non si riesce a leggere il BuildId del motore, meglio provare che rifiutare."""
+    created = local.create_project("Ignoto", str(tmp_path / "P"))
+    path = Path(created["uproject"])
+    (path.parent / "Source").mkdir(exist_ok=True)
+    _scrivi_modules(path.parent, "11111111")
+    # nessun Build.version scritto per il motore
+
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    esito = local.launch_editor(str(path))
+    assert esito["modules"]["match"] is None
+    assert "controllo saltato" in esito["modules"]["reason"]

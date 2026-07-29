@@ -4,6 +4,39 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.3] — 2026-07-29
+
+### Fixed
+
+- **`ue_editor_open` no longer times out on a launch that worked.** The default
+  `wait_seconds` was 240, well past the 60-second request timeout most MCP
+  clients apply, so the call came back `Request timed out` while the editor was
+  starting perfectly well — `ue_editor_status` showed the pid alive the whole
+  time. The default is now 50, and when the bridge is not up yet the answer
+  says so and points at `ue_editor_status` for polling. Raising `wait_seconds`
+  past the client timeout brings the old behaviour back, so a test now pins the
+  default below 60.
+
+### Added
+
+- **Stale C++ modules are caught before the editor is launched.** When the
+  project's compiled modules do not match the engine opening them, Unreal does
+  not fail and does not log anything: it opens a *"the following modules are
+  missing or built with a different engine version"* dialog **behind the splash
+  screen**. From outside, all you see is an editor stuck at
+  `0% - Initializing..` forever, with SDK detection as the last line in the log.
+
+  `launch_editor` now compares the `BuildId` in the project's
+  `Binaries/Win64/UnrealEditor.modules` against the engine's
+  `Engine/Build/Build.version` and refuses to launch on a mismatch, naming both
+  ids and listing the three ways out: rebuild with `ue_build_start`, point at
+  the right engine, or `skip_module_check=True` and answer the dialog by hand.
+  A project with a `Source` folder but no compiled binaries is caught the same
+  way. Blueprint-only projects have nothing to compare and are never blocked;
+  an unreadable engine `Build.version` skips the check rather than blocking.
+
+  `ue_project_info` also reports `modules_build_id` and `binaries_present`.
+
 ## [0.4.2] — 2026-07-29
 
 ### Fixed

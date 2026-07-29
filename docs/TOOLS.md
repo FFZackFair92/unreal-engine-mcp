@@ -29,7 +29,7 @@ the Unreal convention (`/Game/...`).
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args`, `engine_root` | Launches the editor and **waits until the bridge answers**, so the next call is safe. First launch compiles shaders and can take minutes. |
+| `ue_editor_open` | `uproject`, `engine_version`, `wait_seconds`, `extra_args`, `engine_root`, `skip_module_check` | Launches the editor and waits for the bridge. `wait_seconds` defaults to 50 because most MCP clients abandon a request at 60 — a longer wait made the call report a timeout while the editor was starting fine; poll `ue_editor_status` instead. Refuses to launch when the project's compiled C++ modules do not match the engine: that mismatch does not produce an error, it opens a *rebuild?* dialog **behind the splash screen**, and all you see is an editor stuck at `0% - Initializing..` forever. |
 | `ue_editor_status` | — | Whether the editor process is alive (including one you started by hand), whether Live Coding is running, whether the bridge answers. |
 | `ue_editor_close` | `save_all`, `force` | Clean shutdown: saves, then `quit_editor` over the bridge. Falls back to killing the process. |
 
