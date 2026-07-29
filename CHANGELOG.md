@@ -4,6 +4,42 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-07-29
+
+### Added
+
+- **`ue_build_unblock`** — finds, and on request terminates, the processes
+  holding the build lock.
+
+  0.4.4 learned to *report* a blocked build but still told you to go hunting in
+  Task Manager, and the advice did not work: it searched by image name. On
+  UE 5, UnrealBuildTool is a .NET assembly running inside `dotnet.exe` and
+  Epic's scripts run inside `cmd.exe`, so `taskkill /IM UnrealBuildTool.exe`
+  matches nothing and the lock looks impossible to clear. This searches the
+  **command line** instead, which is where those names actually appear.
+
+  `dry_run=True` by default: matching on command line can catch a `dotnet.exe`
+  doing something else entirely, so the list comes first and the killing is a
+  second, explicit call. `UnrealEditor.exe` and `UnrealEditor-Cmd.exe` are never
+  matched — they use the build, they do not block it.
+
+  `ue_build_unblock` also inspects the **lock file**, which is the half of the
+  problem that processes do not explain. `Build.bat` does not use a system
+  mutex: lines 18-20 build a filename from its own full path (backslashes to
+  dashes, colons stripped) under `%TMP%`, then open it exclusively on handle 9.
+  The lock *is* that open handle. If the open fails the script prints
+  "is already running" and loops forever — and if the file is left unopenable
+  rather than held, there is no process to kill and the build waits for eternity.
+  The filename is built with `ntpath` so it comes out right even when the server
+  runs on Linux against a Windows engine path.
+
+  `ue_build_status` now points at this tool instead of at Task Manager.
+
+- **Each build gets its own log file.** They all wrote to `mcp_build.log`, so
+  several accidental concurrent builds produced one unreadable mixture — the
+  only line visible was some waiter's "already running", while the run that
+  actually held the lock was invisible. This one cost real time to diagnose.
+
 ## [0.5.0] — 2026-07-29
 
 ### Added

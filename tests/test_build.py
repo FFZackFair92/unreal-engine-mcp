@@ -92,7 +92,7 @@ def test_build_avvio_e_stato(progetto, monkeypatch):
     assert len(generati) == 1
     contenuto = generati[0].read_text(encoding="utf-8")
     assert "MyGameEditor" in contenuto
-    assert "mcp_build.log" in contenuto
+    assert "mcp_build_" in contenuto and ".log" in contenuto
     assert "EXITCODE" in contenuto
 
     # compilazione ancora in corso
@@ -183,8 +183,8 @@ def test_build_stato_separato_per_progetto(progetto, tmp_path, monkeypatch):
 # ------------------------------------------------ build bloccata su mutex
 
 
-def _log_build(progetto, righe):
-    log = Path(progetto["uproject"]).parent / "Saved/Logs/mcp_build.log"
+def _log_build(avvio, righe):
+    log = Path(avvio["log"])
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("\n".join(righe) + "\n", encoding="utf-8")
 
@@ -197,21 +197,21 @@ def test_build_ferma_su_mutex_non_e_una_build_lenta(progetto, monkeypatch):
     log resta di una riga e lo stato direbbe "in corso" per sempre.
     """
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    local.start_build(progetto["uproject"])
-    _log_build(progetto, ["Build.bat is already running, waiting for existing script to terminate..."])
+    avvio = local.start_build(progetto["uproject"])
+    _log_build(avvio, ["Build.bat is already running, waiting for existing script to terminate..."])
     monkeypatch.setattr(local, "_process_alive", lambda pid: True)
 
     stato = local.build_status()
     assert stato["running"] is True
     assert stato["blocked"] is True
     assert "lock" in stato["reason"]
-    assert "UnrealBuildTool.exe" in stato["reason"]
+    assert "ue_build_unblock" in stato["reason"]
 
 
 def test_build_che_sta_davvero_compilando_non_e_bloccata(progetto, monkeypatch):
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    local.start_build(progetto["uproject"])
-    _log_build(progetto, [
+    avvio = local.start_build(progetto["uproject"])
+    _log_build(avvio, [
         "Build.bat is already running, waiting for existing script to terminate...",
         "Building IndovinaChi3DEditor...",
         "Compiling 12 actions",
@@ -226,8 +226,8 @@ def test_build_che_sta_davvero_compilando_non_e_bloccata(progetto, monkeypatch):
 def test_seconda_build_rifiutata_mentre_la_prima_e_viva(progetto, monkeypatch):
     """Accodarne una seconda sullo stesso mutex peggiora e basta."""
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    local.start_build(progetto["uproject"])
-    _log_build(progetto, ["Build.bat is already running, waiting for existing script to terminate..."])
+    avvio = local.start_build(progetto["uproject"])
+    _log_build(avvio, ["Build.bat is already running, waiting for existing script to terminate..."])
     monkeypatch.setattr(local, "_process_alive", lambda pid: True)
 
     with pytest.raises(local.LocalError) as errore:
@@ -272,3 +272,146 @@ def test_chiusura_forzata_ripulisce_i_processi_che_tengono_il_mutex(progetto, mo
     assert esito["killed"] is True
     assert "UnrealBuildTool.exe" in esito["orphans_cleaned"]
     assert uccisi == list(local.BUILD_LOCK_PROCESSES)
+
+
+# ------------------------------------------ trovare chi tiene il lock di build
+
+
+def test_riconosce_ubt_dentro_dotnet():
+    """È il caso che rendeva il lock inestirpabile.
+
+    Su UE 5 UnrealBuildTool è un assembly .NET: il processo si chiama
+    `dotnet.exe`, quindi `taskkill /IM UnrealBuildTool.exe` non trova niente.
+    Solo la riga di comando lo rivela.
+    """
+    assert local._matches_build_lock(
+        "dotnet.exe",
+        r'"C:\Program Files\dotnet\dotnet.exe" '
+        r'"C:\UE_5.8\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll" -Mode=Build',
+    )
+
+
+def test_riconosce_gli_script_dentro_cmd():
+    assert local._matches_build_lock("cmd.exe", 'cmd.exe /c ""C:\\UE\\Engine\\Build\\BatchFiles\\Build.bat" MyEditor Win64"')
+    assert local._matches_build_lock("cmd.exe", 'cmd.exe /c "C:\\UE\\Engine\\Build\\BatchFiles\\RunUAT.bat" Turnkey')
+
+
+def test_non_tocca_leditor():
+    """L'editor usa la build, non la blocca: terminarlo sarebbe un danno."""
+    assert not local._matches_build_lock(
+        "UnrealEditor.exe", r'"C:\UE\UnrealEditor.exe" "C:\P\G.uproject"'
+    )
+    assert not local._matches_build_lock("UnrealEditor-Cmd.exe", "UnrealEditor-Cmd.exe render")
+
+
+def test_non_tocca_dotnet_estranei():
+    assert not local._matches_build_lock("dotnet.exe", "dotnet.exe run --project MioServizio")
+    assert not local._matches_build_lock("chrome.exe", "chrome.exe --type=renderer")
+
+
+def test_parsing_elenco_windows():
+    uscita = "\n".join([
+        "1234,dotnet.exe,C:\\dotnet.exe UnrealBuildTool.dll -Mode=Build -Project=C:\\a,b\\G.uproject",
+        "5678,chrome.exe,chrome.exe --flag",
+        "intestazione da ignorare",
+        "",
+    ])
+    processi = local._parse_windows_process_list(uscita)
+    assert [p["pid"] for p in processi] == [1234, 5678]
+    # La riga di comando contiene virgole: non deve essere troncata.
+    assert processi[0]["cmdline"].endswith("G.uproject")
+
+
+def test_parsing_elenco_posix():
+    uscita = "  PID COMMAND\n  42 /usr/bin/dotnet UnrealBuildTool.dll -Mode=Build\n  43 sleep 1\n"
+    processi = local._parse_posix_process_list(uscita)
+    assert processi[0]["pid"] == 42
+    assert processi[0]["name"] == "dotnet"
+
+
+def test_dry_run_non_termina_niente(monkeypatch):
+    monkeypatch.setattr(
+        local, "list_processes_with_cmdline",
+        lambda: [{"pid": 1, "name": "dotnet.exe", "cmdline": "dotnet UnrealBuildTool.dll"}],
+    )
+    uccisi = []
+    monkeypatch.setattr(local.subprocess, "run", lambda *a, **k: uccisi.append(a))
+
+    esito = local.clear_build_locks()
+    assert esito["dry_run"] is True
+    assert len(esito["found"]) == 1
+    assert esito["terminated"] == []
+    assert uccisi == []
+    assert "dry_run=False" in esito["note"]
+
+
+def test_terminazione_effettiva(monkeypatch):
+    monkeypatch.setattr(
+        local, "list_processes_with_cmdline",
+        lambda: [
+            {"pid": 1, "name": "dotnet.exe", "cmdline": "dotnet UnrealBuildTool.dll"},
+            {"pid": 2, "name": "chrome.exe", "cmdline": "chrome --type=renderer"},
+        ],
+    )
+    monkeypatch.setattr(local.platform, "system", lambda: "Windows")
+    comandi = []
+    monkeypatch.setattr(local.subprocess, "run", lambda args, **k: comandi.append(args))
+
+    esito = local.clear_build_locks(dry_run=False)
+    assert [p["pid"] for p in esito["terminated"]] == [1]
+    assert comandi == [["taskkill", "/PID", "1", "/T", "/F"]]
+    assert "Terminati 1" in esito["note"]
+
+
+def test_nessun_lock_lo_dice(monkeypatch):
+    monkeypatch.setattr(local, "list_processes_with_cmdline", list)
+    esito = local.clear_build_locks()
+    assert esito["found"] == []
+    assert "Nessun processo" in esito["note"]
+
+
+def test_percorso_del_file_di_lock_di_build_bat():
+    """Le righe 18-20 di Build.bat: percorso completo, \\ -> -, via i :, sotto %TMP%.
+
+    Il nome va costruito come lo costruisce Windows anche quando il server gira
+    altrove, o i separatori restano misti e si cerca un file che non esiste.
+    """
+    motore = local.EngineInstall(
+        version="5.8", root=r"C:\Program Files\Epic Games\UE_5.8", editor="x", source="t"
+    )
+    assert (
+        local.build_lock_file(motore).name
+        == "C-Program Files-Epic Games-UE_5.8-Engine-Build-BatchFiles-Build.bat.lock"
+    )
+
+
+def test_file_di_lock_assente_non_e_un_problema(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMP", str(tmp_path))
+    motore = local.EngineInstall(version="5.8", root=r"C:\UE", editor="x", source="t")
+    stato = local.inspect_build_lock_file(motore)
+    assert stato["exists"] is False
+    assert stato["writable"] is True
+
+
+def test_file_di_lock_non_scrivibile_e_la_causa_senza_processi(tmp_path, monkeypatch):
+    """È il caso che i processi non spiegano: nessuno lo tiene, eppure blocca."""
+    monkeypatch.setenv("TMP", str(tmp_path))
+    motore = local.EngineInstall(version="5.8", root=r"C:\UE", editor="x", source="t")
+    percorso = local.build_lock_file(motore)
+    percorso.write_text("")
+
+    stato = local.inspect_build_lock_file(motore)
+    assert stato["exists"] is True
+    assert stato["writable"] is True  # scrivibile: allora è un processo vivo
+
+    import os as _os
+    _os.chmod(percorso, 0o444)
+    monkeypatch.setattr(local.os, "access", lambda p, m: False)
+
+    def _nega(*a, **k):
+        raise PermissionError("accesso negato")
+
+    monkeypatch.setattr("builtins.open", _nega)
+    stato = local.inspect_build_lock_file(motore)
+    assert stato["writable"] is False
+    assert "senza che nessun processo lo tenga" in stato["reason"]

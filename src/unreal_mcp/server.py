@@ -513,6 +513,34 @@ async def ue_package_status(
 
 
 @mcp.tool()
+async def ue_build_unblock(
+    dry_run: bool = True,
+    engine_version: str | None = None,
+    engine_root: str | None = None,
+) -> dict:
+    """Trova — e se vuoi termina — i processi che tengono occupato il lock di build.
+
+    Serve quando ue_build_status riporta `blocked`: gli script di Epic prendono
+    un lock globale e un'istanza rimasta orfana non lo rilascia mai, quindi
+    Build.bat aspetta all'infinito e ogni nuovo tentativo si accoda.
+
+    La ricerca è sulla **riga di comando**, non sul nome dell'immagine: su UE 5
+    UnrealBuildTool è un assembly .NET dentro `dotnet.exe` e gli script girano
+    dentro `cmd.exe`, quindi nessuno dei due si trova con
+    `taskkill /IM UnrealBuildTool.exe` — ed è il motivo per cui il lock sembra
+    inestirpabile.
+
+    Args:
+        dry_run: con True (default) elenca soltanto. La ricerca per riga di
+            comando può intercettare un `dotnet.exe` che sta facendo altro:
+            guarda l'elenco prima di terminarlo.
+        engine_version, engine_root: quale motore, per sapere quale file di
+            lock controllare (`%TMP%\\<percorso di Build.bat>.lock`).
+    """
+    return local_call(local.clear_build_locks, dry_run, engine_version, engine_root)
+
+
+@mcp.tool()
 async def ue_editor_status() -> dict:
     """Stato del processo editor avviato da questo MCP e del bridge Remote Control."""
     process = local_call(local.editor_status)

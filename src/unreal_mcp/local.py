@@ -9,11 +9,13 @@ qui, lanciando `UnrealEditor.exe` come processo figlio.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1278,10 +1280,12 @@ def start_build(
     _check_path_arg("uproject", path)
     _check_path_arg("Build script", build_bat)
 
-    log_path = path.parent / "Saved/Logs/mcp_build.log"
+    # Un file di log per esecuzione, non uno fisso: con più build avviate per
+    # sbaglio, tutte scrivevano nello stesso percorso e la coda diventava un
+    # miscuglio illeggibile — l'unica riga che si vedeva era il "waiting" di una
+    # qualsiasi di loro, mentre quella che aveva davvero il lock era invisibile.
+    log_path = path.parent / "Saved/Logs" / ("mcp_build_%d.log" % int(time.time()))
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    if log_path.exists():
-        log_path.unlink()
 
     comando = _invoke(
         f'"{build_bat}" {target_name} {platform_name} '
@@ -1371,12 +1375,11 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
             "tipicamente figlia di un editor chiuso a forza — non termina mai. "
             "Aspettare di più non serve, e nemmeno rilanciare: una seconda build "
             "si accoda sullo stesso lock.\n"
-            "Chiudi i processi rimasti e poi ue_build_start con force=True. "
-            "Cerca, in quest'ordine: %s, i `cmd.exe` con Build.bat o RunUAT nella "
-            "riga di comando, e il `dotnet.exe` che esegue UnrealBuildTool.dll "
-            "(su UE 5 UBT gira lì dentro, quindi non compare con il suo nome). "
-            "Un riavvio li azzera tutti."
-            % ", ".join(BUILD_LOCK_PROCESSES)
+            "Chiama ue_build_unblock per vedere chi lo tiene, poi con "
+            "dry_run=False per terminarli, e infine ue_build_start con "
+            "force=True. La ricerca è per riga di comando: su UE 5 "
+            "UnrealBuildTool è un assembly .NET dentro dotnet.exe e gli script "
+            "girano dentro cmd.exe, quindi cercarli per nome non li trova."
         )
     return esito
 
@@ -1966,6 +1969,227 @@ def terminate_process_by_name(name: str) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+# ------------------------------------------- processi che tengono il lock di build
+
+#: Frammenti cercati nella **riga di comando**, non nel nome dell'immagine.
+#:
+#: È la differenza che fa funzionare o no la pulizia: su UE 5 UnrealBuildTool è
+#: un assembly .NET eseguito da `dotnet.exe`, e gli script di Epic girano dentro
+#: `cmd.exe`. Nessuno dei due compare col proprio nome, quindi
+#: `taskkill /IM UnrealBuildTool.exe` non trova niente e il lock resta.
+BUILD_LOCK_PATTERNS = (
+    "UnrealBuildTool",
+    "Build.bat",
+    "RunUAT",
+    "RunUBT",
+    "AutomationTool",
+    # Gli script che genera questo MCP: si chiamano mcp_build_run.bat e
+    # mcp_package_run.bat, quindi *non* contengono la stringa "Build.bat" e una
+    # ricerca su quella li mancherebbe — cioè mancherebbe proprio i processi che
+    # abbiamo lasciato in giro noi.
+    "mcp_build_run",
+    "mcp_package_run",
+    "mcp_render_run",
+)
+
+#: Processi da non toccare mai, per quanto la riga di comando somigli: sono
+#: quelli che stanno *usando* la build, non quelli che la bloccano.
+BUILD_LOCK_NEVER = ("UnrealEditor.exe", "UnrealEditor-Cmd.exe")
+
+
+def build_lock_file(engine: EngineInstall) -> Path:
+    """Il file con cui `Build.bat` si serializza con se stesso.
+
+    Non è un mutex di sistema: le righe 18-20 di
+    `Engine/Build/BatchFiles/Build.bat` costruiscono un nome di file dal proprio
+    percorso completo (backslash sostituiti da trattini, due punti tolti) sotto
+    `%TMP%`, e poi lo aprono in scrittura sull'handle 9::
+
+        set LockFile=%~f0
+        set LockFile=%LockFile:\\=-%
+        set LockFile=%tmp%\\%LockFile::=%.lock
+        9>&2 2>nul (call :LockAndRestoreStdErr %* 9>"%LockFile%") || (...)
+
+    Il lock **è** l'apertura esclusiva del file. Se quell'apertura fallisce —
+    perché un altro script lo tiene aperto, ma anche perché il file è rimasto
+    con l'attributo di sola lettura dopo una terminazione brutale — si entra nel
+    ramo `||`, che stampa "is already running" e cicla all'infinito. Nel secondo
+    caso non c'è nessun processo da chiudere e la build resta bloccata per
+    sempre: è il motivo per cui cercare processi non basta.
+    """
+    # Il nome si costruisce con ntpath e non con pathlib: `%~f0` è sempre un
+    # percorso Windows con i backslash, e su un server che gira altrove pathlib
+    # produrrebbe separatori misti — le barre resterebbero nel nome e il file
+    # cercato non sarebbe quello.
+    bat = ntpath.join(str(engine.root), "Engine", "Build", "BatchFiles", "Build.bat")
+    nome = bat.replace("\\", "-").replace("/", "-").replace(":", "")
+    temp = os.environ.get("TMP") or os.environ.get("TEMP") or tempfile.gettempdir()
+    return Path(temp) / (nome + ".lock")
+
+
+def inspect_build_lock_file(engine: EngineInstall) -> dict:
+    """Stato del file di lock: se esiste, se è scrivibile, se è sola lettura."""
+    percorso = build_lock_file(engine)
+    stato: dict = {"path": str(percorso), "exists": percorso.exists()}
+    if not stato["exists"]:
+        stato["writable"] = True
+        stato["reason"] = "il file di lock non esiste: Build.bat non è bloccato da qui"
+        return stato
+
+    stato["read_only"] = not os.access(percorso, os.W_OK)
+    try:
+        with open(percorso, "a"):
+            pass
+        stato["writable"] = True
+        stato["reason"] = (
+            "il file esiste ed è apribile in scrittura: se la build resta ferma, "
+            "il lock lo tiene un processo ancora vivo"
+        )
+    except OSError as exc:
+        stato["writable"] = False
+        stato["reason"] = (
+            "il file di lock non è apribile in scrittura (%s). È esattamente la "
+            "condizione in cui Build.bat stampa 'is already running' e aspetta "
+            "per sempre senza che nessun processo lo tenga: va rimosso." % exc
+        )
+    return stato
+
+
+def _matches_build_lock(nome: str, riga: str) -> bool:
+    """Se un processo va considerato detentore del lock di build."""
+    if any(escluso.lower() == (nome or "").lower() for escluso in BUILD_LOCK_NEVER):
+        return False
+    testo = riga or ""
+    return any(frammento.lower() in testo.lower() for frammento in BUILD_LOCK_PATTERNS)
+
+
+def _parse_windows_process_list(output: str) -> list[dict]:
+    """Legge l'output CSV di `Get-CimInstance Win32_Process`.
+
+    Il formato è `pid,nome,riga di comando` con la riga di comando che contiene
+    virgole a sua volta: si divide sui primi due separatori e basta.
+    """
+    processi = []
+    for riga in output.splitlines():
+        riga = riga.strip()
+        if not riga:
+            continue
+        parti = riga.split(",", 2)
+        if len(parti) < 2 or not parti[0].isdigit():
+            continue
+        processi.append(
+            {"pid": int(parti[0]), "name": parti[1], "cmdline": parti[2] if len(parti) > 2 else ""}
+        )
+    return processi
+
+
+def _parse_posix_process_list(output: str) -> list[dict]:
+    processi = []
+    for riga in output.splitlines()[1:]:
+        riga = riga.strip()
+        if not riga:
+            continue
+        parti = riga.split(None, 1)
+        if len(parti) < 2 or not parti[0].isdigit():
+            continue
+        comando = parti[1]
+        processi.append(
+            {"pid": int(parti[0]), "name": comando.split()[0].rsplit("/", 1)[-1], "cmdline": comando}
+        )
+    return processi
+
+
+def list_processes_with_cmdline() -> list[dict]:
+    """Processi attivi con la loro riga di comando."""
+    try:
+        if platform.system() == "Windows":
+            uscita = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_Process | "
+                    "ForEach-Object { \"$($_.ProcessId),$($_.Name),$($_.CommandLine)\" }",
+                ],
+                capture_output=True, text=True, timeout=60,
+            ).stdout
+            return _parse_windows_process_list(uscita)
+        uscita = subprocess.run(
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=30
+        ).stdout
+        return _parse_posix_process_list(uscita)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def find_build_locks() -> list[dict]:
+    """I processi che possono tenere occupato il lock di build."""
+    return [p for p in list_processes_with_cmdline() if _matches_build_lock(p["name"], p["cmdline"])]
+
+
+def clear_build_locks(
+    dry_run: bool = True, engine_version: str | None = None, engine_root: str | None = None
+) -> dict:
+    """Trova — e se richiesto termina — i processi che tengono il lock di build.
+
+    Il default è `dry_run=True` di proposito: la ricerca è per riga di comando,
+    quindi può intercettare un `dotnet.exe` che sta facendo altro. Meglio
+    guardare l'elenco prima di terminarlo.
+    """
+    trovati = find_build_locks()
+    terminati: list[dict] = []
+
+    # Il file di lock è l'altra metà del problema, e quella che i processi non
+    # spiegano: Build.bat si serializza aprendolo in esclusiva, quindi se resta
+    # non apribile la build aspetta per sempre senza che ci sia nessuno da
+    # chiudere.
+    file_lock: dict = {}
+    try:
+        motore = resolve_engine(engine_version, engine_root, None)
+        file_lock = inspect_build_lock_file(motore)
+    except LocalError as exc:
+        file_lock = {"reason": "motore non risolto, controllo del file saltato: %s" % exc}
+
+    if not dry_run and file_lock.get("exists") and not file_lock.get("writable", True):
+        try:
+            Path(file_lock["path"]).unlink()
+            file_lock["removed"] = True
+        except OSError as exc:
+            file_lock["removed"] = False
+            file_lock["error"] = str(exc)
+
+    if not dry_run:
+        for processo in trovati:
+            try:
+                if platform.system() == "Windows":
+                    subprocess.run(  # noqa: S603
+                        ["taskkill", "/PID", str(processo["pid"]), "/T", "/F"],
+                        capture_output=True, timeout=30,
+                    )
+                else:
+                    os.kill(processo["pid"], 9)
+                terminati.append(processo)
+            except Exception as exc:  # noqa: BLE001
+                # Un processo può sparire fra la scoperta e la terminazione, o
+                # appartenere a un altro utente: si riporta e si va avanti.
+                processo["error"] = str(exc)
+
+    return {
+        "dry_run": dry_run,
+        "found": trovati,
+        "terminated": terminati,
+        "lock_file": file_lock,
+        "note": (
+            "Nessun processo sta tenendo il lock di build."
+            if not trovati
+            else (
+                "Trovati %d processi. Richiama con dry_run=False per terminarli."
+                % len(trovati)
+                if dry_run
+                else "Terminati %d processi su %d." % (len(terminati), len(trovati))
+            )
+        ),
+    }
 
 
 def editor_status() -> dict:
