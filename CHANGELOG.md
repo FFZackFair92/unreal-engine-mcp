@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-07-29
+
+### Fixed
+
+- **Builds, packaging and renders now run with a usable `TMP`.** This is the
+  real cause of the build that could never start, and it was never a lock at
+  all.
+
+  An MCP client does not launch a server with the user's environment; it passes
+  a reduced allowlist, and the default one on Windows contains `TEMP` but
+  **not `TMP`**. `Engine/Build/BatchFiles/Build.bat` builds its lock file with
+
+      set LockFile=%tmp%\%LockFile::=%.lock
+
+  so with `TMP` missing the path collapses to the root of the drive, where a
+  standard user cannot write. The exclusive open on handle 9 fails every single
+  time, the script falls into its error branch and prints *"is already running,
+  waiting for existing script to terminate..."* forever.
+
+  Every symptom followed from that one missing variable: it failed instantly
+  and always, no process ever held the lock, deleting `%TMP%\…​.lock` changed
+  nothing because that was not the file being opened, and the identical
+  generated script compiled in fifteen seconds when run from a normal shell.
+
+  Child processes now get an environment with `TMP` and `TEMP` both pointing at
+  a directory that exists — for builds, packaging, renders and the editor
+  launch alike. Tests assert that `Popen` actually receives it, not merely that
+  the helper exists.
+
 ## [0.5.1] — 2026-07-29
 
 ### Added

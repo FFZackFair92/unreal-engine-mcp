@@ -1295,7 +1295,7 @@ def start_build(
         path.parent / "Saved" / "mcp_build_run", comando, log_path
     )
 
-    kwargs: dict[str, Any] = {"cwd": str(path.parent)}
+    kwargs: dict[str, Any] = {"cwd": str(path.parent), "env": child_environment()}
     if platform_module_is_windows():
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
@@ -1375,11 +1375,13 @@ def build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
             "tipicamente figlia di un editor chiuso a forza — non termina mai. "
             "Aspettare di più non serve, e nemmeno rilanciare: una seconda build "
             "si accoda sullo stesso lock.\n"
-            "Chiama ue_build_unblock per vedere chi lo tiene, poi con "
-            "dry_run=False per terminarli, e infine ue_build_start con "
-            "force=True. La ricerca è per riga di comando: su UE 5 "
-            "UnrealBuildTool è un assembly .NET dentro dotnet.exe e gli script "
-            "girano dentro cmd.exe, quindi cercarli per nome non li trova."
+            "Se stai usando una versione < 0.5.2 la causa più probabile non è "
+            "una contesa ma la variabile TMP mancante nell'ambiente del server: "
+            "Build.bat costruisce il file di lock con %tmp% e senza quella "
+            "variabile punta alla radice del disco, dove non può scrivere. "
+            "Aggiorna, oppure chiama ue_build_unblock per vedere se c'è "
+            "davvero qualcuno che lo tiene (dry_run=False per terminarlo) e poi "
+            "ue_build_start con force=True."
         )
     return esito
 
@@ -1558,7 +1560,7 @@ def start_render(
         log_path,
     )
 
-    kwargs: dict[str, Any] = {"cwd": str(path.parent)}
+    kwargs: dict[str, Any] = {"cwd": str(path.parent), "env": child_environment()}
     if platform_module_is_windows():
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
@@ -1638,6 +1640,41 @@ _PACKAGE_ERROR_MARKERS = (
     "ERROR:", "BUILD FAILED", "AutomationException", "Cook failed",
     "error C", "error LNK", "fatal error",
 )
+
+
+def resolved_temp_dir() -> str:
+    """Una cartella temporanea che esiste davvero, comunque sia partito il server."""
+    for chiave in ("TMP", "TEMP"):
+        valore = os.environ.get(chiave)
+        if valore and Path(valore).is_dir():
+            return valore
+    return tempfile.gettempdir()
+
+
+def child_environment() -> dict[str, str]:
+    """Ambiente per i processi che lanciamo: Build.bat, RunUAT, UnrealEditor-Cmd.
+
+    Esiste per una ragione precisa e non ovvia. Un client MCP non avvia il
+    server con l'ambiente dell'utente: ne passa una lista ridotta, e su Windows
+    quella predefinita contiene ``TEMP`` ma **non** ``TMP``.
+
+    `Engine/Build/BatchFiles/Build.bat` costruisce il proprio file di lock così::
+
+        set LockFile=%tmp%\\%LockFile::=%.lock
+
+    Con ``TMP`` assente quel percorso diventa la radice del disco, dove un
+    utente normale non scrive; l'apertura in esclusiva fallisce, lo script cade
+    nel ramo di errore e stampa *"is already running, waiting for existing
+    script to terminate..."* all'infinito. Nessun processo tiene il lock, il
+    file che si cancella è un altro, e lo stesso script lanciato da una shell
+    normale compila in quindici secondi: sembra tutto tranne una variabile
+    mancante.
+    """
+    env = dict(os.environ)
+    temp = resolved_temp_dir()
+    env["TMP"] = temp
+    env["TEMP"] = temp
+    return env
 
 
 def _write_launch_script(
@@ -1743,7 +1780,7 @@ def start_package(
         path.parent / "Saved" / "mcp_package_run", _invoke(" ".join(argomenti)), log_path
     )
 
-    kwargs: dict[str, Any] = {"cwd": str(path.parent)}
+    kwargs: dict[str, Any] = {"cwd": str(path.parent), "env": child_environment()}
     if platform.system() == "Windows":
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
@@ -1900,7 +1937,7 @@ def launch_editor(
         args += ["-RCWebControlEnable", "-RCWebInterfaceEnable"]
     args += extra_args or []
 
-    kwargs: dict[str, Any] = {"cwd": str(path.parent)}
+    kwargs: dict[str, Any] = {"cwd": str(path.parent), "env": child_environment()}
     if platform.system() == "Windows":
         kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
     else:
@@ -2025,8 +2062,7 @@ def build_lock_file(engine: EngineInstall) -> Path:
     # cercato non sarebbe quello.
     bat = ntpath.join(str(engine.root), "Engine", "Build", "BatchFiles", "Build.bat")
     nome = bat.replace("\\", "-").replace("/", "-").replace(":", "")
-    temp = os.environ.get("TMP") or os.environ.get("TEMP") or tempfile.gettempdir()
-    return Path(temp) / (nome + ".lock")
+    return Path(resolved_temp_dir()) / (nome + ".lock")
 
 
 def inspect_build_lock_file(engine: EngineInstall) -> dict:

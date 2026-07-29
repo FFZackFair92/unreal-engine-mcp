@@ -184,3 +184,26 @@ def test_il_readme_consiglia_un_comando_che_esiste():
                 "%s consiglia `uvx %s`, ma i comandi installati sono %s"
                 % (readme, comando, sorted(scripts))
             )
+
+
+def test_anche_packaging_e_render_ricevono_lambiente(progetto, monkeypatch, tmp_path):
+    """La stessa variabile mancante rompeva RunUAT e il render, non solo Build.bat."""
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.setattr(local, "RENDER_STATE_FILE", tmp_path / "state/render.json")
+    monkeypatch.setattr(local, "STATE_FILE", tmp_path / "state/state.json")
+    catturato = []
+
+    class _Cattura(_FakePopen):
+        def __init__(self, args, **kwargs):
+            catturato.append(kwargs)
+            super().__init__(args, **kwargs)
+
+    monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
+    local.start_package(progetto["uproject"])
+    local.start_render(progetto["uproject"], "/Game/LS")
+    local.launch_editor(progetto["uproject"], skip_module_check=True)
+
+    assert len(catturato) == 3
+    for kwargs in catturato:
+        assert kwargs["env"]["TMP"] == str(tmp_path)

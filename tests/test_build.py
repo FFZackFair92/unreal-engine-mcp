@@ -415,3 +415,48 @@ def test_file_di_lock_non_scrivibile_e_la_causa_senza_processi(tmp_path, monkeyp
     stato = local.inspect_build_lock_file(motore)
     assert stato["writable"] is False
     assert "senza che nessun processo lo tenga" in stato["reason"]
+
+
+# ------------------------------------------- l'ambiente dei processi figli
+
+
+def test_tmp_viene_sempre_fornito_ai_processi_figli(monkeypatch, tmp_path):
+    """La causa vera del lock che non si scioglieva.
+
+    Un client MCP avvia il server con un ambiente ridotto: su Windows la lista
+    predefinita ha TEMP ma non TMP. Build.bat costruisce il file di lock con
+    %tmp%, che senza quella variabile diventa la radice del disco — non
+    scrivibile — e lo script stampa "is already running" per sempre, senza che
+    nessun processo tenga niente.
+    """
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.setenv("TEMP", str(tmp_path))
+
+    env = local.child_environment()
+    assert env["TMP"] == str(tmp_path)
+    assert env["TEMP"] == str(tmp_path)
+
+
+def test_tmp_inesistente_viene_sostituito(monkeypatch):
+    """Una TMP che punta a una cartella che non c'è è peggio che assente."""
+    monkeypatch.setenv("TMP", r"C:\cartella\che\non\esiste")
+    monkeypatch.delenv("TEMP", raising=False)
+    assert Path(local.child_environment()["TMP"]).is_dir()
+
+
+def test_la_build_passa_lambiente_al_processo(progetto, monkeypatch, tmp_path):
+    """Non basta avere la funzione: Popen deve riceverla davvero."""
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    catturato = {}
+
+    class _Cattura(_FakePopen):
+        def __init__(self, args, **kwargs):
+            catturato.update(kwargs)
+            super().__init__(args, **kwargs)
+
+    monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
+    local.start_build(progetto["uproject"])
+
+    assert "env" in catturato, "senza env il figlio eredita l'ambiente ridotto del server"
+    assert catturato["env"]["TMP"] == str(tmp_path)
