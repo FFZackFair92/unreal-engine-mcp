@@ -322,7 +322,12 @@ def build_fake_unreal(tmp_path):
         "pie": [],
         "directories": set(),
         "deleted": [],
+        "selected": [],
         "referencers": {},  # path -> chi lo referenzia, per il test di delete
+        # Una camera lontana dall'origine: è la situazione dei livelli veri, ed
+        # è quella in cui spawnare a [0,0,0] produce un attore invisibile.
+        # Rotator è (roll, pitch, yaw), come nel motore.
+        "camera": {"location": Vector(12000, -3000, 800), "rotation": Rotator(0, -10, 45)},
     }
 
     module = types.ModuleType("unreal")
@@ -371,6 +376,12 @@ def build_fake_unreal(tmp_path):
 
         def destroy_actor(self, actor):
             state["actors"] = [a for a in state["actors"] if a is not actor]
+
+        def get_selected_level_actors(self):
+            return list(state["selected"])
+
+        def set_selected_level_actors(self, actors):
+            state["selected"] = list(actors)
 
     class LevelEditorSubsystem:
         def new_level(self, path):
@@ -602,6 +613,20 @@ def build_fake_unreal(tmp_path):
         NONE="NONE", REPLICATED="REPLICATED", REP_NOTIFY="REP_NOTIFY"
     )
     module.GuidLibrary = types.SimpleNamespace(new_guid=lambda: Guid(str(uuid.uuid4())))
+
+    def _forward(rotatore):
+        """Vettore in avanti, calcolato come lo calcola il motore."""
+        import math as _math
+
+        pitch = _math.radians(rotatore.pitch)
+        yaw = _math.radians(rotatore.yaw)
+        return Vector(
+            _math.cos(pitch) * _math.cos(yaw),
+            _math.cos(pitch) * _math.sin(yaw),
+            _math.sin(pitch),
+        )
+
+    module.MathLibrary = types.SimpleNamespace(get_forward_vector=_forward)
     module.AttachmentRule = types.SimpleNamespace(
         KEEP_RELATIVE="KEEP_RELATIVE", KEEP_WORLD="KEEP_WORLD", SNAP_TO_TARGET="SNAP_TO_TARGET"
     )
@@ -630,6 +655,12 @@ def build_fake_unreal(tmp_path):
 
         def get_game_world(self):
             return None
+
+        def get_level_viewport_camera_info(self):
+            return state["camera"]["location"], state["camera"]["rotation"]
+
+        def set_level_viewport_camera_info(self, location, rotation):
+            state["camera"] = {"location": location, "rotation": rotation}
 
     module.UnrealEditorSubsystem = UnrealEditorSubsystem
     config_dir = tmp_path / "Config"

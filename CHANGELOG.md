@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-07-29
+
+### Added
+
+- **A second transport: the engine's own Python remote execution channel**, and
+  it is now the default. Setting up an existing project used to mean two
+  plugins plus a hand-written `DefaultRemoteControl.ini` with two separate
+  security gates — the step where people gave up. The native channel needs the
+  *Python Editor Script Plugin* and one checkbox, *Enable Remote Execution*.
+  Discovery is a UDP multicast ping on `239.0.0.1:6766`; the command channel is
+  TCP, opened **by the editor towards us**, which is why a firewall shows up as
+  "answered discovery, never connected" and the error says so.
+
+  `UE_MCP_TRANSPORT=auto` (default) tries the native channel and falls back to
+  the Remote Control API, so existing setups keep working untouched and the
+  HTTP route stays the answer for an editor on another machine, or a network
+  that swallows multicast. `ue_status` reports which one is live.
+- **Viewport camera** — `ue_get_camera`, `ue_set_camera`, `ue_focus_actor`.
+  `ue_screenshot` returned an image but pointed wherever the camera happened to
+  be; framing what you just built is what makes the picture worth its tokens.
+- **The agent is told not to trust the world origin.** Real levels are often
+  built thousands of units from `[0,0,0]`, so an actor spawned there can be
+  off-screen and invisible — a failure that looks like success. The server
+  instructions now say to anchor new actors to an existing one or to the
+  camera, and to verify with `ue_focus_actor` + `ue_screenshot`.
+- **`uvx unreal-engine-mcp`** in the README: no install step at all.
+
 ## [0.3.1] — 2026-07-29
 
 ### Fixed

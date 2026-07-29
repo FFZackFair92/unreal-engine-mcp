@@ -136,6 +136,14 @@ really do create and wire the nodes.
 | `ue_create_material_instance` | `package_path`, `name`, `parent_path`, `parameters` | Material Instance from a parent material. A number is a scalar, `{"r","g","b"}` a colour, a bool a static switch, a `/Game/...` path a texture. |
 | `ue_assign_material` | `label`, `material_path`, `slot`, `component` | Assigns a material to a placed actor. |
 
+## Viewport camera (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_get_camera` | — | Where the editor viewport camera is and what it is looking at. Worth calling **before spawning**: real levels are often built thousands of units from `[0,0,0]`, so an actor placed at the origin can be off-screen and invisible. |
+| `ue_set_camera` | `location`, `rotation` | Moves the camera. Either argument alone keeps the other as it was. |
+| `ue_focus_actor` | `label`, `distance` | Frames an actor, like pressing F in the editor. The complement of `ue_screenshot` — without it you photograph whatever the camera happened to be pointing at. |
+
 ## Screenshots (editor)
 
 | Tool | Parameters | What it does |
@@ -184,6 +192,21 @@ against the published md5 where available, are size-capped by
 > [`legendary`](https://github.com/derrod/legendary) (`pip install legendary-gl`,
 > then `legendary auth`). Without it, the tool explains how to download from the
 > Epic Games Launcher instead. This is third-party software, not an official route.
+
+## Transports
+
+The server reaches the editor two ways, and `ue_status` reports which one is
+live.
+
+| Transport | Unreal-side setup | When |
+|---|---|---|
+| `pyremote` | *Python Editor Script Plugin* + **Enable Remote Execution** | Default. The engine's own remote-execution channel: UDP multicast discovery on `239.0.0.1:6766`, then a TCP command channel that **the editor opens back towards us** — which is why a firewall shows up as "responded to discovery but never connected". |
+| `remotecontrol` | Both plugins + `DefaultRemoteControl.ini` | Editor on another machine, or a network that swallows multicast. |
+
+`UE_MCP_TRANSPORT=auto` (the default) tries the native channel and falls back to
+HTTP, so a project configured either way just works. The choice is made once and
+kept: swapping transports mid-session would mean reinstalling the in-editor
+helpers every call.
 
 ## Resources
 

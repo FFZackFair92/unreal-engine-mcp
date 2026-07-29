@@ -26,8 +26,8 @@ The local layer exists because the Remote Control API only works against an
 editor that is **already running**: creating a project, launching it, compiling
 and packaging all have to happen at the process level.
 
-- **65 tools** and **5 resources** — [full reference](docs/TOOLS.md)
-- **182 tests**, none of which need Unreal installed
+- **68 tools** and **5 resources** — [full reference](docs/TOOLS.md)
+- **210 tests**, none of which need Unreal installed
 - **[Unreal automation notes](docs/UNREAL-NOTES.md)** — the API traps found the hard way
 
 ---
@@ -64,6 +64,12 @@ surface, not on the version number.
 
 ```bash
 pip install unreal-engine-mcp
+```
+
+Or run it without installing anything, if you have [uv](https://docs.astral.sh/uv/):
+
+```bash
+uvx unreal-engine-mcp
 ```
 
 Or from source, to hack on it:
@@ -169,10 +175,28 @@ required plugins enabled, the security flags Remote Control needs, and an
 ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 ```
 
-### Existing project — three steps
+### Existing project — two steps
 
-1. **Enable the plugins**: `Edit ▸ Plugins` → *Python Editor Script Plugin* and
-   *Remote Control API*. Restart when prompted.
+1. **Enable the plugin**: `Edit ▸ Plugins` → *Python Editor Script Plugin*.
+   Restart when prompted.
+
+2. **Tick one box**: `Edit ▸ Project Settings` → search *Python* → check
+   **Enable Remote Execution**.
+
+That is the whole setup. The server discovers the editor over the engine's own
+Python remote execution channel — no config file, no HTTP port.
+
+<details>
+<summary>The HTTP route (Remote Control API), for when multicast will not do</summary>
+
+The native channel finds the editor with a UDP multicast ping on the local
+machine. That is the easy path, but it does not cross a subnet, and some
+corporate networks and VPN adapters swallow multicast entirely. In those cases
+— or with the editor on **another machine** — use the Remote Control API
+instead, with `UE_MCP_TRANSPORT=remotecontrol`.
+
+1. **Enable the plugins**: *Python Editor Script Plugin* and *Remote Control
+   API*. Restart when prompted.
 
 2. **Allow remote Python.** Create `Config/DefaultRemoteControl.ini`:
 
@@ -212,6 +236,14 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 
 3. **Check it**: open `http://127.0.0.1:30010/remote/info` in a browser. JSON
    back means you are connected.
+
+</details>
+
+### Which transport is in use
+
+`ue_status` reports it. By default (`UE_MCP_TRANSPORT=auto`) the server tries
+the native channel first and falls back to HTTP, so a project set up either way
+just works. Set `pyremote` or `remotecontrol` to pin one.
 
 ## What it can do
 
@@ -276,8 +308,13 @@ Material graphs, unlike Blueprint graphs, *are* fully scriptable:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `UE_MCP_TRANSPORT` | `auto` | `auto`, `pyremote` (native channel) or `remotecontrol` (HTTP) |
 | `UE_MCP_HOST` / `UE_MCP_PORT` | `127.0.0.1` / `30010` | Remote Control endpoint |
 | `UE_MCP_TIMEOUT` | `180` | Per-call timeout in seconds |
+| `UE_MCP_PROJECT` | — | Which project to drive when several editors are open |
+| `UE_MCP_MULTICAST_GROUP` / `_PORT` | `239.0.0.1` / `6766` | Discovery endpoint for the native channel |
+| `UE_MCP_MULTICAST_BIND` | `0.0.0.0` | Interface the discovery ping goes out of — set it when several adapters (VPN, WSL, Hyper-V) hide the editor |
+| `UE_MCP_MULTICAST_TTL` | `0` | Keeps discovery on this machine. Raising it exposes arbitrary code execution to the network |
 | `UE_MCP_ENGINE_DIRS` | — | Extra folders to search for engine installs |
 | `UE_MCP_LIBRARY` | `~/UnrealAssetLibrary` | Where downloaded assets land |
 | `UE_MCP_MAX_DOWNLOAD` | 4 GiB | Per-file download cap |

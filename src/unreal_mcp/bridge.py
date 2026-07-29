@@ -23,15 +23,18 @@ sentinelle, così da avere un valore di ritorno strutturato e non solo testo.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from .pyremote import NoEditorFoundError, PyRemoteClient, PyRemoteConfig, PyRemoteError
 
 SENTINEL_START = "<<<MCP_JSON_BEGIN>>>"
 SENTINEL_END = "<<<MCP_JSON_END>>>"
@@ -61,11 +64,33 @@ class UnrealPythonError(UnrealBridgeError):
         self.log = log
 
 
+#: Trasporti disponibili verso l'editor.
+#:
+#: - ``pyremote``: il protocollo di Python remote execution del motore. Chiede
+#:   solo il *Python Editor Script Plugin* e la casella *Enable Remote
+#:   Execution*: niente file di configurazione.
+#: - ``remotecontrol``: la Remote Control API su HTTP. Serve un plugin in più e
+#:   un ``DefaultRemoteControl.ini`` scritto a mano, ma funziona anche con
+#:   l'editor su un'altra macchina, dove il multicast non arriva.
+#: - ``auto``: prova ``pyremote``, e se nessun editor risponde ricade
+#:   sull'HTTP. È il default perché copre il caso facile senza chiedere nulla,
+#:   senza togliere quello difficile.
+TRANSPORTS = ("auto", "pyremote", "remotecontrol")
+
+
 @dataclass(frozen=True)
 class BridgeConfig:
     host: str = "127.0.0.1"
     port: int = 30010
     timeout: float = 180.0
+    transport: str = "auto"
+
+    def __post_init__(self) -> None:
+        if self.transport not in TRANSPORTS:
+            raise ValueError(
+                "transport deve essere uno di %s, ricevuto %r"
+                % (", ".join(TRANSPORTS), self.transport)
+            )
 
     @property
     def base_url(self) -> str:
@@ -77,6 +102,7 @@ class BridgeConfig:
             host=os.environ.get("UE_MCP_HOST", "127.0.0.1"),
             port=int(os.environ.get("UE_MCP_PORT", "30010")),
             timeout=float(os.environ.get("UE_MCP_TIMEOUT", "180")),
+            transport=os.environ.get("UE_MCP_TRANSPORT", "auto").strip().lower(),
         )
 
 
@@ -182,12 +208,45 @@ def extract_result(log_text: str) -> tuple[dict[str, Any] | None, str]:
 class UnrealBridge:
     """Connessione asincrona all'editor Unreal."""
 
-    def __init__(self, config: BridgeConfig | None = None) -> None:
+    def __init__(
+        self, config: BridgeConfig | None = None, pyremote: PyRemoteClient | None = None
+    ) -> None:
         self.config = config or BridgeConfig.from_env()
         self._client: httpx.AsyncClient | None = None
         #: Hash degli helper che risultano installati nell'editor corrente.
         #: None finché non se ne ha conferma (o dopo un riavvio dell'editor).
         self._helpers_digest: str | None = None
+        #: Client del trasporto nativo. Costruito su richiesta: con
+        #: transport="remotecontrol" non serve aprire nessun socket multicast.
+        self._pyremote = pyremote
+        #: Quale trasporto sta effettivamente servendo le chiamate. Con "auto"
+        #: si decide alla prima e non si torna indietro: alternare i due a ogni
+        #: chiamata significherebbe reinstallare gli helper ogni volta.
+        self._trasporto_scelto: str | None = (
+            None if self.config.transport == "auto" else self.config.transport
+        )
+        #: Perché il canale nativo non è andato, quando si ricade sull'HTTP.
+        self._motivo_pyremote: str | None = None
+
+    # --------------------------------------------------------------- trasporto
+
+    @property
+    def transport(self) -> str | None:
+        """Il trasporto in uso, o None finché non è stato deciso."""
+        return self._trasporto_scelto
+
+    def _pyremote_client(self) -> PyRemoteClient:
+        if self._pyremote is None:
+            self._pyremote = PyRemoteClient(
+                replace(PyRemoteConfig.from_env(), command_timeout=self.config.timeout)
+            )
+        return self._pyremote
+
+    async def _pyremote_exec(self, code: str) -> str:
+        """Esegue lo snippet sul canale nativo, da un thread (i socket sono sincroni)."""
+        client = self._pyremote_client()
+        esito = await asyncio.to_thread(client.run, code, self.config.timeout)
+        return esito.log
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -201,11 +260,20 @@ class UnrealBridge:
         return self._client
 
     def forget_helpers(self) -> None:
-        """Dimentica gli helper installati: da chiamare quando l'editor riparte."""
+        """Dimentica gli helper installati: da chiamare quando l'editor riparte.
+
+        Chiude anche il canale nativo: dopo un riavvio dell'editor il socket
+        punta a un processo che non c'è più.
+        """
         self._helpers_digest = None
+        if self._pyremote is not None:
+            self._pyremote.close()
+        if self.config.transport == "auto":
+            self._trasporto_scelto = None
 
     async def aclose(self) -> None:
         self.forget_helpers()
+        self._pyremote = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -257,8 +325,25 @@ class UnrealBridge:
             return {"raw": response.text}
 
     async def info(self) -> Any:
-        """GET /remote/info — usato come health check."""
-        return await self._request("GET", "/remote/info")
+        """Health check. Sul canale nativo è la scoperta, sull'HTTP è /remote/info."""
+        if self._trasporto_scelto == "pyremote":
+            nodo = await asyncio.to_thread(self._pyremote_client().connect)
+            return {"transport": "pyremote", "project": nodo.project_name,
+                    "engine": nodo.engine_version, "node": nodo.node_id}
+        if self._trasporto_scelto == "remotecontrol":
+            return await self._request("GET", "/remote/info")
+
+        try:
+            nodo = await asyncio.to_thread(self._pyremote_client().connect)
+        except PyRemoteError:
+            self._pyremote = None
+        else:
+            self._trasporto_scelto = "pyremote"
+            return {"transport": "pyremote", "project": nodo.project_name,
+                    "engine": nodo.engine_version, "node": nodo.node_id}
+        risposta = await self._request("GET", "/remote/info")
+        self._trasporto_scelto = "remotecontrol"
+        return risposta
 
     async def call_object(
         self,
@@ -275,8 +360,56 @@ class UnrealBridge:
         }
         return await self._request("PUT", "/remote/object/call", payload)
 
+    async def exec_python(self, code: str) -> str:
+        """Esegue codice Python nell'editor sul trasporto disponibile.
+
+        Con ``transport="auto"`` la prima chiamata decide: si prova il canale
+        nativo e, se nessun editor risponde alla scoperta, si passa all'HTTP.
+        La scelta poi resta, perché ogni cambio di trasporto costerebbe una
+        reinstallazione degli helper.
+        """
+        if self._trasporto_scelto == "pyremote":
+            return await self._pyremote_exec(code)
+        if self._trasporto_scelto == "remotecontrol":
+            log, _ = await self.exec_python_raw(code)
+            return log
+
+        try:
+            log = await self._pyremote_exec(code)
+        except NoEditorFoundError:
+            self._pyremote = None
+        except PyRemoteError as exc:
+            # Il canale nativo c'è ma non funziona (firewall, interfaccia
+            # sbagliata): vale la pena provare l'HTTP prima di arrendersi, ma
+            # il motivo va conservato — se fallisce anche quello, il primo
+            # errore è quasi sempre quello utile.
+            self._motivo_pyremote = str(exc)
+            self._pyremote = None
+        else:
+            self._trasporto_scelto = "pyremote"
+            return log
+
+        try:
+            log, _ = await self.exec_python_raw(code)
+        except UnrealNotConnected as exc:
+            motivo = self._motivo_pyremote
+            raise UnrealNotConnected(
+                str(exc)
+                + "\n\nAnche il canale nativo (Python remote execution) non ha "
+                + (
+                    "risposto: " + motivo
+                    if motivo
+                    else "trovato editor sul gruppo multicast."
+                )
+                + "\nÈ la via più semplice: basta il 'Python Editor Script Plugin' "
+                "e 'Enable Remote Execution' in Project Settings → Python, senza "
+                "DefaultRemoteControl.ini."
+            ) from exc
+        self._trasporto_scelto = "remotecontrol"
+        return log
+
     async def exec_python_raw(self, code: str) -> tuple[str, Any]:
-        """Esegue codice Python grezzo nell'editor. Ritorna (log, risposta)."""
+        """Esegue codice Python grezzo via Remote Control API. Ritorna (log, risposta)."""
         response = await self.call_object(
             PYTHON_LIBRARY_PATH,
             "ExecutePythonCommandEx",
@@ -294,12 +427,12 @@ class UnrealBridge:
 
     async def _exec_parsed(self, payload_code: str) -> tuple[dict[str, Any], str]:
         """Esegue un payload già costruito e ne estrae la risposta JSON."""
-        log_text, response = await self.exec_python_raw(payload_code)
+        log_text = await self.exec_python(payload_code)
         parsed, clean_log = extract_result(log_text)
         if parsed is None:
             raise UnrealBridgeError(
-                "Nessun risultato leggibile dall'editor. Log Unreal:\n"
-                + (clean_log[-2000:] or json.dumps(response, default=str)[:2000])
+                "Nessun risultato leggibile dall'editor (trasporto: %s). Log Unreal:\n%s"
+                % (self._trasporto_scelto or "non deciso", clean_log[-2000:] or "(vuoto)")
             )
         return parsed, clean_log
 

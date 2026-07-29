@@ -93,3 +93,45 @@ async def test_componente_inesistente_elenca_i_disponibili(tools):
     with pytest.raises(RuntimeError) as excinfo:
         await tools.ue_set_actor_property("Cassa", {"x": 1}, component="Inventato")
     assert "StaticMeshComponent" in str(excinfo.value)
+
+
+# ------------------------------------------------------------ camera viewport
+
+
+async def test_get_camera(tools):
+    """La camera parte lontano dall'origine, come nei livelli veri."""
+    camera = await tools.ue_get_camera()
+    assert camera["location"]["x"] == 12000.0
+    assert camera["rotation"]["yaw"] == 45.0
+
+
+async def test_set_camera(tools):
+    esito = await tools.ue_set_camera(location=[100, 200, 300], rotation=[0, 90, 0])
+    assert esito["location"] == {"x": 100.0, "y": 200.0, "z": 300.0}
+    assert (await tools.ue_get_camera())["location"]["z"] == 300.0
+
+
+async def test_set_camera_parziale_conserva_il_resto(tools):
+    """Passare solo la posizione non deve azzerare l'orientamento."""
+    prima = await tools.ue_get_camera()
+    esito = await tools.ue_set_camera(location=[0, 0, 0])
+    assert esito["rotation"] == prima["rotation"]
+
+
+async def test_focus_actor(tools):
+    await tools.ue_spawn_actor("StaticMeshActor", location=[5000, 0, 0], label="Torre")
+    esito = await tools.ue_focus_actor("Torre", distance=1000)
+    assert esito["focused"] == ["Torre"]
+    # La camera arretra dal bersaglio: non ci finisce sopra.
+    assert esito["camera"]["location"]["x"] != 5000.0
+    assert esito["distance"] == 1000.0
+
+
+async def test_focus_actor_inesistente(tools):
+    with pytest.raises(RuntimeError, match="Nessun attore"):
+        await tools.ue_focus_actor("Fantasma")
+
+
+async def test_focus_senza_label_e_senza_selezione(tools):
+    with pytest.raises(RuntimeError, match="non so cosa inquadrare"):
+        await tools.ue_focus_actor()

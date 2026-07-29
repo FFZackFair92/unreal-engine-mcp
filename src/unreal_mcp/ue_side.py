@@ -238,6 +238,85 @@ def mcp_list_assets(path, recursive=True, class_filter=None):
     return out
 
 
+# ------------------------------------------------------- camera della viewport
+
+
+def _mcp_forward(rotazione):
+    """Vettore in avanti di un Rotator.
+
+    `Rotator.get_forward_vector()` non esiste su tutte le versioni: dove manca,
+    la stessa cosa la fa MathLibrary.
+    """
+    if hasattr(rotazione, "get_forward_vector"):
+        return rotazione.get_forward_vector()
+    return unreal.MathLibrary.get_forward_vector(rotazione)
+
+
+def _mcp_viewport():
+    """Sottosistema della viewport di livello, dove vive la camera dell'editor."""
+    return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+
+
+def mcp_get_camera():
+    """Posizione e orientamento della camera della viewport.
+
+    Serve più di quanto sembri: i livelli veri sono spesso costruiti a migliaia
+    di unità dall'origine, quindi sapere dov'è la camera è il modo di piazzare
+    cose dove qualcuno le guarderà.
+    """
+    posizione, rotazione = _mcp_viewport().get_level_viewport_camera_info()
+    return {"location": mcp_vec(posizione), "rotation": mcp_rot(rotazione)}
+
+
+def mcp_set_camera(location=None, rotation=None):
+    """Sposta la camera della viewport."""
+    attuale_pos, attuale_rot = _mcp_viewport().get_level_viewport_camera_info()
+    posizione = mcp_to_vector(location) if location is not None else attuale_pos
+    rotazione = mcp_to_rotator(rotation) if rotation is not None else attuale_rot
+    _mcp_viewport().set_level_viewport_camera_info(posizione, rotazione)
+    return {"location": mcp_vec(posizione), "rotation": mcp_rot(rotazione)}
+
+
+def mcp_focus_actor(label=None, distance=None):
+    """Inquadra un attore (o tutta la selezione) come farebbe il tasto F.
+
+    È il complemento di mcp_screenshot: senza, l'agente fotografa qualunque
+    cosa la camera stesse guardando, che di solito non è quello che ha appena
+    costruito.
+    """
+    subsystem = mcp_actor_subsystem()
+    if label is not None:
+        attore = mcp_require_actor(label)
+        subsystem.set_selected_level_actors([attore])
+        bersagli = [attore]
+    else:
+        bersagli = list(subsystem.get_selected_level_actors())
+        if not bersagli:
+            raise ValueError(
+                "Nessun attore selezionato e nessuna label indicata: non so cosa inquadrare."
+            )
+
+    # Si arretra dal bersaglio lungo la direzione di vista corrente: mantenere
+    # l'angolo invece di ricalcolarlo dà un'inquadratura prevedibile, e
+    # l'agente può orientarla prima con mcp_set_camera.
+    posizione = bersagli[0].get_actor_location()
+    _, rotazione = _mcp_viewport().get_level_viewport_camera_info()
+    if distance is None:
+        distance = 500.0
+    direzione = _mcp_forward(rotazione)
+    camera = unreal.Vector(
+        posizione.x - direzione.x * float(distance),
+        posizione.y - direzione.y * float(distance),
+        posizione.z - direzione.z * float(distance),
+    )
+    _mcp_viewport().set_level_viewport_camera_info(camera, rotazione)
+    return {
+        "focused": [a.get_actor_label() for a in bersagli],
+        "camera": {"location": mcp_vec(camera), "rotation": mcp_rot(rotazione)},
+        "distance": float(distance),
+    }
+
+
 # ------------------------------------------------- gestione asset (CRUD)
 
 

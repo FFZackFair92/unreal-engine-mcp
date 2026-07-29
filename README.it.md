@@ -23,8 +23,8 @@ Il livello locale esiste perché la Remote Control API funziona **solo con un
 editor già aperto**: creare un progetto, avviarlo, compilare e produrre il
 pacchetto sono tutte operazioni a livello di processo.
 
-- **65 tool** e **5 resource** — [riferimento completo](docs/TOOLS.it.md)
-- **182 test**, nessuno dei quali richiede Unreal installato
+- **68 tool** e **5 resource** — [riferimento completo](docs/TOOLS.it.md)
+- **210 test**, nessuno dei quali richiede Unreal installato
 - **[Note sull'automazione di Unreal](docs/UNREAL-NOTES.md)** — le trappole delle API trovate sul campo
 
 ---
@@ -60,6 +60,12 @@ effettivamente presente, non sul numero di versione.
 
 ```bash
 pip install unreal-engine-mcp
+```
+
+Oppure senza installare niente, se hai [uv](https://docs.astral.sh/uv/):
+
+```bash
+uvx unreal-engine-mcp
 ```
 
 Oppure dai sorgenti, per metterci mano:

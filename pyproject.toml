@@ -3,7 +3,7 @@
 # esiste gia'. Il nome coincide con quello del repo, il modulo Python resta
 # `unreal_mcp` e il comando installato resta `unreal-mcp`.
 name = "unreal-engine-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"
 requires-python = ">=3.10"

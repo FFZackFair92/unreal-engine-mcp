@@ -39,7 +39,17 @@ def unreal(tmp_path):
 
 @pytest.fixture
 def bridge(unreal):
-    return UnrealBridge(BridgeConfig(host="127.0.0.1", port=unreal.port, timeout=30))
+    """Bridge puntato all'Unreal finto, sul trasporto HTTP.
+
+    `transport` è esplicito e non "auto": con auto ogni chiamata comincerebbe
+    da una scoperta multicast di due secondi verso un editor che qui non
+    esiste, e la suite ci passerebbe la maggior parte del tempo.
+    """
+    return UnrealBridge(
+        BridgeConfig(
+            host="127.0.0.1", port=unreal.port, timeout=30, transport="remotecontrol"
+        )
+    )
 
 
 @pytest.fixture

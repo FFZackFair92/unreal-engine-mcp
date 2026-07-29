@@ -45,8 +45,14 @@ mcp = FastMCP(
         "Blueprint node graphs cannot be scripted: put logic in a C++ parent class "
         "(ue_cpp_class_create -> build -> ue_reparent_blueprint). Material graphs, on the "
         "other hand, are fully scriptable (ue_create_material). "
-        "Use ue_screenshot to actually look at what you built instead of inferring it "
-        "from coordinates, and ue_spawn_many when placing more than a few actors."
+        "Do not assume the action is at the world origin: real levels are often built "
+        "thousands of units away from [0,0,0], so an actor spawned there can be "
+        "off-screen and invisible. Anchor new actors to what is already in the scene — "
+        "read a reference actor with ue_list_actors, or the camera with ue_get_camera, "
+        "and place relative to that. "
+        "Verify visually: ue_focus_actor on what you touched, then ue_screenshot, which "
+        "returns the viewport as an image — look at it before reporting success. "
+        "Use ue_spawn_many when placing more than a few actors."
     ),
 )
 
@@ -674,8 +680,14 @@ async def preset_fab_download(app_name: str, destination: str | None = None) -> 
 @mcp.tool()
 async def ue_status() -> dict:
     """Verifica la connessione all'editor Unreal e restituisce versione motore,
-    progetto aperto, livello corrente e numero di attori. Da usare per prima."""
-    return await run("result = mcp_project_status()")
+    progetto aperto, livello corrente, numero di attori e trasporto in uso.
+    Da usare per prima."""
+    stato = await run("result = mcp_project_status()")
+    if isinstance(stato, dict):
+        # Quale dei due canali sta servendo le chiamate: quando qualcosa non va,
+        # è la prima cosa da sapere e altrimenti non è visibile da nessuna parte.
+        stato["transport"] = _bridge.transport
+    return stato
 
 
 @mcp.tool()
@@ -1177,6 +1189,53 @@ async def ue_assign_material(
 #: una singola immagine. Override: UE_MCP_MAX_SCREENSHOT (byte).
 MAX_SCREENSHOT_BYTES = int(os.environ.get("UE_MCP_MAX_SCREENSHOT", 1_500_000))
 
+
+# ================================================================ viewport
+
+
+@mcp.tool()
+async def ue_get_camera() -> dict:
+    """Posizione e orientamento della camera della viewport dell'editor.
+
+    Da chiamare **prima di spawnare**: i livelli veri sono spesso costruiti a
+    migliaia di unità dall'origine, e un attore messo a [0,0,0] finisce fuori
+    campo, invisibile a chi guarda l'editor.
+    """
+    return await run("result = mcp_get_camera()")
+
+
+@mcp.tool()
+async def ue_set_camera(
+    location: list[float] | None = None, rotation: list[float] | None = None
+) -> dict:
+    """Sposta la camera della viewport.
+
+    Args:
+        location: [x, y, z] in cm.
+        rotation: [pitch, yaw, roll] in gradi.
+    """
+    return await run(
+        f"result = mcp_set_camera({lit(location)}, {lit(rotation)})"
+    )
+
+
+@mcp.tool()
+async def ue_focus_actor(label: str | None = None, distance: float | None = None) -> dict:
+    """Inquadra un attore con la camera, come il tasto F nell'editor.
+
+    È il complemento di ue_screenshot: senza, si fotografa quello che la camera
+    stava già guardando, che di rado è quello appena costruito.
+
+    Args:
+        label: attore da inquadrare; se omesso usa la selezione corrente.
+        distance: distanza della camera in cm (default 500).
+    """
+    return await run(
+        f"result = mcp_focus_actor({lit(label)}, {lit(distance)})"
+    )
+
+
+# ================================================================ screenshot
 
 # structured_output=False: il tool restituisce [Image, dict], e l'output
 # strutturato di FastMCP sa serializzare solo JSON — con lo schema attivo la
