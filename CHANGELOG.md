@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] — 2026-07-29
+
+### Fixed
+
+- **Paths coming out of the editor are now absolute.** `unreal.Paths.*` returns
+  paths relative to the *engine binaries* directory, not the project:
+  `project_saved_dir()` arrives as
+  `../../../../../../Users/…/Saved/`. Inside the editor that resolves fine —
+  its working directory is the one they are relative to — but this server hands
+  them to a process living somewhere else, which then cannot find anything.
+
+  `ue_screenshot` returned `captured: false`, and no image, for a PNG the
+  engine had written correctly. `ue_status` reported a `project_file` nobody
+  could open. Everything is now passed through
+  `Paths.convert_relative_path_to_full` and normalised, separators included —
+  `os.path.join` on Windows was adding backslashes to a string that already
+  had a mix.
+
+  The fake engine used in tests returned absolute paths, which is why 265 tests
+  went green over a bug that appears on the first contact with a real editor.
+  It now returns relative ones, like the engine does, and a test asserts the
+  paths that come back are absolute.
+
 ## [0.5.3] — 2026-07-29
 
 ### Fixed

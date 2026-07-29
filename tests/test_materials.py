@@ -173,3 +173,21 @@ async def test_screenshot_editor_remoto(tools, monkeypatch):
     assert isinstance(esito, dict)
     assert esito["image"] is None
     assert "altra macchina" in esito["image_note"]
+
+
+async def test_i_percorsi_tornano_assoluti(tools):
+    """`unreal.Paths.*` li dà relativi ai binari del motore, non al progetto.
+
+    Dentro l'editor funzionano — il working directory è quello — ma qui vengono
+    restituiti a un processo che sta altrove. Su Unreal vero lo screenshot
+    tornava `captured: false` pur essendo stato scritto, perché il server non
+    ritrovava il file.
+    """
+    stato = await tools.ue_status()
+    assert not stato["project_file"].startswith(".."), stato["project_file"]
+    assert Path(stato["project_file"]).is_absolute()
+
+    esito = await tools.ue_screenshot("assoluto.png", return_image=False)
+    assert Path(esito["requested"]).is_absolute()
+    assert ".." not in esito["requested"]
+    assert esito["captured"] is True

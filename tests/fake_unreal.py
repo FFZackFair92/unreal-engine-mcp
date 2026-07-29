@@ -676,12 +676,24 @@ def build_fake_unreal(tmp_path):
         "LogInit: avvio\nLogBlueprint: Error: variabile mancante\nLogTemp: fine\n",
         encoding="utf-8",
     )
+    def _relativo(assoluto):
+        """Come li restituisce il motore vero: relativi ai binari del motore.
+
+        Il finto li dava assoluti, ed è il motivo per cui uno screenshot che
+        tornava con `captured: false` su Unreal vero passava qui senza problemi:
+        il percorso non era sbagliato nel test, lo era solo nella realtà.
+        """
+        return "../../../../.." + str(assoluto)
+
     module.Paths = types.SimpleNamespace(
-        get_project_file_path=lambda: str(tmp_path / "MyGame.uproject"),
-        project_content_dir=lambda: str(tmp_path / "Content"),
-        project_config_dir=lambda: str(config_dir),
-        project_log_dir=lambda: str(log_dir),
-        project_saved_dir=lambda: str(tmp_path / "Saved"),
+        get_project_file_path=lambda: _relativo(tmp_path / "MyGame.uproject"),
+        project_content_dir=lambda: _relativo(tmp_path / "Content"),
+        project_config_dir=lambda: _relativo(config_dir),
+        project_log_dir=lambda: _relativo(log_dir),
+        project_saved_dir=lambda: _relativo(tmp_path / "Saved"),
+        # Il motore la espone per riportarli in forma assoluta: qui basta
+        # togliere il prefisso che abbiamo aggiunto sopra.
+        convert_relative_path_to_full=lambda p: str(p).replace("../../../../..", "", 1),
     )
 
     _defaults = {}

@@ -1239,14 +1239,16 @@ def mcp_screenshot(filename=None, width=1280, height=720):
     È l'unico modo perché l'agente veda il risultato di quello che costruisce,
     invece di dedurlo dalle coordinate.
     """
-    cartella = os.path.join(unreal.Paths.project_saved_dir(), "Screenshots", "MCP")
+    cartella = os.path.join(
+        mcp_full_path(unreal.Paths.project_saved_dir()), "Screenshots", "MCP"
+    )
     if not os.path.isdir(cartella):
         os.makedirs(cartella)
 
     nome = filename or ("mcp_%d.png" % int(_mcp_time().time() * 1000))
     if not nome.lower().endswith(".png"):
         nome += ".png"
-    destinazione = os.path.join(cartella, nome)
+    destinazione = mcp_full_path(os.path.join(cartella, nome))
 
     if hasattr(unreal, "AutomationLibrary"):
         unreal.AutomationLibrary.take_high_res_screenshot(
@@ -1400,7 +1402,7 @@ def mcp_live_compile(attesa_massima=20.0):
     """
     import time as _time
 
-    log_dir = unreal.Paths.project_log_dir()
+    log_dir = mcp_full_path(unreal.Paths.project_log_dir())
     file_log = max((os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".log")),
                    key=os.path.getmtime)
 
@@ -1441,7 +1443,7 @@ def mcp_live_compile(attesa_massima=20.0):
 
 def mcp_set_project_setting(section, key, value, config="Game"):
     """Scrive in Config/Default<config>.ini. Alcune voci richiedono riavvio editor."""
-    config_dir = unreal.Paths.project_config_dir()
+    config_dir = mcp_full_path(unreal.Paths.project_config_dir())
     ini_path = os.path.join(config_dir, "Default%s.ini" % config)
     lines = []
     if os.path.exists(ini_path):
@@ -1536,13 +1538,36 @@ def mcp_project_status():
         current_level = "sconosciuto"
     return {
         "engine_version": str(unreal.SystemLibrary.get_engine_version()),
-        "project_file": str(unreal.Paths.get_project_file_path()),
-        "project_content_dir": str(unreal.Paths.project_content_dir()),
+        "project_file": mcp_full_path(unreal.Paths.get_project_file_path()),
+        "project_content_dir": mcp_full_path(unreal.Paths.project_content_dir()),
         "current_level": current_level,
         "actor_count": len(mcp_actor_subsystem().get_all_level_actors()),
         "python_ok": True,
         "capabilities": mcp_capabilities(),
     }
+
+
+def mcp_full_path(percorso):
+    """Percorso assoluto e con i separatori del sistema.
+
+    `unreal.Paths.*` restituisce percorsi **relativi alla cartella dei binari
+    del motore**, non al progetto: `project_saved_dir()` viene fuori come
+    `../../../../../../Users/.../Saved/`. Dentro l'editor funzionano lo stesso —
+    il suo working directory è quello — ma qui vengono restituiti a un processo
+    che sta altrove, e che quindi non ritrova più niente. Lo screenshot tornava
+    con `captured: false` proprio per questo, pur essendo stato scritto.
+
+    Va fatto anche il contrario dei separatori: `os.path.join` su Windows
+    aggiunge backslash a una stringa che ne ha già di misti.
+    """
+    if not percorso:
+        return percorso
+    testo = str(percorso)
+    try:
+        testo = str(unreal.Paths.convert_relative_path_to_full(testo))
+    except Exception:  # noqa: BLE001
+        testo = os.path.abspath(testo)
+    return os.path.normpath(testo)
 
 
 def mcp_log_path():
@@ -1551,7 +1576,7 @@ def mcp_log_path():
     Non è sempre `<Progetto>.log`: quando gira una seconda istanza Unreal
     aggiunge un suffisso (`_2`), quindi si prende il più recente della cartella.
     """
-    log_dir = unreal.Paths.project_log_dir()
+    log_dir = mcp_full_path(unreal.Paths.project_log_dir())
     if not os.path.isdir(log_dir):
         return None
     candidates = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".log")]
