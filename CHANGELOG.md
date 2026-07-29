@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   progress, so a build that takes minutes costs one round trip instead of
   twenty. `ue_editor_open` reports progress while waiting for the bridge.
 - **Release workflow** with PyPI trusted publishing, so the install is
-  `pip install unreal-mcp` instead of a clone.
+  `pip install unreal-engine-mcp` instead of a clone. The distribution is not
+  called `unreal-mcp` because PyPI rejects that as too similar to the existing
+  `unrealmcp`; the import name and the console script are unchanged.
 
 ### Security
 

@@ -1,5 +1,8 @@
 [project]
-name = "unreal-mcp"
+# Non "unreal-mcp": PyPI lo rifiuta come troppo simile a `unrealmcp`, che
+# esiste gia'. Il nome coincide con quello del repo, il modulo Python resta
+# `unreal_mcp` e il comando installato resta `unreal-mcp`.
+name = "unreal-engine-mcp"
 version = "0.3.0"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"

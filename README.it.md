@@ -59,7 +59,7 @@ effettivamente presente, non sul numero di versione.
 ## Installazione
 
 ```bash
-pip install unreal-mcp
+pip install unreal-engine-mcp
 ```
 
 Oppure dai sorgenti, per metterci mano:

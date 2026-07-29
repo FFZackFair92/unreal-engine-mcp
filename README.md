@@ -63,7 +63,7 @@ surface, not on the version number.
 ## Install
 
 ```bash
-pip install unreal-mcp
+pip install unreal-engine-mcp
 ```
 
 Or from source, to hack on it:

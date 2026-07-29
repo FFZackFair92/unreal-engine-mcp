@@ -85,7 +85,7 @@ repository `unreal-engine-mcp`, workflow `release.yml`, environment `pypi`.
 3. Check the tool and test counts quoted in both READMEs still match reality.
 4. Push, wait for CI to be green.
 5. Dry run: *Actions → Release → Run workflow → testpypi*, then
-   `pip install -i https://test.pypi.org/simple/ unreal-mcp` in a clean venv
+   `pip install -i https://test.pypi.org/simple/ unreal-engine-mcp` in a clean venv
    and check that `python -m unreal_mcp.server` starts.
 6. Tag and publish a GitHub release named `v<version>`. The workflow refuses to
    publish if the tag and `pyproject.toml` disagree — otherwise it is easy to
