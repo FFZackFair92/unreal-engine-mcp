@@ -45,3 +45,24 @@ async def test_i_tool_sono_registrati_con_le_descrizioni():
 async def test_ogni_tool_ha_uno_schema_di_input():
     for tool in await mcp_server.mcp.list_tools():
         assert tool.inputSchema is not None, tool.name
+
+
+async def test_le_resource_sono_registrate():
+    """Le resource sono l'unico contesto che il client può aggiornare da sé."""
+    resources = await mcp_server.mcp.list_resources()
+    uri = {str(r.uri) for r in resources}
+    assert {
+        "unreal://status",
+        "unreal://log",
+        "unreal://actors",
+        "unreal://assets",
+        "unreal://engines",
+    } <= uri
+    assert all(r.description for r in resources)
+
+
+async def test_lo_screenshot_non_ha_output_strutturato():
+    """Restituisce [Image, dict]: con lo schema attivo FastMCP non lo serializza."""
+    tools = await mcp_server.mcp.list_tools()
+    screenshot = next(t for t in tools if t.name == "ue_screenshot")
+    assert screenshot.outputSchema is None

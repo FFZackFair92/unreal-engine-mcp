@@ -238,6 +238,192 @@ def mcp_list_assets(path, recursive=True, class_filter=None):
     return out
 
 
+# ------------------------------------------------- gestione asset (CRUD)
+
+
+def _mcp_normalizza_path_asset(path):
+    """Path del Content Browser, senza il suffisso `.NomeOggetto` finale."""
+    testo = str(path).rstrip("/")
+    if not testo.startswith("/"):
+        raise ValueError(
+            "I path degli asset iniziano con /Game (o /Engine): ricevuto %r" % path
+        )
+    nome = testo.rsplit("/", 1)[-1]
+    if "." in nome:
+        testo = testo[: testo.rfind(".")]
+    return testo
+
+
+def mcp_delete_asset(path, force=False):
+    """Elimina un asset o una cartella dal Content Browser.
+
+    Senza questo tool l'unico modo di rimediare a un import sbagliato è aprire
+    l'editor a mano: l'agente può creare ma non ripulire.
+
+    `force=False` rifiuta la cancellazione se qualcosa referenzia l'asset —
+    cancellarlo comunque lascia riferimenti rotti nei livelli e nei Blueprint.
+    """
+    percorso = _mcp_normalizza_path_asset(path)
+    libreria = mcp_asset_lib()
+
+    cartella = libreria.does_directory_exist(percorso)
+    if not cartella and not libreria.does_asset_exist(percorso):
+        raise ValueError("Nessun asset né cartella a %s" % percorso)
+
+    referenti = []
+    if not cartella:
+        try:
+            referenti = [str(r) for r in libreria.find_package_referencers_for_asset(percorso, False)]
+        except Exception:  # noqa: BLE001
+            referenti = []
+        if referenti and not force:
+            raise ValueError(
+                "%s è referenziato da %d asset (%s). Cancellarlo lascerebbe "
+                "riferimenti rotti: usa force=True se è quello che vuoi."
+                % (percorso, len(referenti), ", ".join(referenti[:5]))
+            )
+
+    with mcp_transaction("MCP: elimina %s" % percorso):
+        if cartella:
+            ok = libreria.delete_directory(percorso)
+        else:
+            ok = libreria.delete_asset(percorso)
+
+    return {
+        "path": percorso,
+        "deleted": bool(ok),
+        "was_directory": bool(cartella),
+        "referencers": referenti,
+    }
+
+
+def mcp_rename_asset(path, new_path):
+    """Sposta o rinomina un asset, aggiornando i riferimenti."""
+    origine = _mcp_normalizza_path_asset(path)
+    destinazione = _mcp_normalizza_path_asset(new_path)
+    libreria = mcp_asset_lib()
+
+    if not libreria.does_asset_exist(origine):
+        raise ValueError("Nessun asset a %s" % origine)
+    if libreria.does_asset_exist(destinazione):
+        raise ValueError("Esiste già un asset a %s" % destinazione)
+
+    with mcp_transaction("MCP: rinomina %s" % origine):
+        ok = libreria.rename_asset(origine, destinazione)
+    return {"from": origine, "to": destinazione, "renamed": bool(ok)}
+
+
+def mcp_duplicate_asset(path, new_path):
+    """Duplica un asset: la via rapida per una variante da modificare."""
+    origine = _mcp_normalizza_path_asset(path)
+    destinazione = _mcp_normalizza_path_asset(new_path)
+    libreria = mcp_asset_lib()
+
+    if not libreria.does_asset_exist(origine):
+        raise ValueError("Nessun asset a %s" % origine)
+    if libreria.does_asset_exist(destinazione):
+        raise ValueError("Esiste già un asset a %s" % destinazione)
+
+    with mcp_transaction("MCP: duplica %s" % origine):
+        copia = libreria.duplicate_asset(origine, destinazione)
+    return {"from": origine, "to": destinazione, "duplicated": copia is not None}
+
+
+def mcp_make_folder(path):
+    """Crea una cartella nel Content Browser (idempotente)."""
+    percorso = _mcp_normalizza_path_asset(path)
+    libreria = mcp_asset_lib()
+    esisteva = libreria.does_directory_exist(percorso)
+    ok = True if esisteva else libreria.make_directory(percorso)
+    return {"path": percorso, "created": bool(ok) and not esisteva, "existed": bool(esisteva)}
+
+
+# ------------------------------------------------------- gerarchia di attori
+
+
+#: Regole di attach esposte dai tool, mappate sull'enum di Unreal.
+_MCP_ATTACH_RULES = ("KEEP_RELATIVE", "KEEP_WORLD", "SNAP_TO_TARGET")
+
+
+def _mcp_attach_rule(nome):
+    chiave = str(nome or "KEEP_WORLD").upper()
+    if chiave not in _MCP_ATTACH_RULES:
+        raise ValueError(
+            "attach_rule deve essere uno di %s, ricevuto %r"
+            % (", ".join(_MCP_ATTACH_RULES), nome)
+        )
+    return getattr(unreal.AttachmentRule, chiave)
+
+
+def mcp_attach_actor(child_label, parent_label, socket=None, attach_rule="KEEP_WORLD"):
+    """Aggancia un attore a un altro: muovendo il padre si muove il figlio.
+
+    È il modo in cui si compone una scena — le ruote a un veicolo, le luci a un
+    lampione — e senza di esso l'agente può solo posizionare oggetti slegati
+    che poi si spostano uno per uno.
+    """
+    figlio = mcp_require_actor(child_label)
+    padre = mcp_require_actor(parent_label)
+    if figlio is padre:
+        raise ValueError("Un attore non può essere agganciato a se stesso: %s" % child_label)
+
+    regola = _mcp_attach_rule(attach_rule)
+    with mcp_transaction("MCP: aggancia %s a %s" % (child_label, parent_label)):
+        figlio.attach_to_actor(
+            padre,
+            str(socket or ""),
+            location_rule=regola,
+            rotation_rule=regola,
+            scale_rule=regola,
+            weld_simulated_bodies=False,
+        )
+
+    return {
+        "child": child_label,
+        "parent": padre.get_actor_label(),
+        "socket": socket,
+        "attach_rule": str(attach_rule).upper(),
+        "attached": figlio.get_attach_parent_actor() is not None,
+    }
+
+
+def mcp_detach_actor(label, keep_world=True):
+    """Sgancia un attore dal suo padre."""
+    attore = mcp_require_actor(label)
+    padre = attore.get_attach_parent_actor()
+    if padre is None:
+        return {"label": label, "detached": False, "reason": "non era agganciato"}
+
+    regola = unreal.DetachmentRule.KEEP_WORLD if keep_world else unreal.DetachmentRule.KEEP_RELATIVE
+    with mcp_transaction("MCP: sgancia %s" % label):
+        attore.detach_from_actor(
+            location_rule=regola, rotation_rule=regola, scale_rule=regola
+        )
+    return {"label": label, "was_attached_to": padre.get_actor_label(), "detached": True}
+
+
+def mcp_actor_hierarchy(label=None):
+    """Albero padre/figli degli attori del livello."""
+    if label is not None:
+        radici = [mcp_require_actor(label)]
+    else:
+        radici = [
+            a
+            for a in mcp_actor_subsystem().get_all_level_actors()
+            if a.get_attach_parent_actor() is None
+        ]
+
+    def ramo(attore):
+        figli = list(attore.get_attached_actors() or [])
+        return {
+            "label": attore.get_actor_label(),
+            "class": str(attore.get_class().get_name()),
+            "children": [ramo(f) for f in figli],
+        }
+
+    return [ramo(a) for a in radici]
+
+
 def mcp_spawn_one(class_or_asset, location=None, rotation=None, scale=None, label=None):
     """Spawn di un singolo attore, senza aprire una transazione propria."""
     loc = mcp_to_vector(location)

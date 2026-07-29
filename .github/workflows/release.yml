@@ -1,0 +1,91 @@
+name: Release
+
+# Pubblica su PyPI quando si crea una release su GitHub, e su TestPyPI a mano.
+#
+# Nessun token nei secret: si usa il trusted publishing di PyPI (OIDC). Va
+# configurato una volta sola su pypi.org -> Publishing -> Add a new pending
+# publisher, con owner `FFZackFair92`, repository `unreal-engine-mcp`,
+# workflow `release.yml` ed environment `pypi`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Dove pubblicare
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+jobs:
+  build:
+    name: Costruisce sdist e wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      # `twine check` intercetta il README che non renderizza su PyPI, che è il
+      # modo piu' comune di sprecare un numero di versione: una volta caricato,
+      # quel file non si puo' sostituire.
+      - name: Controlla i metadati
+        run: twine check dist/*
+
+      # La versione del tag e quella del pacchetto devono coincidere, o si
+      # pubblica una 0.2.0 chiamandola v0.3.0.
+      - name: Verifica che il tag corrisponda alla versione
+        if: github.event_name == 'release'
+        run: |
+          versione=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$versione" != "$tag" ]; then
+            echo "::error::Il tag e' $tag ma pyproject.toml dice $versione"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    name: Pubblica su TestPyPI
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write  # necessario per il trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    name: Pubblica su PyPI
+    needs: build
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

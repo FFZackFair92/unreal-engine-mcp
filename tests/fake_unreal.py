@@ -101,6 +101,8 @@ class Actor(FakeObject):
         self._components = [
             ActorComponent("StaticMeshComponent0", "StaticMeshComponent")
         ]
+        self._attach_parent = None
+        self._attached = []
 
     def get_components_by_class(self, cls):
         return list(self._components)
@@ -120,6 +122,27 @@ class Actor(FakeObject):
 
     def get_path_name(self):
         return "/Game/Levels/L_Test.L_Test:PersistentLevel." + self._label
+
+    # ---- gerarchia
+    def attach_to_actor(self, parent, socket_name="", location_rule=None,
+                        rotation_rule=None, scale_rule=None,
+                        weld_simulated_bodies=False):
+        if self._attach_parent is not None:
+            self._attach_parent._attached.remove(self)
+        self._attach_parent = parent
+        parent._attached.append(self)
+        self._attach_socket = socket_name
+
+    def detach_from_actor(self, location_rule=None, rotation_rule=None, scale_rule=None):
+        if self._attach_parent is not None:
+            self._attach_parent._attached.remove(self)
+            self._attach_parent = None
+
+    def get_attach_parent_actor(self):
+        return self._attach_parent
+
+    def get_attached_actors(self):
+        return list(self._attached)
 
     def get_actor_location(self):
         return self._location
@@ -297,6 +320,9 @@ def build_fake_unreal(tmp_path):
         "imports": [],
         "saved": [],
         "pie": [],
+        "directories": set(),
+        "deleted": [],
+        "referencers": {},  # path -> chi lo referenzia, per il test di delete
     }
 
     module = types.ModuleType("unreal")
@@ -430,11 +456,50 @@ def build_fake_unreal(tmp_path):
 
         @staticmethod
         def does_directory_exist(path):
-            return False
+            return path.rstrip("/") in state["directories"]
 
         @staticmethod
         def make_directory(path):
+            state["directories"].add(path.rstrip("/"))
             return True
+
+        @staticmethod
+        def delete_asset(path):
+            state["assets"].pop(path, None)
+            state["asset_classes"].pop(path, None)
+            state["deleted"].append(path)
+            return True
+
+        @staticmethod
+        def delete_directory(path):
+            radice = path.rstrip("/") + "/"
+            for chiave in [k for k in state["assets"] if k.startswith(radice)]:
+                state["assets"].pop(chiave, None)
+                state["asset_classes"].pop(chiave, None)
+            state["directories"].discard(path.rstrip("/"))
+            state["deleted"].append(path)
+            return True
+
+        @staticmethod
+        def find_package_referencers_for_asset(path, load_assets_to_confirm=False):
+            return list(state["referencers"].get(path, []))
+
+        @staticmethod
+        def rename_asset(source, destination):
+            if source not in state["assets"]:
+                return False
+            state["assets"][destination] = state["assets"].pop(source)
+            if source in state["asset_classes"]:
+                state["asset_classes"][destination] = state["asset_classes"].pop(source)
+            return True
+
+        @staticmethod
+        def duplicate_asset(source, destination):
+            if source not in state["assets"]:
+                return None
+            state["assets"][destination] = state["assets"][source]
+            state["asset_classes"][destination] = state["asset_classes"].get(source, "Object")
+            return state["assets"][destination]
 
     class AssetTools:
         def create_asset(self, name, package_path, asset_class, factory):
@@ -537,6 +602,12 @@ def build_fake_unreal(tmp_path):
         NONE="NONE", REPLICATED="REPLICATED", REP_NOTIFY="REP_NOTIFY"
     )
     module.GuidLibrary = types.SimpleNamespace(new_guid=lambda: Guid(str(uuid.uuid4())))
+    module.AttachmentRule = types.SimpleNamespace(
+        KEEP_RELATIVE="KEEP_RELATIVE", KEEP_WORLD="KEEP_WORLD", SNAP_TO_TARGET="SNAP_TO_TARGET"
+    )
+    module.DetachmentRule = types.SimpleNamespace(
+        KEEP_RELATIVE="KEEP_RELATIVE", KEEP_WORLD="KEEP_WORLD"
+    )
 
     # ---- varie
     def execute_console_command(world, cmd):

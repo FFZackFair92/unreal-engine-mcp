@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 
 from . import assets, local
 from .bridge import (
@@ -78,6 +81,54 @@ def local_call(func, *args, **kwargs):
         return func(*args, **kwargs)
     except (local.LocalError, assets.AssetError) as exc:
         raise RuntimeError(str(exc)) from exc
+
+
+async def _progress(ctx: Context | None, fatto: float, totale: float, messaggio: str) -> None:
+    """Notifica di avanzamento, se il client la supporta.
+
+    `report_progress` fallisce quando la richiesta non ha un progressToken (il
+    client non l'ha chiesto): non è un errore, è la norma su metà dei client.
+    """
+    if ctx is None:
+        return
+    with contextlib.suppress(Exception):
+        await ctx.report_progress(fatto, totale, messaggio)
+
+
+async def _attendi_job(
+    leggi_stato,
+    wait_seconds: float,
+    ctx: Context | None,
+    etichetta: str,
+) -> dict:
+    """Polla lo stato di un job locale finché finisce o scade l'attesa.
+
+    Senza questo l'agente deve richiamare ue_*_status a mano decine di volte su
+    un'operazione che dura minuti, e ogni giro costa un round-trip e del
+    contesto. Qui il polling avviene dentro una sola chiamata e l'avanzamento
+    arriva al client come notifica.
+    """
+    scadenza = asyncio.get_event_loop().time() + wait_seconds
+    stato = leggi_stato()
+    await _progress(ctx, 0, wait_seconds, "%s: avviato" % etichetta)
+
+    while stato.get("running") and asyncio.get_event_loop().time() < scadenza:
+        await asyncio.sleep(min(5.0, max(1.0, wait_seconds / 60)))
+        stato = leggi_stato()
+        trascorso = stato.get("elapsed_seconds") or 0
+        await _progress(
+            ctx,
+            min(float(trascorso), wait_seconds),
+            wait_seconds,
+            "%s: %s" % (etichetta, stato.get("phase") or ("in corso" if stato.get("running") else "concluso")),
+        )
+
+    if stato.get("running"):
+        stato["note"] = (
+            "Ancora in corso dopo %.0f s di attesa: richiama con wait_seconds "
+            "più alto, o senza per una lettura istantanea." % wait_seconds
+        )
+    return stato
 
 
 # ========================================== livello LOCALE: motore e progetti
@@ -189,6 +240,7 @@ async def ue_editor_open(
     wait_seconds: int = 240,
     extra_args: list[str] | None = None,
     engine_root: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Apre un progetto nell'editor e attende che il bridge Remote Control risponda.
 
@@ -208,14 +260,23 @@ async def ue_editor_open(
     if wait_seconds <= 0:
         return {**launched, "bridge_ready": False, "note": "launch not awaited"}
 
-    deadline = asyncio.get_event_loop().time() + wait_seconds
+    inizio = asyncio.get_event_loop().time()
+    deadline = inizio + wait_seconds
+    await _progress(ctx, 0, wait_seconds, "editor avviato, attendo il bridge")
     while asyncio.get_event_loop().time() < deadline:
         try:
             await _bridge.info()
             status = await run("result = mcp_project_status()")
+            await _progress(ctx, wait_seconds, wait_seconds, "bridge pronto")
             return {**launched, "bridge_ready": True, "status": status}
         except (UnrealNotConnected, UnrealBridgeError, RuntimeError):
             await asyncio.sleep(3)
+            await _progress(
+                ctx,
+                asyncio.get_event_loop().time() - inizio,
+                wait_seconds,
+                "attendo l'editor (il primo avvio compila gli shader)",
+            )
 
     return {
         **launched,
@@ -316,14 +377,27 @@ async def ue_build_start(
 
 
 @mcp.tool()
-async def ue_build_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+async def ue_build_status(
+    tail_lines: int = 30,
+    uproject: str | None = None,
+    wait_seconds: float = 0,
+    ctx: Context | None = None,
+) -> dict:
     """Stato della compilazione avviata con ue_build_start: in corso, errori, coda del log.
 
     Args:
         tail_lines: quante righe finali del log restituire.
         uproject: a quale progetto si riferisce; se omesso, l'ultima compilazione avviata.
+        wait_seconds: se > 0 attende la fine della compilazione fino a questo
+            limite, riportando l'avanzamento, invece di restituire subito. Una
+            build completa dura minuti: meglio un'attesa sola che venti letture.
     """
-    return local_call(local.build_status, tail_lines, uproject)
+    def leggi() -> dict:
+        return local_call(local.build_status, tail_lines, uproject)
+
+    if wait_seconds > 0:
+        return await _attendi_job(leggi, wait_seconds, ctx, "compilazione")
+    return leggi()
 
 
 @mcp.tool()
@@ -387,7 +461,12 @@ async def ue_package_start(
 
 
 @mcp.tool()
-async def ue_package_status(tail_lines: int = 30, uproject: str | None = None) -> dict:
+async def ue_package_status(
+    tail_lines: int = 30,
+    uproject: str | None = None,
+    wait_seconds: float = 0,
+    ctx: Context | None = None,
+) -> dict:
     """Stato del packaging avviato con ue_package_start.
 
     Riporta la fase corrente (Cook, Stage, Package, Archive), gli errori e,
@@ -396,8 +475,15 @@ async def ue_package_status(tail_lines: int = 30, uproject: str | None = None) -
     Args:
         tail_lines: quante righe finali del log restituire.
         uproject: a quale progetto si riferisce; se omesso, l'ultimo packaging avviato.
+        wait_seconds: se > 0 attende la fine del packaging fino a questo limite,
+            riportando la fase corrente, invece di restituire subito.
     """
-    return local_call(local.package_status, tail_lines, uproject)
+    def leggi() -> dict:
+        return local_call(local.package_status, tail_lines, uproject)
+
+    if wait_seconds > 0:
+        return await _attendi_job(leggi, wait_seconds, ctx, "packaging")
+    return leggi()
 
 
 @mcp.tool()
@@ -670,6 +756,94 @@ async def ue_list_assets(
     return await run(
         f"result = mcp_list_assets({lit(path)}, {bool(recursive)}, {lit(class_filter)})"
     )
+
+
+@mcp.tool()
+async def ue_delete_asset(path: str, force: bool = False) -> dict:
+    """Elimina un asset o una cartella dal Content Browser.
+
+    Serve per rimediare a un import sbagliato senza aprire l'editor a mano.
+    Di default rifiuta la cancellazione se qualcosa referenzia l'asset:
+    cancellarlo comunque lascia riferimenti rotti nei livelli e nei Blueprint.
+
+    Args:
+        path: es. "/Game/Imported/rock_01" oppure una cartella "/Game/Imported".
+        force: cancella anche se referenziato.
+    """
+    return await run(f"result = mcp_delete_asset({lit(path)}, {bool(force)})")
+
+
+@mcp.tool()
+async def ue_rename_asset(path: str, new_path: str) -> dict:
+    """Sposta o rinomina un asset aggiornando i riferimenti.
+
+    Args:
+        path: percorso attuale, es. "/Game/Imported/SM_rock".
+        new_path: percorso nuovo, es. "/Game/MyGame/Meshes/SM_Roccia".
+    """
+    return await run(f"result = mcp_rename_asset({lit(path)}, {lit(new_path)})")
+
+
+@mcp.tool()
+async def ue_duplicate_asset(path: str, new_path: str) -> dict:
+    """Duplica un asset: la via rapida per crearne una variante da modificare."""
+    return await run(f"result = mcp_duplicate_asset({lit(path)}, {lit(new_path)})")
+
+
+@mcp.tool()
+async def ue_make_folder(path: str) -> dict:
+    """Crea una cartella nel Content Browser. Idempotente.
+
+    Args:
+        path: es. "/Game/MyGame/Meshes".
+    """
+    return await run(f"result = mcp_make_folder({lit(path)})")
+
+
+@mcp.tool()
+async def ue_attach_actor(
+    child_label: str,
+    parent_label: str,
+    socket: str | None = None,
+    attach_rule: str = "KEEP_WORLD",
+) -> dict:
+    """Aggancia un attore a un altro: muovendo il padre si muove il figlio.
+
+    È il modo in cui si compone una scena (le luci a un lampione, le casse su
+    un pallet) invece di lasciare oggetti slegati da riposizionare uno per uno.
+
+    Args:
+        child_label: label dell'attore da agganciare.
+        parent_label: label dell'attore padre.
+        socket: nome del socket sul padre, se ne ha.
+        attach_rule: "KEEP_WORLD" (resta dov'è), "KEEP_RELATIVE" o
+            "SNAP_TO_TARGET" (si allinea al padre).
+    """
+    return await run(
+        f"result = mcp_attach_actor({lit(child_label)}, {lit(parent_label)}, "
+        f"{lit(socket)}, {lit(attach_rule)})"
+    )
+
+
+@mcp.tool()
+async def ue_detach_actor(label: str, keep_world: bool = True) -> dict:
+    """Sgancia un attore dal suo padre.
+
+    Args:
+        label: label dell'attore.
+        keep_world: mantiene la posizione nel mondo invece di quella relativa.
+    """
+    return await run(f"result = mcp_detach_actor({lit(label)}, {bool(keep_world)})")
+
+
+@mcp.tool()
+async def ue_actor_hierarchy(label: str | None = None) -> list[dict]:
+    """Albero padre/figli degli attori del livello.
+
+    Args:
+        label: se indicato, parte da quell'attore invece che dalle radici.
+    """
+    return await run(f"result = mcp_actor_hierarchy({lit(label)})")
 
 
 @mcp.tool()
@@ -998,23 +1172,71 @@ async def ue_assign_material(
 # ================================================================== screenshot
 
 
-@mcp.tool()
+#: Oltre questa soglia il PNG non viene allegato alla risposta: in base64 un
+#: megabyte costa circa 350k caratteri, cioè più contesto di quanto ne valga
+#: una singola immagine. Override: UE_MCP_MAX_SCREENSHOT (byte).
+MAX_SCREENSHOT_BYTES = int(os.environ.get("UE_MCP_MAX_SCREENSHOT", 1_500_000))
+
+
+# structured_output=False: il tool restituisce [Image, dict], e l'output
+# strutturato di FastMCP sa serializzare solo JSON — con lo schema attivo la
+# chiamata fallisce con "Unable to serialize unknown type: Image".
+@mcp.tool(structured_output=False)
 async def ue_screenshot(
-    filename: str | None = None, width: int = 1280, height: int = 720
-) -> dict:
-    """Cattura la viewport dell'editor in un PNG e ne restituisce il percorso.
+    filename: str | None = None,
+    width: int = 960,
+    height: int = 540,
+    return_image: bool = True,
+) -> Any:
+    """Cattura la viewport dell'editor e **restituisce l'immagine all'agente**.
 
     Senza questo l'agente costruisce alla cieca: è l'unico modo per verificare
     davvero com'è venuta una scena invece di dedurlo dalle coordinate. Il file
-    finisce in <Progetto>/Saved/Screenshots/MCP.
+    resta in <Progetto>/Saved/Screenshots/MCP.
+
+    La risoluzione predefinita è volutamente modesta: il PNG viaggia in base64
+    dentro la risposta, e a 1280x720 costa spesso più contesto di quanto
+    l'immagine ne faccia risparmiare. Alzala quando serve leggere un dettaglio.
 
     Args:
         filename: nome file; se omesso ne genera uno con il timestamp.
         width, height: risoluzione della cattura.
+        return_image: se False restituisce solo il percorso, senza allegare il PNG.
     """
-    return await run(
+    esito = await run(
         f"result = mcp_screenshot({lit(filename)}, {int(width)}, {int(height)})"
     )
+
+    percorso = (esito or {}).get("file") if isinstance(esito, dict) else None
+    if not return_image or not percorso:
+        return esito
+
+    file = Path(percorso)
+    # L'editor potrebbe essere su un'altra macchina (UE_MCP_HOST): in quel caso
+    # il path esiste per lui e non per noi, e c'è solo da dirlo.
+    if not file.is_file():
+        esito["image"] = None
+        esito["image_note"] = (
+            "PNG scritto dall'editor ma non leggibile da qui: probabilmente "
+            "l'editor è su un'altra macchina. Il percorso resta valido per lui."
+        )
+        return esito
+
+    peso = file.stat().st_size
+    if peso > MAX_SCREENSHOT_BYTES:
+        esito["image"] = None
+        esito["image_note"] = (
+            "PNG di %.1f MB, oltre il limite di %.1f MB: non allegato. Abbassa "
+            "width/height oppure alza UE_MCP_MAX_SCREENSHOT."
+            % (peso / 1e6, MAX_SCREENSHOT_BYTES / 1e6)
+        )
+        return esito
+
+    esito["image"] = "allegata alla risposta"
+    esito["bytes"] = peso
+    # Lista: FastMCP la converte in [ImageContent, TextContent], così il modello
+    # vede davvero la viewport e ha comunque i metadati accanto.
+    return [Image(path=str(file)), esito]
 
 
 # ================================================================== networking
@@ -1120,6 +1342,85 @@ async def ue_create_sound_cue(
     return await run(
         f"result = mcp_create_sound_cue({lit(package_path)}, {lit(name)}, {lit(wave_path)})"
     )
+
+
+# ================================================================== resources
+#
+# Le resource costano meno di una tool call: il client può tenerle aggiornate
+# da sé e allegarle al contesto, senza che il modello spenda un turno per
+# chiedere "com'è messo l'editor adesso".
+
+
+def _json(valore: Any) -> str:
+    return json.dumps(valore, indent=2, ensure_ascii=False, default=str)
+
+
+async def _sicuro(coroutine) -> str:
+    """Esegue una lettura, restituendo l'errore come contenuto della resource.
+
+    Una resource che solleva sparisce dal client; una che risponde "editor
+    chiuso" resta leggibile e dice al modello cosa fare.
+    """
+    try:
+        return _json(await coroutine)
+    except Exception as exc:  # noqa: BLE001
+        return _json({"available": False, "reason": str(exc)})
+
+
+@mcp.resource(
+    "unreal://status",
+    name="Stato dell'editor Unreal",
+    description="Versione motore, progetto, livello corrente, numero di attori e capacità rilevate.",
+    mime_type="application/json",
+)
+async def resource_status() -> str:
+    return await _sicuro(run("result = mcp_project_status()"))
+
+
+@mcp.resource(
+    "unreal://log",
+    name="Log di Unreal",
+    description="Ultime 200 righe del log dell'editor.",
+    mime_type="application/json",
+)
+async def resource_log() -> str:
+    return await _sicuro(run("result = mcp_tail_log(200, False)"))
+
+
+@mcp.resource(
+    "unreal://actors",
+    name="Attori del livello",
+    description="Gli attori presenti nel livello attualmente aperto.",
+    mime_type="application/json",
+)
+async def resource_actors() -> str:
+    return await _sicuro(run("result = mcp_find_actors(None, None)"))
+
+
+# Un template con parametro non funzionerebbe: FastMCP 1.x compila i segmenti
+# come `[^/]+`, quindi "unreal://assets/Game/MyGame" non farebbe match. Per i
+# sottopercorsi c'è ue_list_assets.
+@mcp.resource(
+    "unreal://assets",
+    name="Content Browser",
+    description="Tutti gli asset sotto /Game del progetto aperto.",
+    mime_type="application/json",
+)
+async def resource_assets() -> str:
+    return await _sicuro(run("result = mcp_list_assets('/Game', True, None)"))
+
+
+@mcp.resource(
+    "unreal://engines",
+    name="Motori installati",
+    description="Le installazioni di Unreal Engine trovate su questa macchina. Non richiede l'editor aperto.",
+    mime_type="application/json",
+)
+async def resource_engines() -> str:
+    try:
+        return _json(local.find_engines())
+    except Exception as exc:  # noqa: BLE001
+        return _json({"available": False, "reason": str(exc)})
 
 
 # ============================================================= local extensions

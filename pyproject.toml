@@ -1,6 +1,6 @@
 [project]
 name = "unreal-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"
 requires-python = ">=3.10"

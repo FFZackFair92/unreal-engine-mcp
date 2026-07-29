@@ -57,13 +57,15 @@ ue_cpp_class_create → ue_editor_close → ue_build_start
 | Tool | Parameters | What it does |
 |---|---|---|
 | `ue_build_start` | `uproject`, `engine_version`, `target`, `configuration`, `engine_root` | Compiles the C++ module in the background. **Editor must be closed.** Kills `LiveCodingConsole.exe` first — it outlives the editor and keeps a lock on the DLLs. |
-| `ue_build_status` | `tail_lines` | Running or finished, exit code, parsed compiler errors and warnings, log tail. |
+| `ue_build_status` | `tail_lines`, `uproject`, `wait_seconds` | Running or finished, exit code, parsed compiler errors and warnings, log tail. State is kept per project, so parallel builds do not overwrite each other. With `wait_seconds > 0` it polls inside the call and reports progress instead of returning immediately. |
 | `ue_live_compile` | `max_wait_seconds` | Recompiles **with the editor open**, via Live Coding. Only patches function bodies: adding or changing `UCLASS`/`UFUNCTION`/`UPROPERTY` changes reflection data and still needs `ue_build_start`. |
 | `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version`, `engine_root`, `target_platform` | Cook + build + stage + pak via `RunUAT BuildCookRun`. Produces a standalone executable. **Editor must be closed.** |
-| `ue_package_status` | `tail_lines` | Current phase (Cook, Stage, Package, Archive), errors, and the path of the produced `.exe`. |
+| `ue_package_status` | `tail_lines`, `uproject`, `wait_seconds` | Current phase (Cook, Stage, Package, Archive), errors, and the path of the produced `.exe`. Same per-project state and `wait_seconds` behaviour as the build status. |
 
-Neither build nor package waits for completion inside the call: they would blow
-past the MCP timeout. They start and you poll the status tool.
+Neither build nor package waits for completion inside the *start* call: they
+would blow past the MCP timeout. They start and you poll the status tool — or
+call it once with `wait_seconds`, which polls internally and emits MCP progress
+notifications, so a long build costs one round trip instead of twenty.
 
 ## Diagnostics (editor)
 
@@ -83,6 +85,10 @@ past the MCP timeout. They start and you poll the status tool.
 | `ue_list_assets` | `path`, `recursive`, `class_filter` | Lists assets under a Content Browser path, filterable by class name. |
 | `ue_new_level` | `path`, `template` | Creates a level and opens it. |
 | `ue_open_level` | `path` | Opens an existing level. |
+| `ue_delete_asset` | `path`, `force` | Deletes an asset or a folder. Refuses by default when something references it — deleting anyway leaves broken references in levels and Blueprints — and lists the referencers so you can decide. |
+| `ue_rename_asset` | `path`, `new_path` | Moves or renames an asset, updating references. |
+| `ue_duplicate_asset` | `path`, `new_path` | Duplicates an asset: the quick way to make a variant. |
+| `ue_make_folder` | `path` | Creates a Content Browser folder. Idempotent. |
 
 ## Actors (editor)
 
@@ -95,6 +101,9 @@ past the MCP timeout. They start and you poll the status tool.
 | `ue_set_actor_property` | `label`, `properties`, `component` | Sets properties on a **placed** actor or one of its components — a mesh, a light's intensity, a trigger radius. Vectors are `{"x":…}`, colours `{"r":…}`, and `/Game/...` strings are loaded as assets. |
 | `ue_list_actor_components` | `label` | Components of a placed actor, with name and class — tells you what to pass as `component` above. |
 | `ue_delete_actor` | `label` | Removes an actor from the level. |
+| `ue_attach_actor` | `child_label`, `parent_label`, `socket`, `attach_rule` | Attaches one actor to another, so moving the parent moves the child. `attach_rule` is `KEEP_WORLD`, `KEEP_RELATIVE` or `SNAP_TO_TARGET`. |
+| `ue_detach_actor` | `label`, `keep_world` | Detaches an actor from its parent. |
+| `ue_actor_hierarchy` | `label` | Parent/child tree of the level actors, or of one subtree. |
 
 Actor edits are wrapped in `ScopedEditorTransaction`, so everything above is
 undoable with Ctrl+Z by whoever is watching the editor.
@@ -131,7 +140,13 @@ really do create and wire the nodes.
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `ue_screenshot` | `filename`, `width`, `height` | Captures the editor viewport to a PNG under `<Project>/Saved/Screenshots/MCP` and returns its path. Capture happens a frame or two later, so the tool waits for the file and tells you if it never appeared. |
+| `ue_screenshot` | `filename`, `width`, `height`, `return_image` | Captures the editor viewport and **returns the image itself** as MCP `ImageContent`, so the model actually sees it — a path alone leaves the agent exactly as blind as it was. The PNG also stays on disk under `<Project>/Saved/Screenshots/MCP`. Capture happens a frame or two later, so the tool waits for the file and says so if it never appeared. |
+
+The default resolution is deliberately modest (960×540): the PNG travels
+base64-encoded inside the response, and at 1280×720 it often costs more
+context than the picture saves. Above `UE_MCP_MAX_SCREENSHOT` (1.5 MB) the
+image is not attached and the tool says why. `return_image=False` goes back to
+returning just the path.
 
 ## Play In Editor (editor)
 
@@ -169,6 +184,23 @@ against the published md5 where available, are size-capped by
 > [`legendary`](https://github.com/derrod/legendary) (`pip install legendary-gl`,
 > then `legendary auth`). Without it, the tool explains how to download from the
 > Epic Games Launcher instead. This is third-party software, not an official route.
+
+## Resources
+
+Resources cost less than a tool call: the client can keep them up to date by
+itself and attach them to the context, instead of the model spending a turn
+asking "what does the editor look like right now?".
+
+| URI | Contents |
+|---|---|
+| `unreal://status` | Engine version, project, current level, actor count, detected capabilities. |
+| `unreal://log` | Last 200 lines of the editor log. |
+| `unreal://actors` | Actors in the currently open level. |
+| `unreal://assets` | Everything under `/Game`. For sub-paths use `ue_list_assets`. |
+| `unreal://engines` | Engine installs found on this machine. Works with the editor closed. |
+
+A resource that raises disappears from the client, so with the editor closed
+they answer `{"available": false, "reason": …}` instead of failing.
 
 ## Extending it with project-specific tools
 

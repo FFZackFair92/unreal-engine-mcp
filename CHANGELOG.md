@@ -4,7 +4,38 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] — 2026-07-29
+
+### Added
+
+- **`ue_screenshot` now returns the image itself**, as MCP `ImageContent`,
+  instead of a filesystem path. The tool existed so the agent could *see* what
+  it had built; handing back a string left it exactly as blind as before.
+  Default resolution drops to 960×540 because the PNG travels base64-encoded
+  inside the response and at 1280×720 usually costs more context than the
+  picture saves. `UE_MCP_MAX_SCREENSHOT` (1.5 MB) caps the attachment,
+  `return_image=False` restores the old behaviour, and an editor on another
+  machine is reported rather than silently failing.
+- **Asset management** — `ue_delete_asset`, `ue_rename_asset`,
+  `ue_duplicate_asset`, `ue_make_folder`. An agent could create and import but
+  not clean up after a bad import. `ue_delete_asset` refuses by default when
+  something references the asset, and lists the referencers: deleting anyway
+  leaves broken references in levels and Blueprints.
+- **Actor hierarchy** — `ue_attach_actor`, `ue_detach_actor`,
+  `ue_actor_hierarchy`. This is how a scene is composed (lights on a lamppost,
+  crates on a pallet) instead of leaving loose objects to be repositioned one
+  at a time.
+- **MCP resources** — `unreal://status`, `unreal://log`, `unreal://actors`,
+  `unreal://assets`, `unreal://engines`. Cheaper than a tool call: the client
+  refreshes them itself. With the editor closed they answer
+  `{"available": false, "reason": …}`, because a resource that raises
+  disappears from the client while one that explains stays useful.
+- **Progress notifications.** `ue_build_status` and `ue_package_status` take
+  `wait_seconds`: above zero they poll inside a single call and emit MCP
+  progress, so a build that takes minutes costs one round trip instead of
+  twenty. `ue_editor_open` reports progress while waiting for the bridge.
+- **Release workflow** with PyPI trusted publishing, so the install is
+  `pip install unreal-mcp` instead of a clone.
 
 ### Security
 

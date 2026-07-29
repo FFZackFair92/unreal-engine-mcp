@@ -23,8 +23,8 @@ Il livello locale esiste perché la Remote Control API funziona **solo con un
 editor già aperto**: creare un progetto, avviarlo, compilare e produrre il
 pacchetto sono tutte operazioni a livello di processo.
 
-- **58 tool** — [riferimento completo](docs/TOOLS.it.md)
-- **153 test**, nessuno dei quali richiede Unreal installato
+- **65 tool** e **5 resource** — [riferimento completo](docs/TOOLS.it.md)
+- **182 test**, nessuno dei quali richiede Unreal installato
 - **[Note sull'automazione di Unreal](docs/UNREAL-NOTES.md)** — le trappole delle API trovate sul campo
 
 ---
@@ -57,6 +57,12 @@ Le build custom del motore vanno bene: il rilevamento si basa sull'API Python
 effettivamente presente, non sul numero di versione.
 
 ## Installazione
+
+```bash
+pip install unreal-mcp
+```
+
+Oppure dai sorgenti, per metterci mano:
 
 ```bash
 git clone https://github.com/FFZackFair92/unreal-engine-mcp.git
@@ -220,7 +226,7 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 | **Networking** | Flag di replication, PIE multi-client, impostazioni di progetto |
 | **Audio** | Import wav, MetaSound source, Sound Cue |
 | **Asset gratuiti** | Download da Poly Haven, ambientCG e Kenney (tutti CC0), più qualunque URL diretto |
-| **Riscontro visivo** | `ue_screenshot` cattura la viewport: l'agente vede cosa ha costruito |
+| **Riscontro visivo** | `ue_screenshot` restituisce la viewport **come immagine**: l'agente vede davvero cosa ha costruito |
 
 Elenco completo dei parametri in [docs/TOOLS.it.md](docs/TOOLS.it.md).
 

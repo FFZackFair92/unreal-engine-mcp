@@ -72,6 +72,28 @@ the ignore list.
 Comments explain *why*, not *what*. Much of the existing code documents traps
 found the hard way; that context is the most valuable thing in the file.
 
+## Cutting a release
+
+The package is published to PyPI by `.github/workflows/release.yml` using
+[trusted publishing](https://docs.pypi.org/trusted-publishers/) — there is no
+API token in the repository secrets. It has to be configured once on PyPI
+(*Publishing → Add a new pending publisher*) with owner `FFZackFair92`,
+repository `unreal-engine-mcp`, workflow `release.yml`, environment `pypi`.
+
+1. Bump `version` in `pyproject.toml`.
+2. Move the `CHANGELOG.md` entries under the new version with today's date.
+3. Check the tool and test counts quoted in both READMEs still match reality.
+4. Push, wait for CI to be green.
+5. Dry run: *Actions → Release → Run workflow → testpypi*, then
+   `pip install -i https://test.pypi.org/simple/ unreal-mcp` in a clean venv
+   and check that `python -m unreal_mcp.server` starts.
+6. Tag and publish a GitHub release named `v<version>`. The workflow refuses to
+   publish if the tag and `pyproject.toml` disagree — otherwise it is easy to
+   ship a 0.2.0 labelled v0.3.0.
+
+A version, once on PyPI, cannot be replaced. `twine check` runs in the workflow
+because a README that fails to render is the most common way to burn one.
+
 ## Reporting a bug
 
 Include the engine version, the MCP client, and the full error. If the failure

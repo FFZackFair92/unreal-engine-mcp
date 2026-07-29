@@ -26,8 +26,8 @@ The local layer exists because the Remote Control API only works against an
 editor that is **already running**: creating a project, launching it, compiling
 and packaging all have to happen at the process level.
 
-- **58 tools** — [full reference](docs/TOOLS.md)
-- **153 tests**, none of which need Unreal installed
+- **65 tools** and **5 resources** — [full reference](docs/TOOLS.md)
+- **182 tests**, none of which need Unreal installed
 - **[Unreal automation notes](docs/UNREAL-NOTES.md)** — the API traps found the hard way
 
 ---
@@ -61,6 +61,12 @@ Custom engine builds are fine: detection is based on the actual Python API
 surface, not on the version number.
 
 ## Install
+
+```bash
+pip install unreal-mcp
+```
+
+Or from source, to hack on it:
 
 ```bash
 git clone https://github.com/FFZackFair92/unreal-engine-mcp.git

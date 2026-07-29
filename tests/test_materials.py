@@ -5,6 +5,8 @@ scriptabile: questi test verificano che i nodi vengano davvero creati e
 collegati ai canali giusti.
 """
 
+from pathlib import Path
+
 import fake_unreal
 
 
@@ -104,14 +106,14 @@ async def test_materiale_assegnato_a_un_attore(tools):
 
 
 async def test_screenshot_scrive_il_file(tools, unreal):
-    esito = await tools.ue_screenshot("prova.png", width=640, height=360)
+    esito = await tools.ue_screenshot("prova.png", width=640, height=360, return_image=False)
     assert esito["captured"] is True
     assert esito["file"].endswith("prova.png")
     assert unreal.state["screenshots"]
 
 
 async def test_screenshot_aggiunge_estensione(tools):
-    esito = await tools.ue_screenshot("senza-estensione")
+    esito = await tools.ue_screenshot("senza-estensione", return_image=False)
     assert esito["file"].endswith(".png")
 
 
@@ -126,3 +128,48 @@ async def test_modifiche_agli_attori_sono_annullabili(tools):
     aperte = fake_unreal.ScopedEditorTransaction.opened
     assert len(aperte) == 3
     assert all(d.startswith("MCP:") for d in aperte)
+
+
+# ------------------------------------------------ lo screenshot torna come immagine
+
+
+async def test_screenshot_allega_immagine(tools, unreal):
+    """Il PNG deve arrivare al modello, non solo il suo percorso.
+
+    Il tool esiste perché l'agente *veda* quello che ha costruito: restituire
+    una stringa con un path lo lascia esattamente cieco com'era.
+    """
+    from mcp.server.fastmcp import Image
+
+    esito = await tools.ue_screenshot("visibile.png")
+    assert isinstance(esito, list)
+    immagine, metadati = esito
+    assert isinstance(immagine, Image)
+    assert Path(immagine.path).is_file()
+    assert metadati["captured"] is True
+    assert metadati["bytes"] > 0
+
+
+async def test_screenshot_oltre_il_limite_non_allega(tools, monkeypatch):
+    """Un PNG enorme costa più contesto di quanto ne faccia risparmiare."""
+    monkeypatch.setattr(tools, "MAX_SCREENSHOT_BYTES", 1)
+    esito = await tools.ue_screenshot("grosso.png")
+    assert isinstance(esito, dict)
+    assert esito["image"] is None
+    assert "UE_MCP_MAX_SCREENSHOT" in esito["image_note"]
+
+
+async def test_screenshot_editor_remoto(tools, monkeypatch):
+    """Con l'editor su un'altra macchina il file non è leggibile da qui."""
+    class NonLeggibile:
+        def __init__(self, _percorso):
+            pass
+
+        def is_file(self):
+            return False
+
+    monkeypatch.setattr(tools, "Path", NonLeggibile)
+    esito = await tools.ue_screenshot("remoto.png")
+    assert isinstance(esito, dict)
+    assert esito["image"] is None
+    assert "altra macchina" in esito["image_note"]
