@@ -4,6 +4,223 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.7.0] — 2026-07-31
+
+Le 10 fasi della roadmap di parità con
+[ue-mcp (db-lyon)](https://github.com/db-lyon/ue-mcp), chiuse in una sessione
+sola contro un editor 5.8 vero — 72 tool → 127. Vedi
+`docs/PARITY_ROADMAP.md` per lo stato finale categoria per categoria.
+
+Il filo conduttore: **ogni fase è stata verificata dal vivo prima di essere
+dichiarata**, e quattro si sono chiuse ridimensionate perché la Python API di
+UE non permetteva ciò che si sperava. Il muro non è "i grafi non si toccano":
+è che i sistemi costruiti su un `UEdGraph` di nodi K2 (Blueprint, UMG,
+Niagara, EQS) tengono il contenuto in una proprietà protetta, mentre i grafi
+di oggetti dati (Behavior Tree, PCG) sono scrivibili per intero. Due volte —
+fase 4 sull'animazione e fase 10 sul PCG — l'aspettativa pessimista si è
+rivelata sbagliata, e una volta — fase 8 sui template dei componenti — è
+stata smentita una conclusione di una fase precedente.
+
+UE non espone un modo generico per elencare proprietà/funzioni di una classe
+arbitraria (`get_editor_property` richiede il nome già noto); questi tool
+coprono quello che la Python API permette davvero, verificato dal vivo su un
+editor 5.8, non indovinato.
+
+### Added
+
+- `ue_find_classes` — classi (native e Blueprint) derivate da una classe
+  base, base inclusa. Usa `unreal.ClassIterator`, che in UE elenca le
+  sottoclassi della classe passata (non i suoi campi).
+- `ue_find_structs` — come sopra, per `ScriptStruct` via `unreal.StructIterator`.
+- `ue_reflect_enum` — nome, valore e display name dei membri di un enum
+  nativo esposto ai binding Python (es. `"CollisionChannel"`). Non copre gli
+  enum Blueprint (`UserDefinedEnum`), che non hanno questo binding.
+- `ue_create_widget_blueprint` (Fase 2, UMG) — crea l'asset Widget Blueprint
+  (o Editor Utility Widget). Il `WidgetTree` è una proprietà protetta nella
+  Python API di UE, verificato dal vivo: stesso muro dei grafi Blueprint, non
+  scriptabile. Il layout va disegnato a mano nel Widget Designer; per la
+  logica vale lo stesso workaround C++ (`BindWidget` + `ue_cpp_class_create`
+  → `ue_reparent_blueprint`) già in uso per i grafi Blueprint.
+- `ue_bp_list_graphs`, `ue_bp_list_events`, `ue_bp_add_event_override`,
+  `ue_bp_add_function_graph` (Fase 3, grafo Blueprint) — copertura parziale
+  ma reale: si possono aggiungere nodi evento per eventi ereditati
+  overridabili e grafi funzione vuoti. Verificato dal vivo che `Nodes` di
+  `EdGraph` è protetta (stesso muro del `WidgetTree`): niente elenco nodi di
+  un grafo arbitrario, niente creazione di nodi liberi (Print String,
+  Branch...). Un modo per collegare due pin (`try_create_connection`) esiste
+  ed è stato testato funzionante, ma non è stato esposto come tool: gli
+  unici nodi raggiungibili da qui sono nodi evento, e un nodo evento ha
+  *solo* pin di output (verificato anche su un evento con 8 parametri,
+  `ReceiveHit`) — senza un pin di input da nessuna parte non c'è nessuna
+  connessione valida da fare.
+- `ue_skeleton_info`, `ue_anim_sequence_info`, `ue_create_blend_space_1d`,
+  `ue_create_anim_montage`, `ue_create_anim_blueprint` (Fase 4, animazione) —
+  a differenza di UMG e del grafo Blueprint, qui la scrittura funziona
+  davvero: `BlendParameters`/`SampleData` di un BlendSpace sono array di
+  struct ordinari, non protetti. Verificato dal vivo su asset reali del
+  progetto (Remy_Skeleton, BS_Remy_Locomozione, Idle/Walking/Running):
+  creato un BlendSpace1D, riempito di parametri e sample, salvato,
+  ricaricato da zero — i dati erano davvero lì. L'AnimGraph di un Anim
+  Blueprint resta un EdGraph come gli altri (stesso muro): l'asset si crea,
+  il grafo si disegna a mano.
+- `ue_create_niagara_system`, `ue_niagara_system_info` (Fase 5, Niagara/VFX)
+  — `EmitterHandles` di `NiagaraSystem` è protetta come `Nodes`/`WidgetTree`,
+  verificato dal vivo anche su template popolati della libreria di sistema
+  del motore (/Niagara/DefaultAssets/Templates/Systems/DirectionalBurst):
+  niente aggiunta di emitter via Python. `NiagaraFunctionLibrary.get_all_emitters`/
+  `get_all_user_parameters` invece funzionano davvero e a livello di asset,
+  senza bisogno di un PIE in esecuzione — testato leggendo il template reale
+  (2 emitter, "LocationBasedRibbon" e "DirectionalBurst").
+- `ue_set_component_physics`, `ue_component_physics_info`, `ue_nav_rebuild`,
+  `ue_nav_query_point`, `ue_nav_find_path`, `ue_create_blackboard`,
+  `ue_blackboard_add_key`, `ue_blackboard_info`, `ue_create_behavior_tree`,
+  `ue_bt_add_node`, `ue_bt_add_decorator`, `ue_bt_add_service`,
+  `ue_bt_set_node_property`, `ue_bt_info`, `ue_create_eqs_asset` (Fase 6,
+  Gameplay) — fisica/collisione e navmesh pienamente scriptabili (verificato
+  dal vivo: `set_simulate_physics`/`set_collision_enabled`/
+  `set_collision_profile_name` sono UFUNCTION vere su `UPrimitiveComponent`,
+  non proprietà dirette; `NavigationSystemV1` risponde a query di punti
+  raggiungibili e pathfinding sincrono senza PIE). Sorpresa più grande della
+  fase: Blackboard e Behavior Tree rompono di nuovo il pattern "i sistemi a
+  grafo sono protetti" di UMG/Blueprint/Niagara — qui `RootNode`, `Children`,
+  `Decorators` (sul child link) e `Services` (sui nodi composite) sono
+  davvero scrivibili via Python, root composite/task/decorator/service
+  inclusi, con persistenza confermata risalvando e ricaricando l'asset da
+  zero. La differenza sembra essere l'assenza di un vero `EdGraph` sotto il
+  cofano: i nodi sono `UObject` referenziati da proprietà o da array di
+  struct (`FBTCompositeChild`), non un grafo K2-style. Le proprietà
+  bindable da blackboard sui task (es. `BTTask_Wait.WaitTime`) sono struct
+  `FValueOrBBKey_*` riconosciuti dal nome del tipo Python (`type(x).__name__`),
+  gestiti in automatico da `ue_bt_set_node_property`. EQS resta bloccato
+  come gli altri sistemi a grafo: `Options` di `EnvQuery` è protetta,
+  verificato dal vivo — solo l'asset vuoto è creabile. L'AI Perception si
+  aggiunge già con `ue_add_component` generico (nessun tool dedicato); il
+  suo `SensesConfig` è `EditDefaultsOnly` e la Python API rifiuta di
+  scriverlo su un'istanza spawnata ("cannot be edited on instances") — va
+  configurato a mano nel pannello Details del Blueprint. Anche
+  `create_physics_asset` (su `SkeletalMeshEditorSubsystem`, non più sulla
+  `EditorSkeletalMeshLibrary` deprecata) funziona davvero, testato dal vivo
+  sullo SkeletalMesh reale del progetto, ma non è stato esposto come tool:
+  crea e assegna un asset reale con effetti collaterali da annullare a mano,
+  giudicato troppo invasivo per un tool a basso valore aggiunto rispetto a
+  farlo dal Physics Asset Editor.
+- `ue_create_gameplay_ability`, `ue_create_gameplay_effect`,
+  `ue_ge_add_modifier`, `ue_ge_add_component`, `ue_ge_info` (Fase 7, GAS) —
+  richiede il plugin `GameplayAbilities`, non abilitato di default sul
+  progetto (`ue_project_set_plugins` + riavvio editor). GameplayEffect e
+  AttributeSet sono Blueprint "normali", già coperti da `ue_create_blueprint`
+  generico; GameplayAbility ha invece un asset dedicato
+  (`GameplayAbilityBlueprint`) che serve `GameplayAbilitiesBlueprintFactory`.
+  Aggiungere un attributo (`GameplayAttributeData`) a un AttributeSet
+  funziona già con `ue_add_variable` passando il path completo dello struct
+  come `sub_type` — nessun tool nuovo serviva per quello. **Il muro vero**:
+  `GameplayModifierInfo.Attribute`/`.ModifierOp` rifiutano
+  `set_editor_property` ("cannot be edited on instances") e
+  `GameplayAttribute.AttributeName` è read-only — il modo normale di
+  collegare un modifier a un attributo è bloccato. **Aggirato** costruendo
+  l'intero struct `GameplayModifierInfo` con `import_text` in una volta sola
+  (stessa tecnica già in uso per `EdGraphPinType`): verificato dal vivo che
+  il parser testuale bypassa la restrizione sulla singola proprietà,
+  costruendo un modifier reale (attributo `Health` su un AttributeSet
+  Blueprint vero, `ModifierOp=AddBase`, magnitudine -10), salvando il
+  GameplayEffect e ricaricandolo da zero — il modifier era davvero lì. Non
+  verificato in PIE, solo la persistenza sull'asset. `GEComponents`
+  (`AssetTagsGameplayEffectComponent` e simili) è scrivibile allo stesso
+  modo delle fasi precedenti (array di oggetti su un nodo, non un EdGraph).
+  L'AnimGraph/EventGraph di un'abilità resta un grafo Blueprint normale, non
+  scriptabile.
+- `ue_set_net_config`, `ue_net_info`, `ue_set_component_replication`,
+  `ue_set_component_default` (Fase 8, networking esteso) — dormancy,
+  frequenze di update, priorità di replication, cull distance e relevancy
+  accanto al solo `ue_set_replication` che c'era prima. Nessun muro:
+  sono tutte `get/set_editor_property` normali sulla CDO, verificato dal vivo
+  su UE 5.8 scrivendole, salvando il Blueprint e ritrovando i nomi delle
+  proprietà dentro il `.uasset` (`NetDormancy`, `NetPriority`,
+  `MinNetUpdateFrequency`, `bOnlyRelevantToOwner`…). `net_cull_distance` è
+  esposta in centimetri come tutto il resto del server e viene elevata al
+  quadrato prima di finire in `NetCullDistanceSquared`.
+  **Bonus: chiude un limite documentato nella fase 6.** Là si era concluso
+  che il template di un componente di Blueprint non fosse raggiungibile ("il
+  subsystem dei subobject non espone un modo diretto per risalire dall'handle
+  all'oggetto") e che quindi `SensesConfig` di un AIPerceptionComponent
+  andasse configurato a mano. Il modo esiste:
+  `SubobjectDataBlueprintFunctionLibrary.get_object` sul dato ottenuto da
+  `k2_find_subobject_data_from_handle`. Verificato dal vivo scrivendo una
+  config di senso Sight (raggi 1500/1800) sul template di un
+  AIPerceptionComponent vero, salvando e ritrovandola sia rileggendo l'asset
+  sia nel `.uasset`. `ue_set_component_default` la espone in generale, per
+  qualunque proprietà `EditDefaultsOnly` di qualunque componente.
+- `ue_landscape_list`, `ue_landscape_info`, `ue_landscape_import_heightmap`,
+  `ue_landscape_import_weightmap`, `ue_landscape_export_heightmap`,
+  `ue_landscape_set_material`, `ue_landscape_set_grass` (Fase 9, landscape) —
+  la fase più ridimensionata di tutte. **Creare** un landscape da Python non
+  si può: verificato dal vivo che `spawn_actor_from_class(unreal.Landscape)`
+  restituisce un `LandscapePlaceholder` vuoto (nessun componente, nessun
+  target layer, nemmeno i metodi di `ALandscape`), e che le classi che lo
+  creano davvero — `LandscapeSubsystem`, `LandscapeEditorObject`,
+  `ActorFactoryLandscape`, tutte trovate con `ClassIterator` — non sono
+  esposte al Python del motore. Su un landscape già creato con Landscape Mode
+  invece funziona tutto. Unreal accetta un heightmap solo come
+  `TextureRenderTarget2D`: i tool costruiscono il ponte da un file immagine
+  (`import_file_as_texture2d` → `begin_draw_canvas_to_render_target` →
+  `Canvas.draw_texture`), catena verificata dal vivo fino al render target
+  compreso, generando un PNG a gradiente 64×64 e rileggendolo dal RT pixel per
+  pixel con i valori attesi. **L'ultimo anello non è verificato**: in
+  quattroCantoni non esiste nessun landscape su cui provare
+  `landscape_import_heightmap_from_render_target`, e Python non può crearne
+  uno per provare.
+- `ue_create_pcg_graph`, `ue_pcg_add_node`, `ue_pcg_connect`,
+  `ue_pcg_disconnect`, `ue_pcg_remove_node`, `ue_pcg_set_node_property`,
+  `ue_pcg_graph_info`, `ue_pcg_spawn_volume`, `ue_pcg_generate`,
+  `ue_pcg_cleanup` (Fase 10, PCG) — **la sorpresa della roadmap**. Dopo che
+  UMG (fase 2), il grafo Blueprint (fase 3) e Niagara (fase 5) avevano
+  sbattuto contro lo stesso muro, ci si aspettava l'ennesimo grafo protetto;
+  invece il grafo PCG è pienamente scriptabile: `add_node_of_type`,
+  `add_edge`, `remove_edge`, `remove_node`, `get_all_edges`, `nodes`,
+  `set_node_position` sono tutti esposti, e le proprietà di un nodo si
+  scrivono sul suo `PCGSettings` come su un oggetto qualunque. Verificato dal
+  vivo costruendo Input → SurfaceSampler → StaticMeshSpawner, impostando
+  `points_per_squared_meter`, salvando e ricaricando l'asset da zero: nodi,
+  archi e proprietà c'erano ancora, e i nomi dei nodi compaiono nel `.uasset`.
+  Anche il lato livello è stato provato davvero: PCGVolume spawnato,
+  `set_graph`, `generate` e `cleanup` sul suo `PCGComponent`. Il motivo del
+  diverso trattamento è lo stesso dei Behavior Tree della fase 6: è un grafo
+  di dati veri (`UPCGNode` + `UPCGEdge`), non un `UEdGraph` di nodi K2 con il
+  contenuto in una proprietà protetta — l'`UPCGEditorGraph` è solo la
+  rappresentazione visiva, e non serve toccarlo. In PCG il tipo di un nodo
+  *è* la sua classe di settings (`PCGSurfaceSamplerSettings`…), e i nomi dei
+  pin sono le etichette visibili spazi compresi (`"Bounding Shape"`): per
+  questo `ue_pcg_add_node` e `ue_pcg_graph_info` li restituiscono sempre, e
+  `ue_pcg_connect` rifiuta un pin sbagliato elencando quelli veri invece di
+  creare in silenzio un arco che non esiste.
+
+### Fixed (durante lo sviluppo, non ancora rilasciato)
+
+- I resolver interni `mcp_resolve_class`/`mcp_resolve_struct` (usati da
+  spawn/reparent/add_component) e i nuovi resolver di reflection avrebbero
+  avuto lo stesso nome se non fossi intervenuto: la seconda definizione nel
+  file avrebbe silenziosamente sovrascritto la prima, rompendo `ue_spawn_actor`
+  e simili con un `ValueError: Classe 'StaticMeshActor' non trovata` — preso
+  dalla suite (`test_actors.py`), non a occhio. I resolver di reflection ora
+  si chiamano `mcp_reflect_resolve_class`/`mcp_reflect_resolve_struct`: sono
+  concettualmente diversi da quelli di spawn (restituiscono l'oggetto `Class`
+  di riflessione, non il tipo Python usabile da `spawn_actor_from_class`) e
+  quindi non dovevano condividere il nome.
+
+- **Tre bugie in meno nel `fake_unreal`**, trovate scrivendo i test delle fasi
+  8-10. `SubobjectDataSubsystem` restituiva un unico handle fisso e buttava
+  via il componente creato: bastava per `ue_add_component`, che non rilegge
+  niente, ma avrebbe fatto passare senza accorgersene tutto il percorso
+  handle → dato → template della fase 8. `Actor.get_component_by_class` non
+  esisteva affatto, e `get_components_by_class` ignorava la classe chiesta —
+  un attore senza PCGComponent sarebbe sembrato averne uno. `get_actor_scale3d`
+  mancava pur essendo il gemello di un `set_` che c'era. Ora il finto tiene i
+  componenti per Blueprint, filtra per classe davvero, e riproduce anche la
+  trappola del landscape: spawnare `Landscape` restituisce un
+  `LandscapePlaceholder`, esattamente come nel motore vero.
+
 ## [0.6.0] — 2026-07-29
 
 First session driving a real Unreal editor end to end. Most tools worked on the

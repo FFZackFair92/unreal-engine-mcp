@@ -3,7 +3,7 @@
 # esiste gia'. Il nome coincide con quello del repo, il modulo Python resta
 # `unreal_mcp` e il comando installato resta `unreal-mcp`.
 name = "unreal-engine-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "Drive Unreal Engine 5 from an AI agent: Remote Control API + in-editor Python, no C++ plugin to compile"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -138,4 +138,7 @@ ignore = [
 "src/unreal_mcp/bridge.py" = ["N818"]
 # The fakes mimic Unreal's and http.server's naming, which is not PEP 8, and
 # the suite deliberately execs generated snippets — that is what it tests.
-"tests/*" = ["N802", "N803", "N806", "N815", "S102", "S108", "S603", "RUF012"]
+# N801: alcune classi finte (BTComposite_Selector, BTTask_Wait, ...) usano il
+# nome esatto della classe Unreal reale con underscore, perché mcp_resolve_class
+# risolve per nome esatto e i test devono passare la stessa stringa del motore.
+"tests/*" = ["N801", "N802", "N803", "N806", "N815", "S102", "S108", "S603", "RUF012"]

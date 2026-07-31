@@ -7,6 +7,7 @@ usare liberamente il modulo ``unreal``, disponibile solo nell'editor.
 
 import json
 import os
+import re
 
 import unreal
 
@@ -1388,6 +1389,232 @@ def mcp_set_replication(blueprint_path, replicates=True, replicate_movement=True
     return {"blueprint": blueprint_path, "applied": applied}
 
 
+# Networking esteso (fase 8). Verificato dal vivo su UE 5.8 il 2026-07-31:
+# tutte le proprietà di rete di `AActor` (dormancy, frequenze di update,
+# priorità, cull distance, relevancy) sono `get/set_editor_property` normali
+# sulla CDO del Blueprint, e persistono su disco (controllato leggendo i nomi
+# delle proprietà nel .uasset dopo il salvataggio). Niente muro tipo
+# WidgetTree/EdGraph qui: la fase 8 è l'unica finora senza ridimensionamenti
+# oltre alla 4 e alla 6.
+
+#: Nomi accettati per `NetDormancy` → membro di `unreal.NetDormancy`.
+MCP_NET_DORMANCY = {
+    "awake": "DORM_AWAKE",
+    "dormant_all": "DORM_DORMANT_ALL",
+    "dormant_partial": "DORM_DORMANT_PARTIAL",
+    "initial": "DORM_INITIAL",
+    "never": "DORM_NEVER",
+}
+
+#: Proprietà di rete numeriche/booleane scrivibili sulla CDO di un Actor.
+MCP_NET_PROPS = (
+    "net_update_frequency",
+    "min_net_update_frequency",
+    "net_priority",
+    "net_cull_distance_squared",
+    "only_relevant_to_owner",
+    "net_use_owner_relevancy",
+    "net_load_on_client",
+    "replicates",
+    "replicate_movement",
+    "always_relevant",
+)
+
+
+def _mcp_net_dormancy(nome):
+    chiave = str(nome).lower().replace("-", "_").replace(" ", "_")
+    chiave = chiave[5:] if chiave.startswith("dorm_") else chiave
+    membro = MCP_NET_DORMANCY.get(chiave)
+    if membro is None:
+        raise ValueError(
+            "dormancy '%s' sconosciuta. Validi: %s"
+            % (nome, ", ".join(sorted(MCP_NET_DORMANCY)))
+        )
+    return getattr(unreal.NetDormancy, membro)
+
+
+def mcp_net_info(blueprint_path):
+    """Tutte le proprietà di rete della CDO di un Blueprint Actor."""
+    blueprint = mcp_load_blueprint(blueprint_path)
+    cdo = unreal.get_default_object(blueprint.generated_class())
+
+    info = {"blueprint": blueprint_path}
+    try:
+        info["dormancy"] = str(cdo.get_editor_property("net_dormancy"))
+    except Exception as exc:  # noqa: BLE001
+        info["dormancy"] = "non leggibile (%s)" % exc
+    for prop in MCP_NET_PROPS:
+        try:
+            valore = cdo.get_editor_property(prop)
+            info[prop] = bool(valore) if isinstance(valore, bool) else float(valore)
+        except Exception as exc:  # noqa: BLE001
+            info[prop] = "non leggibile (%s)" % exc
+
+    quadrato = info.get("net_cull_distance_squared")
+    if isinstance(quadrato, float) and quadrato >= 0:
+        info["net_cull_distance"] = quadrato**0.5
+
+    componenti = []
+    for handle in _mcp_bp_subobject_handles(blueprint)[1:]:
+        template = _mcp_subobject_object(handle)
+        if template is None or not hasattr(template, "replicates"):
+            continue
+        try:
+            componenti.append(
+                {
+                    "name": str(template.get_name()),
+                    "class": str(template.get_class().get_name()),
+                    "replicates": bool(template.get_editor_property("replicates")),
+                }
+            )
+        except Exception:  # noqa: BLE001, S112
+            continue
+    info["components"] = componenti
+    return info
+
+
+def mcp_set_net_config(
+    blueprint_path,
+    dormancy=None,
+    net_update_frequency=None,
+    min_net_update_frequency=None,
+    net_priority=None,
+    net_cull_distance=None,
+    only_relevant_to_owner=None,
+    net_use_owner_relevancy=None,
+    net_load_on_client=None,
+):
+    """Configura dormancy, frequenze di update, priorità e relevancy di rete.
+
+    `net_cull_distance` è in centimetri come tutto il resto del server: viene
+    elevata al quadrato prima di scriverla in `NetCullDistanceSquared`, che è
+    come Unreal la memorizza.
+    """
+    blueprint = mcp_load_blueprint(blueprint_path)
+    cdo = unreal.get_default_object(blueprint.generated_class())
+
+    applicato = {}
+    with mcp_transaction("MCP: rete di %s" % blueprint_path):
+        if dormancy is not None:
+            cdo.set_editor_property("net_dormancy", _mcp_net_dormancy(dormancy))
+            applicato["dormancy"] = str(dormancy)
+
+        if net_cull_distance is not None:
+            distanza = float(net_cull_distance)
+            if distanza < 0:
+                raise ValueError("net_cull_distance non può essere negativa.")
+            cdo.set_editor_property("net_cull_distance_squared", distanza * distanza)
+            applicato["net_cull_distance"] = distanza
+
+        for prop, valore, conversione in (
+            ("net_update_frequency", net_update_frequency, float),
+            ("min_net_update_frequency", min_net_update_frequency, float),
+            ("net_priority", net_priority, float),
+            ("only_relevant_to_owner", only_relevant_to_owner, bool),
+            ("net_use_owner_relevancy", net_use_owner_relevancy, bool),
+            ("net_load_on_client", net_load_on_client, bool),
+        ):
+            if valore is None:
+                continue
+            try:
+                cdo.set_editor_property(prop, conversione(valore))
+                applicato[prop] = conversione(valore)
+            except Exception as exc:  # noqa: BLE001
+                applicato[prop] = "non applicabile (%s)" % exc
+
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {"blueprint": blueprint_path, "applied": applicato, "info": mcp_net_info(blueprint_path)}
+
+
+def _mcp_bp_subobject_handles(blueprint):
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    return list(subsystem.k2_gather_subobject_data_for_blueprint(blueprint))
+
+
+def _mcp_subobject_object(handle):
+    """Oggetto template dietro un handle del SubobjectDataSubsystem.
+
+    Il passaggio handle → dato → oggetto è quello che la fase 6 aveva dato
+    per irraggiungibile: `SubobjectDataBlueprintFunctionLibrary.get_object`
+    esiste e funziona (verificato dal vivo su UE 5.8), e apre l'accesso ai
+    template dei componenti di un Blueprint — non solo alla loro replication.
+    """
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    dato = subsystem.k2_find_subobject_data_from_handle(handle)
+    if dato is None:
+        return None
+    return unreal.SubobjectDataBlueprintFunctionLibrary.get_object(dato)
+
+
+def _mcp_bp_component_template(blueprint, component_name):
+    """Template di un componente di un Blueprint, cercato per nome.
+
+    I template hanno il suffisso `_GEN_VARIABLE` nel nome: il confronto lo
+    ignora, così chi chiama può usare il nome che vede nell'editor.
+    """
+    atteso = str(component_name).lower()
+    trovati = []
+    for handle in _mcp_bp_subobject_handles(blueprint)[1:]:
+        template = _mcp_subobject_object(handle)
+        if template is None:
+            continue
+        nome = str(template.get_name())
+        trovati.append(nome)
+        pulito = nome[: -len("_GEN_VARIABLE")] if nome.endswith("_GEN_VARIABLE") else nome
+        if pulito.lower() == atteso or nome.lower() == atteso:
+            return template
+    raise ValueError(
+        "Componente '%s' non trovato. Presenti: %s" % (component_name, ", ".join(trovati) or "nessuno")
+    )
+
+
+def mcp_set_component_replication(blueprint_path, component_name, replicates=True):
+    """Attiva/disattiva la replication di un singolo componente di un Blueprint."""
+    blueprint = mcp_load_blueprint(blueprint_path)
+    template = _mcp_bp_component_template(blueprint, component_name)
+    if not hasattr(template, "replicates"):
+        raise ValueError(
+            "'%s' è un %s: solo gli ActorComponent hanno una replication propria."
+            % (component_name, template.get_class().get_name())
+        )
+    with mcp_transaction("MCP: replication di %s/%s" % (blueprint_path, component_name)):
+        template.set_editor_property("replicates", bool(replicates))
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {
+        "blueprint": blueprint_path,
+        "component": str(template.get_name()),
+        "replicates": bool(template.get_editor_property("replicates")),
+    }
+
+
+def mcp_set_component_default(blueprint_path, component_name, property_name, value):
+    """Scrive una proprietà sul *template* di un componente di un Blueprint.
+
+    È la via per le proprietà `EditDefaultsOnly` che la Python API rifiuta di
+    scrivere su un attore spawnato ("cannot be edited on instances") — il
+    limite documentato nella fase 6 per `SensesConfig` di AIPerception.
+    """
+    blueprint = mcp_load_blueprint(blueprint_path)
+    template = _mcp_bp_component_template(blueprint, component_name)
+    with mcp_transaction("MCP: default di %s/%s" % (blueprint_path, component_name)):
+        template.set_editor_property(property_name, mcp_coerce_value(value))
+        letto = template.get_editor_property(property_name)
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    if isinstance(letto, (bool, int, float, str)) or letto is None:
+        valore_letto = letto
+    else:
+        valore_letto = str(letto)
+    return {
+        "blueprint": blueprint_path,
+        "component": str(template.get_name()),
+        "property": property_name,
+        "value": valore_letto,
+    }
+
+
 #: Valori di EPlayNetMode (ByteProperty: Python legge/scrive interi).
 MCP_NET_MODES = {"standalone": 0, "listen_server": 1, "client": 2}
 
@@ -1678,3 +1905,1728 @@ def mcp_tail_log(lines=80, only_errors=False):
 
 def mcp_dumps(value):
     return json.dumps(value, default=str)
+
+
+# ============================================================== reflection
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31 (nessuna API qui è indovinata):
+# la Python API di UE non espone un modo generico per elencare proprietà e
+# funzioni di una classe arbitraria — `unreal.Class`/`unreal.Struct` offrono
+# solo `get_editor_property(nome)`, che richiede di conoscere già il nome.
+# `ClassIterator`/`StructIterator` invece funzionano, ma elencano le
+# sottoclassi/sotto-struct di quella passata, non i suoi campi: è
+# un'iterazione di gerarchia, non di membri. Per questo la reflection qui si
+# ferma a "trova classi/struct per gerarchia" ed "elenca i valori di un
+# enum nativo esposto ai binding Python": è quello che la API permette senza
+# ricorrere a `ue_exec_python` a mano.
+#
+# Nota: NON riusa `mcp_resolve_class`/`mcp_resolve_struct` già definite più
+# sopra per lo spawn — quelle restituiscono il *tipo* Python (serve a
+# `spawn_actor_from_class`), qui invece serve l'oggetto `Class`/`ScriptStruct`
+# di riflessione (`.static_class()`/`.static_struct()`), che è un'altra cosa:
+# confonderli ha rotto lo spawn degli attori nella prima stesura di questa
+# fase (`ClassIterator` con un `type` grezzo lancia
+# "Cannot nativize 'Class' as 'Struct'"/comportamento errato). Nomi diversi
+# apposta.
+
+
+def mcp_reflect_resolve_class(name):
+    """Risolve un nome di classe nell'oggetto `Class` di riflessione di Unreal.
+
+    Prova prima l'attributo comodo (``unreal.Actor``), che copre le classi
+    native e Blueprint con binding Python generato; poi ``find_object`` con
+    un percorso completo (``/Script/Engine.Actor``, o
+    ``/Game/.../BP_Nome.BP_Nome_C`` per una Blueprint del progetto). Un nome
+    corto senza percorso (solo ``"Actor"``) NON si risolve con
+    ``find_object``: serve il primo tentativo.
+    """
+    attr = getattr(unreal, name, None)
+    if attr is not None and hasattr(attr, "static_class"):
+        return attr.static_class()
+    obj = unreal.find_object(None, name)
+    if obj is None:
+        raise ValueError("Classe '%s' non trovata." % name)
+    return obj
+
+
+def mcp_reflect_resolve_struct(name):
+    """Come `mcp_reflect_resolve_class`, per gli struct (`ScriptStruct`)."""
+    attr = getattr(unreal, name, None)
+    if attr is not None and hasattr(attr, "static_struct"):
+        return attr.static_struct()
+    obj = unreal.find_object(None, name)
+    if obj is None:
+        raise ValueError("Struct '%s' non trovato." % name)
+    return obj
+
+
+def mcp_find_classes(parent, name_contains=None, limit=200):
+    """Elenca le classi (native e Blueprint) derivate da `parent`, `parent` incluso.
+
+    `ClassIterator` include il progetto: le Blueprint compaiono con il loro
+    nome generato (`BP_PlayerCharacter_C`), oltre alla loro classe SKEL
+    ombra.
+    """
+    base = mcp_reflect_resolve_class(parent)
+    filtro = (name_contains or "").lower()
+    trovate = []
+    troncato = False
+    for c in unreal.ClassIterator(base):
+        nome = c.get_name()
+        if filtro and filtro not in nome.lower():
+            continue
+        if len(trovate) >= limit:
+            troncato = True
+            break
+        trovate.append({"name": nome, "path": c.get_path_name()})
+    return {"parent": parent, "count": len(trovate), "truncated": troncato, "classes": trovate}
+
+
+def mcp_find_structs(parent, name_contains=None, limit=200):
+    """Elenca gli struct derivati da `parent` (`ScriptStruct`), `parent` incluso."""
+    base = mcp_reflect_resolve_struct(parent)
+    filtro = (name_contains or "").lower()
+    trovate = []
+    troncato = False
+    for s in unreal.StructIterator(base):
+        nome = s.get_name()
+        if filtro and filtro not in nome.lower():
+            continue
+        if len(trovate) >= limit:
+            troncato = True
+            break
+        trovate.append({"name": nome, "path": s.get_path_name()})
+    return {"parent": parent, "count": len(trovate), "truncated": troncato, "structs": trovate}
+
+
+def mcp_reflect_enum(enum_name):
+    """Elenca i valori di un enum nativo esposto ai binding Python.
+
+    Il nome esposto è quello UENUM senza il prefisso `E` (`ECollisionChannel`
+    diventa `CollisionChannel`). Copre la quasi totalità degli enum nativi
+    del motore. Non copre gli enum Blueprint (`UserDefinedEnum`, asset in
+    `/Game/...`): quelli vanno caricati con `unreal.load_asset(path)` via
+    `ue_exec_python`, perché non hanno questo binding.
+    """
+    enum_type = getattr(unreal, enum_name, None)
+    if enum_type is None:
+        raise ValueError(
+            "Enum '%s' non trovato. Prova senza il prefisso 'E' (es. "
+            "'CollisionChannel' non 'ECollisionChannel'); se è un enum "
+            "Blueprint (asset in /Game/...) non è coperto da questo tool."
+            % enum_name
+        )
+    try:
+        membri = list(enum_type)
+    except TypeError as exc:
+        raise ValueError("'%s' non è un enum esposto ai binding Python." % enum_name) from exc
+    valori = [
+        {"name": m.name, "value": int(m.value), "display_name": str(m.get_display_name())}
+        for m in membri
+    ]
+    return {"name": enum_name, "count": len(valori), "values": valori}
+
+
+# ===================================================================== UMG
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31: creare l'asset Widget
+# Blueprint funziona, `parent_class` accetta anche una classe C++ del
+# progetto (non solo `UserWidget`/`EditorUtilityWidget`). Popolare il
+# `WidgetTree` (aggiungere TextBlock/Button/CanvasPanel, il layout) NO:
+# `get_editor_property("WidgetTree")` sulla CDO della classe generata
+# risponde "protected and cannot be read" — stesso muro dei grafi Blueprint
+# già documentato per `ue_reparent_blueprint`. Il layout va disegnato a mano
+# nel Widget Designer; per la logica, la stessa via C++ già in uso altrove
+# (`ue_cpp_class_create` con proprietà `BindWidget` -> reparent) funziona
+# perché quelle proprietà sono lette dal compilatore Blueprint al momento
+# della compilazione, non scritte da qui a runtime.
+
+
+def mcp_create_widget_blueprint(package_path, name, parent_class="UserWidget", editor_utility=False):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    resolved_parent = mcp_resolve_class(parent_class)
+    if editor_utility:
+        factory = unreal.EditorUtilityWidgetBlueprintFactory()
+        asset_class = unreal.EditorUtilityWidgetBlueprint
+    else:
+        factory = unreal.WidgetBlueprintFactory()
+        asset_class = unreal.WidgetBlueprint
+    factory.set_editor_property("parent_class", resolved_parent)
+
+    asset = mcp_asset_tools().create_asset(name, package_path, asset_class, factory)
+    if asset is None:
+        raise RuntimeError("Creazione Widget Blueprint '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {
+        "path": full,
+        "created": True,
+        "parent_class": parent_class,
+        "editor_utility": bool(editor_utility),
+    }
+
+
+# ============================================================ blueprint graph
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31. Le istruzioni del server
+# dicono "i grafi Blueprint non sono scriptabili" — vero solo in parte:
+# `unreal.BlueprintEditorLibrary` espone un sottoinsieme reale di editing
+# (aggiungere nodi evento per eventi ereditati overridabili, aggiungere grafi
+# funzione vuoti, leggere i pin di un nodo di cui si ha già il riferimento),
+# ma la proprietà `Nodes` di `EdGraph` è protetta esattamente come
+# `WidgetTree` in UMG (fase 2): niente elenco dei nodi di un grafo qualunque,
+# niente creazione di nodi arbitrari (Print String, Branch, chiamate a
+# funzione libere, nodi matematici...). C'è anche un modo per collegare due
+# pin (`BlueprintGraphPin.try_create_connection`, verificato funzionante),
+# ma non è esposto come tool: gli unici nodi raggiungibili da qui sono nodi
+# evento, e un nodo evento ha *solo* pin di output (verificato anche su un
+# evento con 8 parametri, ReceiveHit) — senza un nodo con un pin di input non
+# c'è nessuna connessione valida da fare, quindi sarebbe stato un tool
+# funzionante ma inutile nella pratica. Per logica vera resta la via C++ già
+# in uso altrove (`ue_cpp_class_create` -> `ue_reparent_blueprint`); questi
+# tool servono a predisporre l'aggancio (l'evento esiste, il suo grafo pure),
+# non a scrivere la logica.
+
+
+def mcp_bp_list_graphs(blueprint_path):
+    blueprint = mcp_load_blueprint(blueprint_path)
+    nomi = [g.get_name() for g in unreal.BlueprintEditorLibrary.list_graphs(blueprint)]
+    return {"path": blueprint_path, "graphs": nomi}
+
+
+def mcp_bp_list_events(blueprint_path):
+    """Elenca gli eventi (custom, ereditati overridabili, di interfaccia) visibili sul Blueprint.
+
+    `is_implemented` dice se esiste già un nodo per quell'evento nel grafo:
+    utile prima di chiamare `mcp_bp_add_event_override`, che altrimenti
+    restituisce comunque il nodo esistente senza duplicarlo.
+    """
+    blueprint = mcp_load_blueprint(blueprint_path)
+    eventi = [
+        {
+            "name": str(e.get_editor_property("name")),
+            "is_implemented": bool(e.get_editor_property("is_implemented")),
+        }
+        for e in unreal.BlueprintEditorLibrary.list_events(blueprint)
+    ]
+    return {"path": blueprint_path, "events": eventi}
+
+
+def _mcp_bp_pin_dict(pin, node_path):
+    return {
+        "node_path": node_path,
+        "name": str(pin.get_pin_name()),
+        "direction": pin.get_pin_direction().name,
+        "type": str(pin.get_pin_type_display_string()),
+    }
+
+
+def mcp_bp_add_event_override(blueprint_path, event_name, x=0, y=0):
+    """Aggiunge (o ritrova, se già presente) il nodo di un evento ereditato overridabile.
+
+    Restituisce il path del nodo e i suoi pin, a scopo informativo (un nodo
+    evento ha solo pin di output: non c'è altro da collegarci con quello che
+    la Python API di UE permette — vedi il commento in cima a questa
+    sezione).
+    """
+    blueprint = mcp_load_blueprint(blueprint_path)
+    library = unreal.BlueprintEditorLibrary
+    node = library.add_event_override(blueprint, event_name, unreal.IntPoint(int(x), int(y)))
+    if node is None:
+        raise ValueError(
+            "'%s' non è un evento ereditato overridabile su questo Blueprint, "
+            "o il Blueprint non ha un grafo evento. Controlla con mcp_bp_list_events."
+            % event_name
+        )
+    node_path = node.get_path_name()
+    pins = [_mcp_bp_pin_dict(p, node_path) for p in library.list_all_pins(node)]
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {"node_path": node_path, "pins": pins}
+
+
+def mcp_bp_add_function_graph(blueprint_path, func_name):
+    """Crea un grafo funzione vuoto con i nodi Entry/Return di default.
+
+    Quei nodi non sono raggiungibili da qui (stesso limite di `Nodes`
+    protetta): il corpo della funzione va scritto a mano nel Blueprint
+    Editor, o la funzione lasciata vuota se serve solo come slot da
+    riempire in seguito.
+    """
+    blueprint = mcp_load_blueprint(blueprint_path)
+    graph = unreal.BlueprintEditorLibrary.add_function_graph(blueprint, func_name)
+    if graph is None:
+        raise ValueError("Impossibile creare la funzione '%s'." % func_name)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {"graph_name": graph.get_name()}
+
+
+# =================================================================== animazione
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31, su asset reali del progetto
+# (Remy_Skeleton, BS_Remy_Locomozione, Idle/Walking/Running). A differenza
+# dei grafi Blueprint/UMG (fasi 2-3), qui la scrittura funziona davvero: le
+# proprietà di BlendSpace (`BlendParameters`, `SampleData`) sono array di
+# struct ordinari, non protetti — creare un nuovo asset, riempirlo di
+# parametri e sample, salvare e ricaricarlo da zero mostra i dati persistiti.
+# L'AnimGraph di un Anim Blueprint resta invece un EdGraph come gli altri:
+# stesso muro di `ue_bp_add_event_override`, non trattato qui — questo modulo
+# crea solo l'asset (come `ue_create_widget_blueprint` per UMG).
+
+
+def mcp_skeleton_info(skeleton_path):
+    skeleton = mcp_asset_lib().load_asset(skeleton_path)
+    if skeleton is None:
+        raise ValueError("Skeleton '%s' non trovato." % skeleton_path)
+    pose = skeleton.get_reference_pose()
+    return {
+        "path": skeleton_path,
+        "bones": [str(b) for b in pose.get_bone_names()],
+        "sockets": [str(s) for s in pose.get_socket_names()],
+    }
+
+
+def mcp_anim_sequence_info(anim_path):
+    seq = mcp_asset_lib().load_asset(anim_path)
+    if seq is None:
+        raise ValueError("Animazione '%s' non trovata." % anim_path)
+    library = unreal.AnimationLibrary
+    return {
+        "path": anim_path,
+        "length_seconds": library.get_sequence_length(seq),
+        "num_frames": library.get_num_frames(seq),
+        "notify_track_names": [str(n) for n in library.get_animation_notify_track_names(seq)],
+        "notify_event_names": [str(n) for n in library.get_animation_notify_event_names(seq)],
+        "sync_marker_names": [str(n) for n in library.get_unique_marker_names(seq)],
+        "curve_names": [
+            str(n) for n in library.get_animation_curve_names(seq, unreal.RawCurveTrackTypes.RCT_FLOAT)
+        ],
+    }
+
+
+def mcp_create_blend_space_1d(
+    package_path, name, skeleton_path, axis_name="Speed", axis_min=0.0, axis_max=1.0,
+    grid_num=4, samples=None,
+):
+    """Crea un BlendSpace1D con un asse e, opzionalmente, i suoi sample.
+
+    `samples` è una lista di `{"value": float, "animation": path}`. Solo 1D
+    per ora: BlendSpace (2D) usa la stessa struttura dati ma non è stata
+    verificata dal vivo in questa fase.
+    """
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    skeleton = mcp_asset_lib().load_asset(skeleton_path)
+    if skeleton is None:
+        raise ValueError("Skeleton '%s' non trovato." % skeleton_path)
+
+    factory = unreal.BlendSpaceFactoryNew()
+    factory.set_editor_property("target_skeleton", skeleton)
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.BlendSpace1D, factory)
+    if asset is None:
+        raise RuntimeError("Creazione BlendSpace '%s' fallita." % full)
+
+    parametri = asset.get_editor_property("BlendParameters")
+    parametro = parametri[0]
+    parametro.set_editor_property("DisplayName", axis_name)
+    parametro.set_editor_property("Min", float(axis_min))
+    parametro.set_editor_property("Max", float(axis_max))
+    parametro.set_editor_property("GridNum", int(grid_num))
+    parametri[0] = parametro
+    asset.set_editor_property("BlendParameters", parametri)
+
+    aggiunti = []
+    for voce in samples or []:
+        anim = mcp_asset_lib().load_asset(voce["animation"])
+        if anim is None:
+            raise ValueError("Animazione '%s' non trovata." % voce["animation"])
+        campione = unreal.BlendSample()
+        campione.set_editor_property("Animation", anim)
+        campione.set_editor_property("SampleValue", unreal.Vector(float(voce["value"]), 0.0, 0.0))
+        aggiunti.append(campione)
+    if aggiunti:
+        asset.set_editor_property("SampleData", aggiunti)
+
+    mcp_asset_lib().save_asset(full)
+    return {
+        "path": full,
+        "created": True,
+        "axis": {
+            "name": axis_name,
+            "min": float(axis_min),
+            "max": float(axis_max),
+            "grid_num": int(grid_num),
+        },
+        "samples": len(aggiunti),
+    }
+
+
+def mcp_create_anim_montage(package_path, name, source_animation_path):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    source = mcp_asset_lib().load_asset(source_animation_path)
+    if source is None:
+        raise ValueError("Animazione '%s' non trovata." % source_animation_path)
+
+    factory = unreal.AnimMontageFactory()
+    factory.set_editor_property("source_animation", source)
+    factory.set_editor_property("target_skeleton", source.get_editor_property("skeleton"))
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.AnimMontage, factory)
+    if asset is None:
+        raise RuntimeError("Creazione AnimMontage '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+
+    library = unreal.AnimationLibrary
+    return {
+        "path": full,
+        "created": True,
+        "source_animation": source_animation_path,
+        "slot_names": [str(n) for n in library.get_montage_slot_names(asset)],
+    }
+
+
+def mcp_create_anim_blueprint(package_path, name, skeleton_path, parent_class="AnimInstance"):
+    """Crea l'asset Anim Blueprint. Il grafo (AnimGraph) non è raggiungibile
+    da qui: stesso limite del Blueprint graph, vedi il commento in cima a
+    questa sezione."""
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    skeleton = mcp_asset_lib().load_asset(skeleton_path)
+    if skeleton is None:
+        raise ValueError("Skeleton '%s' non trovato." % skeleton_path)
+    resolved_parent = mcp_resolve_class(parent_class)
+
+    factory = unreal.AnimBlueprintFactory()
+    factory.set_editor_property("target_skeleton", skeleton)
+    factory.set_editor_property("parent_class", resolved_parent)
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.AnimBlueprint, factory)
+    if asset is None:
+        raise RuntimeError("Creazione Anim Blueprint '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "skeleton": skeleton_path, "parent_class": parent_class}
+
+
+# ======================================================================= niagara
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31, anche su template popolati
+# della libreria di sistema (/Niagara/DefaultAssets/Templates/Systems/...).
+# `EmitterHandles` di `NiagaraSystem` è protetta esattamente come `Nodes` di
+# `EdGraph` e `WidgetTree`: niente aggiunta di emitter o moduli via Python.
+# `NiagaraFunctionLibrary.get_all_emitters`/`get_all_user_parameters` invece
+# funzionano davvero e sono a livello di ASSET, non di componente a runtime:
+# leggono un NiagaraSystem senza bisogno del PIE in esecuzione. Quindi:
+# creazione dell'asset vuoto sì, introspezione di un sistema esistente sì,
+# authoring dell'emitter stack no — stessa forma delle fasi 2 e 4.
+
+
+def mcp_create_niagara_system(package_path, name):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    factory = unreal.NiagaraSystemFactoryNew()
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.NiagaraSystem, factory)
+    if asset is None:
+        raise RuntimeError("Creazione Niagara System '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True}
+
+
+def mcp_niagara_system_info(system_path):
+    sistema = mcp_asset_lib().load_asset(system_path)
+    if sistema is None:
+        raise ValueError("Niagara System '%s' non trovato." % system_path)
+
+    library = unreal.NiagaraFunctionLibrary
+    emitter = [
+        {
+            "name": str(e.emitter_name),
+            "enabled": bool(e.is_enabled),
+            "lightweight": bool(e.is_lightweight),
+        }
+        for e in library.get_all_emitters(sistema)
+    ]
+    parametri = [
+        {"name": str(p.parameter_name), "type": str(p.type_name)}
+        for p in library.get_all_user_parameters(sistema)
+    ]
+    return {"path": system_path, "emitters": emitter, "user_parameters": parametri}
+
+
+# ======================================================================= gameplay
+#
+# Verificato dal vivo su UE 5.8 il 2026-07-31. Fisica/collisione: le funzioni
+# `set_simulate_physics`/`set_collision_enabled`/`set_collision_profile_name`
+# di `UPrimitiveComponent` sono UFUNCTION vere, non proprietà dirette (ecco
+# perché `SimulatePhysics` come `get/set_editor_property` fallisce con
+# "Failed to find property" — bisogna passare dai metodi). Il NavMesh è del
+# tutto scriptabile: piazzare un `NavMeshBoundsVolume` è già coperto da
+# `ue_spawn_actor` (nessun tool dedicato), un `RebuildNavigation` via console
+# command genera il navmesh, e `NavigationSystemV1` risponde a query di punti
+# raggiungibili e pathfinding sincrono senza bisogno del PIE.
+#
+# Blackboard e Behavior Tree rompono ulteriormente il pattern "i sistemi a
+# grafo sono protetti" scoperto nelle fasi 2/3/5: qui SONO scrivibili,
+# `RootNode`/`Children`/`Decorators`/`Services` compresi. La differenza è che
+# BT/Blackboard non hanno un vero editor a nodi K2-style sotto il cofano — i
+# nodi sono normali `UObject` referenziati da proprietà o array di struct
+# (`FBTCompositeChild`), non un `EdGraph`. EQS invece resta bloccato come
+# Blueprint/UMG/Niagara: `Options` di `EnvQuery` è protetta.
+#
+# Nota tecnica sugli struct: `Children` di un nodo composite è un
+# `TArray<FBTCompositeChild>` — struct per valore. Leggerlo con
+# `get_editor_property` restituisce COPIE: modificare un elemento (es.
+# aggiungere un decorator) richiede sempre riscrivere l'intero array sul nodo
+# genitore con `set_editor_property("Children", ...)`. I nodi stessi
+# (composite/task/decorator/service) sono `UObject` referenziati per
+# puntatore: modificarli direttamente persiste senza bisogno di riscrivere
+# nulla a monte, qualunque sia la profondità nell'albero.
+#
+# Le proprietà "bindable da blackboard" sui task (es. `BTTask_Wait.WaitTime`)
+# sono struct `FValueOrBBKey_*` con due campi: `key` (nome chiave blackboard,
+# se vuota si usa il valore fisso) e `default_value` (il valore fisso).
+# `mcp_bt_set_node_property` lo gestisce in automatico.
+#
+# AI Perception: il componente si aggiunge già con `ue_add_component`
+# generico (nessun tool dedicato). `SensesConfig` invece è `EditDefaultsOnly`
+# e la Python API rifiuta di scriverla su un'istanza spawnata ("cannot be
+# edited on instances"); scriverla sul component template del Blueprint
+# richiede un accesso all'oggetto template che non si è trovato in modo
+# affidabile (il subsystem dei subobject non espone un modo diretto per
+# risalire dall'handle all'oggetto, e il nome della proprietà sulla CDO non
+# corrisponde al nome dato al componente). Va configurato a mano nel pannello
+# Details del Blueprint, stessa categoria di limite di UMG/Blueprint graph.
+
+
+def mcp_component_physics_info(actor_label, component):
+    actor = mcp_require_actor(actor_label)
+    comp = mcp_find_component(actor, component)
+    return {
+        "actor": actor_label,
+        "component": component,
+        "simulate_physics": bool(comp.is_simulating_physics()),
+        "collision_enabled": str(comp.get_collision_enabled()),
+        "collision_profile": str(comp.get_collision_profile_name()),
+    }
+
+
+def _mcp_collision_enum(nome):
+    chiave = re.sub(r"(?<!^)(?=[A-Z])", "_", str(nome)).upper().replace("-", "_").replace(" ", "_")
+    chiave = re.sub(r"_+", "_", chiave)
+    if not hasattr(unreal.CollisionEnabled, chiave):
+        disponibili = sorted(m for m in dir(unreal.CollisionEnabled) if m.isupper())
+        raise ValueError(
+            "CollisionEnabled '%s' sconosciuto. Validi: %s" % (nome, ", ".join(disponibili))
+        )
+    return getattr(unreal.CollisionEnabled, chiave)
+
+
+def mcp_set_component_physics(
+    actor_label, component, simulate_physics=None, collision_enabled=None, collision_profile=None
+):
+    actor = mcp_require_actor(actor_label)
+    comp = mcp_find_component(actor, component)
+    applicato = {}
+    with mcp_transaction("MCP: fisica di %s/%s" % (actor_label, component)):
+        if simulate_physics is not None:
+            comp.set_simulate_physics(bool(simulate_physics))
+            applicato["simulate_physics"] = bool(simulate_physics)
+        if collision_profile is not None:
+            comp.set_collision_profile_name(collision_profile)
+            applicato["collision_profile"] = collision_profile
+        if collision_enabled is not None:
+            comp.set_collision_enabled(_mcp_collision_enum(collision_enabled))
+            applicato["collision_enabled"] = collision_enabled
+    return {
+        "actor": actor_label,
+        "component": component,
+        "applied": applicato,
+        "info": mcp_component_physics_info(actor_label, component),
+    }
+
+
+# -------------------------------------------------------------- navmesh
+
+
+def _mcp_nav_system():
+    subsys = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+    world = subsys.get_editor_world()
+    return world, unreal.NavigationSystemV1.get_navigation_system(world)
+
+
+def mcp_nav_rebuild():
+    """Rigenera il navmesh (equivalente al comando console `RebuildNavigation`).
+
+    Serve almeno un `NavMeshBoundsVolume` nel livello: piazzalo con
+    `ue_spawn_actor` (classe `NavMeshBoundsVolume`) prima di chiamare questo.
+    """
+    world, navsys = _mcp_nav_system()
+    unreal.SystemLibrary.execute_console_command(world, "RebuildNavigation")
+    return {"triggered": True, "is_building": bool(navsys.is_navigation_being_built(world))}
+
+
+def mcp_nav_query_point(origin, radius=500.0):
+    world, navsys = _mcp_nav_system()
+    punto = mcp_to_vector(origin)
+    reachable = navsys.get_random_reachable_point_in_radius(world, punto, float(radius))
+    return {
+        "origin": mcp_vec(punto),
+        "radius": float(radius),
+        "random_reachable_point": mcp_vec(reachable) if reachable else None,
+    }
+
+
+def mcp_nav_find_path(start, end):
+    world, navsys = _mcp_nav_system()
+    a = mcp_to_vector(start)
+    b = mcp_to_vector(end)
+    path = navsys.find_path_to_location_synchronously(world, a, b)
+    if path is None:
+        return {"found": False, "start": mcp_vec(a), "end": mcp_vec(b)}
+    return {
+        "found": True,
+        "start": mcp_vec(a),
+        "end": mcp_vec(b),
+        "is_valid": bool(path.is_valid()),
+        "is_partial": bool(path.is_partial()),
+        "path_points": [mcp_vec(p) for p in path.path_points],
+    }
+
+
+# -------------------------------------------------------------- blackboard
+
+
+_MCP_BLACKBOARD_KEY_TYPES = {
+    "object": "BlackboardKeyType_Object",
+    "class": "BlackboardKeyType_Class",
+    "bool": "BlackboardKeyType_Bool",
+    "int": "BlackboardKeyType_Int",
+    "float": "BlackboardKeyType_Float",
+    "string": "BlackboardKeyType_String",
+    "name": "BlackboardKeyType_Name",
+    "vector": "BlackboardKeyType_Vector",
+    "rotator": "BlackboardKeyType_Rotator",
+    "enum": "BlackboardKeyType_Enum",
+}
+
+
+def mcp_create_blackboard(package_path, name):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+    factory = unreal.BlackboardDataFactory()
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.BlackboardData, factory)
+    if asset is None:
+        raise RuntimeError("Creazione Blackboard '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True}
+
+
+def mcp_blackboard_add_key(blackboard_path, key_name, key_type="object"):
+    bb = mcp_asset_lib().load_asset(blackboard_path)
+    if bb is None:
+        raise ValueError("Blackboard '%s' non trovato." % blackboard_path)
+    nome_classe = _MCP_BLACKBOARD_KEY_TYPES.get(str(key_type).lower())
+    if nome_classe is None:
+        raise ValueError(
+            "Tipo chiave '%s' sconosciuto. Validi: %s"
+            % (key_type, ", ".join(sorted(_MCP_BLACKBOARD_KEY_TYPES)))
+        )
+    cls = mcp_resolve_class(nome_classe)
+    key_type_obj = unreal.new_object(cls, outer=bb)
+    entry = unreal.BlackboardEntry()
+    entry.set_editor_property("EntryName", key_name)
+    entry.set_editor_property("KeyType", key_type_obj)
+
+    keys = list(bb.get_editor_property("Keys"))
+    keys.append(entry)
+    bb.set_editor_property("Keys", keys)
+    mcp_asset_lib().save_asset(blackboard_path)
+    return mcp_blackboard_info(blackboard_path)
+
+
+def mcp_blackboard_info(blackboard_path):
+    bb = mcp_asset_lib().load_asset(blackboard_path)
+    if bb is None:
+        raise ValueError("Blackboard '%s' non trovato." % blackboard_path)
+    chiavi = [
+        {
+            "name": str(k.get_editor_property("EntryName")),
+            "type": str(k.get_editor_property("KeyType").get_class().get_name()),
+        }
+        for k in bb.get_editor_property("Keys")
+    ]
+    return {"path": blackboard_path, "keys": chiavi}
+
+
+# -------------------------------------------------------------- behavior tree
+
+
+def _mcp_bt_resolve_node(bt, path):
+    """Risolve un path tipo 'root', '0', '0.1' in un nodo (composite o task).
+
+    Ogni pezzo del path (separato da '.') è l'indice del figlio nell'array
+    `Children` del nodo composite corrente, a partire dal `RootNode`.
+    """
+    root = bt.get_editor_property("RootNode")
+    if root is None:
+        raise ValueError("Il Behavior Tree non ha ancora un RootNode (usa mcp_create_behavior_tree).")
+    if path in (None, "", "root"):
+        return root
+    nodo = root
+    for pezzo in str(path).split("."):
+        idx = int(pezzo)
+        figli = nodo.get_editor_property("Children")
+        if idx >= len(figli):
+            raise ValueError(
+                "Path '%s': indice %d fuori range (figli disponibili: %d)." % (path, idx, len(figli))
+            )
+        link = figli[idx]
+        figlio = link.get_editor_property("ChildComposite") or link.get_editor_property("ChildTask")
+        if figlio is None:
+            raise ValueError("Path '%s': il ramo %d è vuoto." % (path, idx))
+        nodo = figlio
+    return nodo
+
+
+def _mcp_bt_parent_and_index(bt, path):
+    """Risolve il nodo composite genitore e l'indice del figlio indicato
+    dall'ultimo pezzo del path. Serve per le operazioni sul child link
+    (decorator, inserimento figli): il path non può essere 'root', perché la
+    radice non ha un child link proprio (non è figlia di nessuno)."""
+    if path in (None, "", "root"):
+        raise ValueError("Serve un path a un nodo figlio (es. '0', '0.1'), non 'root'.")
+    pezzi = str(path).split(".")
+    parent_path = ".".join(pezzi[:-1])
+    parent = _mcp_bt_resolve_node(bt, parent_path)
+    idx = int(pezzi[-1])
+    figli = parent.get_editor_property("Children")
+    if idx >= len(figli):
+        raise ValueError("Path '%s': indice %d fuori range (figli disponibili: %d)." % (path, idx, len(figli)))
+    return parent, idx
+
+
+def mcp_create_behavior_tree(package_path, name, blackboard_path=None, root_composite="BTComposite_Selector"):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    factory = unreal.BehaviorTreeFactory()
+    bt = mcp_asset_tools().create_asset(name, package_path, unreal.BehaviorTree, factory)
+    if bt is None:
+        raise RuntimeError("Creazione Behavior Tree '%s' fallita." % full)
+
+    if blackboard_path:
+        bb = mcp_asset_lib().load_asset(blackboard_path)
+        if bb is None:
+            raise ValueError("Blackboard '%s' non trovato." % blackboard_path)
+        bt.set_editor_property("BlackboardAsset", bb)
+
+    cls = mcp_resolve_class(root_composite)
+    root = unreal.new_object(cls, outer=bt)
+    bt.set_editor_property("RootNode", root)
+
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "blackboard": blackboard_path, "root_composite": root_composite}
+
+
+def mcp_bt_add_node(bt_path, parent_path, node_class, index=None):
+    """Aggiunge un nodo (composite o task, dedotto dalla classe base) come
+    figlio del composite trovato a `parent_path` ('root' per la radice).
+    Restituisce il path del nodo appena creato, da riusare nelle chiamate
+    successive (decorator, service, set_node_property, figli annidati)."""
+    bt = mcp_asset_lib().load_asset(bt_path)
+    if bt is None:
+        raise ValueError("Behavior Tree '%s' non trovato." % bt_path)
+
+    genitore = _mcp_bt_resolve_node(bt, parent_path)
+    if not isinstance(genitore, unreal.BTCompositeNode):
+        raise ValueError("Path '%s' non è un nodo composite: non può avere figli." % parent_path)
+
+    cls = mcp_resolve_class(node_class)
+    nuovo_nodo = unreal.new_object(cls, outer=bt)
+
+    link = unreal.BTCompositeChild()
+    if isinstance(nuovo_nodo, unreal.BTCompositeNode):
+        link.set_editor_property("ChildComposite", nuovo_nodo)
+    else:
+        link.set_editor_property("ChildTask", nuovo_nodo)
+
+    figli = list(genitore.get_editor_property("Children"))
+    if index is None or int(index) >= len(figli):
+        figli.append(link)
+        nuovo_indice = len(figli) - 1
+    else:
+        nuovo_indice = int(index)
+        figli.insert(nuovo_indice, link)
+    genitore.set_editor_property("Children", figli)
+    mcp_asset_lib().save_asset(bt_path)
+
+    prefisso = "" if parent_path in (None, "", "root") else str(parent_path)
+    nuovo_path = ("%s.%d" % (prefisso, nuovo_indice)) if prefisso else str(nuovo_indice)
+    return {"path": bt_path, "node_path": nuovo_path, "node_class": node_class}
+
+
+def mcp_bt_add_decorator(bt_path, node_path, decorator_class):
+    bt = mcp_asset_lib().load_asset(bt_path)
+    if bt is None:
+        raise ValueError("Behavior Tree '%s' non trovato." % bt_path)
+    genitore, idx = _mcp_bt_parent_and_index(bt, node_path)
+    cls = mcp_resolve_class(decorator_class)
+    dec = unreal.new_object(cls, outer=bt)
+
+    figli = list(genitore.get_editor_property("Children"))
+    link = figli[idx]
+    decoratori = list(link.get_editor_property("Decorators"))
+    decoratori.append(dec)
+    link.set_editor_property("Decorators", decoratori)
+    figli[idx] = link
+    genitore.set_editor_property("Children", figli)
+    mcp_asset_lib().save_asset(bt_path)
+    return {
+        "path": bt_path,
+        "node_path": node_path,
+        "decorator_class": decorator_class,
+        "decorator_count": len(decoratori),
+    }
+
+
+def mcp_bt_add_service(bt_path, node_path, service_class):
+    """I service vanno solo su nodi composite (Selector/Sequence): sui task
+    la proprietà `Services` è protetta (verificato dal vivo)."""
+    bt = mcp_asset_lib().load_asset(bt_path)
+    if bt is None:
+        raise ValueError("Behavior Tree '%s' non trovato." % bt_path)
+    nodo = _mcp_bt_resolve_node(bt, node_path)
+    if not isinstance(nodo, unreal.BTCompositeNode):
+        raise ValueError(
+            "Path '%s' non è un nodo composite: i service vanno solo su Selector/Sequence." % node_path
+        )
+    cls = mcp_resolve_class(service_class)
+    svc = unreal.new_object(cls, outer=bt)
+
+    servizi = list(nodo.get_editor_property("Services"))
+    servizi.append(svc)
+    nodo.set_editor_property("Services", servizi)
+    mcp_asset_lib().save_asset(bt_path)
+    return {"path": bt_path, "node_path": node_path, "service_class": service_class, "service_count": len(servizi)}
+
+
+def mcp_bt_set_node_property(bt_path, node_path, property_name, value):
+    """Imposta una proprietà su un nodo (composite o task) trovato per path.
+
+    Gestisce in automatico i campi bindable da blackboard (struct
+    `FValueOrBBKey_*`, es. `BTTask_Wait.WaitTime`): se la proprietà corrente è
+    uno di questi struct, scrive in `default_value` invece di sostituire
+    l'intero struct.
+    """
+    bt = mcp_asset_lib().load_asset(bt_path)
+    if bt is None:
+        raise ValueError("Behavior Tree '%s' non trovato." % bt_path)
+    nodo = _mcp_bt_resolve_node(bt, node_path)
+
+    valore_attuale = nodo.get_editor_property(property_name)
+    nome_tipo = type(valore_attuale).__name__
+    if hasattr(valore_attuale, "set_editor_property"):
+        if nome_tipo.startswith("ValueOrBBKey_"):
+            valore_attuale.set_editor_property("default_value", mcp_coerce_value(value))
+            nodo.set_editor_property(property_name, valore_attuale)
+            mcp_asset_lib().save_asset(bt_path)
+            return {
+                "path": bt_path,
+                "node_path": node_path,
+                "property": property_name,
+                "applied": value,
+                "via": "default_value",
+            }
+
+    nodo.set_editor_property(property_name, mcp_coerce_value(value))
+    mcp_asset_lib().save_asset(bt_path)
+    return {"path": bt_path, "node_path": node_path, "property": property_name, "applied": value}
+
+
+def mcp_bt_info(bt_path):
+    bt = mcp_asset_lib().load_asset(bt_path)
+    if bt is None:
+        raise ValueError("Behavior Tree '%s' non trovato." % bt_path)
+
+    def _dump(nodo, path):
+        if nodo is None:
+            return None
+        info = {"path": path, "class": str(nodo.get_class().get_name())}
+        if isinstance(nodo, unreal.BTCompositeNode):
+            try:
+                info["services"] = [str(s.get_class().get_name()) for s in nodo.get_editor_property("Services")]
+            except Exception:  # noqa: BLE001
+                info["services"] = []
+            figli = []
+            for i, link in enumerate(nodo.get_editor_property("Children")):
+                sotto = link.get_editor_property("ChildComposite") or link.get_editor_property("ChildTask")
+                sotto_path = "%s.%d" % (path, i) if path else str(i)
+                nodo_info = _dump(sotto, sotto_path)
+                if nodo_info is not None:
+                    try:
+                        nodo_info["decorators"] = [
+                            str(d.get_class().get_name()) for d in link.get_editor_property("Decorators")
+                        ]
+                    except Exception:  # noqa: BLE001
+                        nodo_info["decorators"] = []
+                figli.append(nodo_info)
+            info["children"] = figli
+        return info
+
+    root = bt.get_editor_property("RootNode")
+    blackboard = bt.get_editor_property("BlackboardAsset")
+    return {
+        "path": bt_path,
+        "blackboard": str(blackboard.get_path_name()) if blackboard else None,
+        "root": _dump(root, ""),
+    }
+
+
+# -------------------------------------------------------------- EQS
+
+
+def mcp_create_eqs_asset(package_path, name):
+    """Crea solo l'asset EQS vuoto. `Options` di `EnvQuery` è protetta nella
+    Python API (stesso muro di WidgetTree/EdGraph/EmitterHandles, verificato
+    dal vivo) — nessuna query configurabile via script, solo authoring a mano
+    nell'editor EQS."""
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+    factory = unreal.EnvironmentQueryFactory()
+    asset = mcp_asset_tools().create_asset(name, package_path, unreal.EnvQuery, factory)
+    if asset is None:
+        raise RuntimeError("Creazione EQS '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True}
+
+
+# ======================================================================= GAS
+#
+# Investigato dal vivo su UE 5.8 il 31/07/2026. Il plugin GameplayAbilities
+# non era abilitato di default sul progetto: va abilitato con
+# `ue_project_set_plugins` e l'editor va riavviato prima che queste classi
+# esistano in Python.
+#
+# GameplayEffect e AttributeSet sono Blueprintable "normali": si creano già
+# con `ue_create_blueprint` generico (`parent_class="GameplayEffect"` o
+# `"AttributeSet"`), nessun tool dedicato serve per quello. GameplayAbility
+# invece ha un asset dedicato (`GameplayAbilityBlueprint`, non `Blueprint`
+# semplice) che richiede `GameplayAbilitiesBlueprintFactory` — da qui
+# `mcp_create_gameplay_ability`. Aggiungere un attributo (`GameplayAttributeData`)
+# a un AttributeSet funziona già con `ue_add_variable` passando il path
+# completo dello struct come `sub_type`
+# (`/Script/GameplayAbilities.GameplayAttributeData`) — non è nella whitelist
+# di nomi corti di `MCP_STRUCT_PATHS`, va il path per esteso.
+#
+# **Il muro e come è stato aggirato**: `FGameplayModifierInfo.Attribute`/
+# `.ModifierOp` e `FGameplayAttribute.AttributeName` rifiutano
+# `set_editor_property` ("cannot be edited on instances" / read-only) — la
+# via normale per costruire un modifier via Python è bloccata. Aggirato con
+# `import_text` sull'INTERO struct `GameplayModifierInfo` in una volta sola,
+# stessa tecnica già in uso in questo file per `EdGraphPinType`: il parser
+# testuale non passa dalla stessa restrizione della reflection a singola
+# proprietà. Verificato dal vivo end-to-end: costruito un modifier
+# (`Attribute` che punta a un attributo reale di un AttributeSet Blueprint,
+# `ModifierOp=AddBase`, `ScalableFloatMagnitude.Value=25`), aggiunto
+# all'array `Modifiers` di un GameplayEffect, salvato l'asset, ricaricato da
+# zero — il modifier era davvero lì con tutti i valori. Il campo `Attribute`
+# interno (il puntatore FProperty vero) resta vuoto nell'export testuale
+# anche dopo il roundtrip: sembra normale per come funziona
+# `FGameplayAttribute` (la risoluzione avviene a runtime via
+# `AttributeName`+`AttributeOwner`, non da un puntatore serializzato) ma
+# **non è stato verificato in PIE** — solo la persistenza sull'asset, non il
+# comportamento a runtime.
+#
+# I nomi corti accettati per `modifier_op` sono alias della sintassi
+# testuale interna (`AddBase`, `AddFinal`, `MultiplyAdditive`,
+# `DivideAdditive`, `MultiplyCompound`, `Override`), non i nomi dei membri
+# dell'enum Python (`ADD_BASE` ecc.), perché passano per `import_text` e non
+# per `set_editor_property`.
+
+
+def _mcp_gas_enum_member(enum_type, nome):
+    """Converte un nome amichevole (es. 'instanced_per_actor') nel membro
+    reale dell'enum Python (es. `INSTANCED_PER_ACTOR`)."""
+    chiave = re.sub(r"(?<!^)(?=[A-Z])", "_", str(nome)).upper().replace("-", "_").replace(" ", "_")
+    chiave = re.sub(r"_+", "_", chiave)
+    if not hasattr(enum_type, chiave):
+        disponibili = sorted(m for m in dir(enum_type) if m.isupper())
+        raise ValueError("Valore '%s' sconosciuto. Validi: %s" % (nome, ", ".join(disponibili)))
+    return getattr(enum_type, chiave)
+
+
+#: Alias amichevoli -> sintassi testuale interna di EGameplayModOp, per
+#: `import_text` (bypassa il muro di ModifierInfo, vedi commento sopra).
+_MCP_MODIFIER_OP_TEXT = {
+    "add": "AddBase",
+    "additive": "AddBase",
+    "addbase": "AddBase",
+    "add_base": "AddBase",
+    "addfinal": "AddFinal",
+    "add_final": "AddFinal",
+    "multiply": "MultiplyAdditive",
+    "multiplyadditive": "MultiplyAdditive",
+    "multiply_additive": "MultiplyAdditive",
+    "divide": "DivideAdditive",
+    "divideadditive": "DivideAdditive",
+    "divide_additive": "DivideAdditive",
+    "multiplycompound": "MultiplyCompound",
+    "multiply_compound": "MultiplyCompound",
+    "override": "Override",
+}
+
+
+def mcp_create_gameplay_ability(package_path, name, instancing_policy=None, net_execution_policy=None):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    factory = unreal.GameplayAbilitiesBlueprintFactory()
+    bp = mcp_asset_tools().create_asset(name, package_path, unreal.GameplayAbilityBlueprint, factory)
+    if bp is None:
+        raise RuntimeError("Creazione GameplayAbility '%s' fallita." % full)
+
+    cdo = unreal.get_default_object(bp.generated_class())
+    applicato = {}
+    if instancing_policy:
+        cdo.set_editor_property(
+            "InstancingPolicy",
+            _mcp_gas_enum_member(unreal.GameplayAbilityInstancingPolicy, instancing_policy),
+        )
+        applicato["instancing_policy"] = instancing_policy
+    if net_execution_policy:
+        cdo.set_editor_property(
+            "NetExecutionPolicy",
+            _mcp_gas_enum_member(unreal.GameplayAbilityNetExecutionPolicy, net_execution_policy),
+        )
+        applicato["net_execution_policy"] = net_execution_policy
+
+    unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "applied": applicato}
+
+
+def mcp_create_gameplay_effect(package_path, name, duration_policy=None, period=None):
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    factory = unreal.BlueprintFactory()
+    factory.set_editor_property("parent_class", unreal.GameplayEffect)
+    bp = mcp_asset_tools().create_asset(name, package_path, unreal.Blueprint, factory)
+    if bp is None:
+        raise RuntimeError("Creazione GameplayEffect '%s' fallita." % full)
+
+    cdo = unreal.get_default_object(bp.generated_class())
+    applicato = {}
+    if duration_policy:
+        cdo.set_editor_property(
+            "DurationPolicy", _mcp_gas_enum_member(unreal.GameplayEffectDurationType, duration_policy)
+        )
+        applicato["duration_policy"] = duration_policy
+    if period is not None:
+        periodo = cdo.get_editor_property("Period")
+        periodo.set_editor_property("Value", float(period))
+        cdo.set_editor_property("Period", periodo)
+        applicato["period"] = period
+
+    unreal.BlueprintEditorLibrary.compile_blueprint(bp)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "applied": applicato}
+
+
+def _mcp_gas_attribute_owner_path(attribute_set_path):
+    bp = mcp_asset_lib().load_asset(attribute_set_path)
+    if bp is None:
+        raise ValueError("AttributeSet '%s' non trovato." % attribute_set_path)
+    return bp.generated_class().get_path_name()
+
+
+def mcp_ge_add_modifier(ge_path, attribute_set_path, attribute_name, modifier_op, magnitude):
+    """Aggiunge un modifier a un GameplayEffect: collega un attributo di un
+    AttributeSet Blueprint esistente, un'operazione e un valore fisso
+    (ScalableFloat, niente curve/attribute-based magnitude per ora).
+
+    Aggira il muro descritto in cima al file costruendo l'intero struct
+    `GameplayModifierInfo` via `import_text`.
+    """
+    ge = mcp_load_blueprint(ge_path)
+    cdo = unreal.get_default_object(ge.generated_class())
+
+    owner_path = _mcp_gas_attribute_owner_path(attribute_set_path)
+    chiave_op = str(modifier_op).lower().replace("_", "").replace(" ", "").replace("-", "")
+    op_testo = _MCP_MODIFIER_OP_TEXT.get(chiave_op)
+    if op_testo is None:
+        raise ValueError(
+            "modifier_op '%s' sconosciuto. Validi: add, add_final, multiply, divide, "
+            "multiply_compound, override." % modifier_op
+        )
+
+    mod = unreal.GameplayModifierInfo()
+    testo = (
+        "(ModifierOp=%s,"
+        "ModifierMagnitude=(MagnitudeCalculationType=ScalableFloat,ScalableFloatMagnitude=(Value=%f)),"
+        'Attribute=(AttributeName="%s",AttributeOwner="%s"))'
+    ) % (op_testo, float(magnitude), attribute_name, owner_path)
+    if not mod.import_text(testo):
+        raise RuntimeError("import_text ha rifiutato il modifier costruito: %s" % testo)
+
+    modificatori = list(cdo.get_editor_property("Modifiers"))
+    modificatori.append(mod)
+    cdo.set_editor_property("Modifiers", modificatori)
+    mcp_asset_lib().save_asset(ge_path)
+    return mcp_ge_info(ge_path)
+
+
+def mcp_ge_add_component(ge_path, component_class):
+    """Aggiunge un `GameplayEffectComponent` (es. `AssetTagsGameplayEffectComponent`,
+    `TargetTagRequirementsGameplayEffectComponent`, `ChanceToApplyGameplayEffectComponent`)
+    a un GameplayEffect. Solo l'aggiunta: configurare i tag/condizioni al suo
+    interno va fatto con `ue_exec_python` o a mano nell'editor — non
+    verificato quali sotto-proprietà sono scrivibili caso per caso."""
+    ge = mcp_load_blueprint(ge_path)
+    cdo = unreal.get_default_object(ge.generated_class())
+
+    cls = mcp_resolve_class(component_class)
+    comp = unreal.new_object(cls, outer=cdo)
+
+    componenti = list(cdo.get_editor_property("GEComponents"))
+    componenti.append(comp)
+    cdo.set_editor_property("GEComponents", componenti)
+    mcp_asset_lib().save_asset(ge_path)
+    return {
+        "path": ge_path,
+        "component_class": component_class,
+        "ge_components": [str(c.get_class().get_name()) for c in cdo.get_editor_property("GEComponents")],
+    }
+
+
+def mcp_ge_info(ge_path):
+    ge = mcp_load_blueprint(ge_path)
+    cdo = unreal.get_default_object(ge.generated_class())
+
+    modificatori = []
+    for m in cdo.get_editor_property("Modifiers"):
+        attr = m.get_editor_property("Attribute")
+        proprietario = attr.get_editor_property("AttributeOwner")
+        magnitudine = m.get_editor_property("ModifierMagnitude").get_editor_property("ScalableFloatMagnitude")
+        modificatori.append(
+            {
+                "attribute_name": str(attr.get_editor_property("AttributeName")),
+                "attribute_owner": proprietario.get_path_name() if proprietario else None,
+                "modifier_op": str(m.get_editor_property("ModifierOp")),
+                "magnitude": float(magnitudine.get_editor_property("Value")),
+            }
+        )
+
+    periodo = cdo.get_editor_property("Period")
+    componenti = [str(c.get_class().get_name()) for c in cdo.get_editor_property("GEComponents")]
+    return {
+        "path": ge_path,
+        "duration_policy": str(cdo.get_editor_property("DurationPolicy")),
+        "period": float(periodo.get_editor_property("Value")),
+        "modifiers": modificatori,
+        "ge_components": componenti,
+    }
+
+
+# ===================================================================== landscape
+#
+# Fase 9, verificata dal vivo su UE 5.8 il 2026-07-31 — ed è la fase più
+# ridimensionata di tutte.
+#
+# **Creare** un landscape da Python non si può: `spawn_actor_from_class(
+# unreal.Landscape, ...)` non produce un terreno ma un `LandscapePlaceholder`
+# vuoto (nessun componente, nessun target layer, nemmeno i metodi di
+# `ALandscape`). Le classi che lo creano davvero — `ULandscapeSubsystem`,
+# `ULandscapeEditorObject`, `UActorFactoryLandscape` — esistono nel motore
+# (trovate con `ClassIterator`) ma non sono esposte al Python di UE:
+# `hasattr(unreal, "LandscapeSubsystem")` è False. Il landscape va creato a
+# mano con il Landscape Mode dell'editor; da lì in poi tutto il resto è
+# scriptabile.
+#
+# Su un landscape **esistente** funzionano: heightmap in ingresso e in
+# uscita, weightmap dei layer di pittura, materiale, grass, e la lettura di
+# target layer / edit layer. Il ponte fra un file immagine e il landscape è
+# un `TextureRenderTarget2D` transitorio: `import_file_as_texture2d` →
+# `begin_draw_canvas_to_render_target` → `Canvas.draw_texture` →
+# `landscape_import_heightmap_from_render_target`. Questa catena è verificata
+# dal vivo fino al render target compreso (PNG 64×64 a gradiente riletto
+# pixel per pixel dal RT con i valori giusti); l'ultimo anello — la chiamata
+# sul landscape — **non è verificato**, perché in quattroCantoni non esiste
+# nessun landscape su cui provarlo e Python non può crearne uno.
+
+
+def _mcp_mondo_editor():
+    return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+
+
+#: Formati di render target accettati dai tool di landscape.
+MCP_RT_FORMATS = {
+    "rgba8": "RTF_RGBA8",
+    "rgba16f": "RTF_RGBA16f",
+    "rgba32f": "RTF_RGBA32f",
+    "r8": "RTF_R8",
+    "r16f": "RTF_R16f",
+    "r32f": "RTF_R32f",
+}
+
+
+def _mcp_rt_format(nome):
+    chiave = str(nome).lower().replace("_", "").replace("-", "")
+    chiave = chiave[3:] if chiave.startswith("rtf") else chiave
+    membro = MCP_RT_FORMATS.get(chiave)
+    if membro is None:
+        raise ValueError(
+            "Formato render target '%s' sconosciuto. Validi: %s"
+            % (nome, ", ".join(sorted(MCP_RT_FORMATS)))
+        )
+    return getattr(unreal.TextureRenderTargetFormat, membro)
+
+
+def mcp_landscape_list():
+    """I landscape presenti nel livello corrente.
+
+    Se è vuota, il livello non ha terreni: nessun tool di questa sezione ha
+    qualcosa su cui lavorare, e crearne uno va fatto dall'editor (Landscape
+    Mode) perché Python non può.
+    """
+    trovati = []
+    for attore in mcp_actor_subsystem().get_all_level_actors():
+        if not isinstance(attore, unreal.LandscapeProxy):
+            continue
+        trovati.append(
+            {
+                "label": str(attore.get_actor_label()),
+                "class": str(attore.get_class().get_name()),
+                "location": mcp_vec(attore.get_actor_location()),
+                "components": len(attore.get_components_by_class(unreal.LandscapeComponent)),
+            }
+        )
+    return {"landscapes": trovati, "count": len(trovati)}
+
+
+def mcp_require_landscape(label=None):
+    """Il landscape indicato, o l'unico presente se il livello ne ha uno solo."""
+    landscape = [
+        a for a in mcp_actor_subsystem().get_all_level_actors() if isinstance(a, unreal.LandscapeProxy)
+    ]
+    if not landscape:
+        raise ValueError(
+            "Nessun landscape nel livello corrente. Python non può crearne uno: "
+            "va aggiunto dall'editor con Landscape Mode."
+        )
+    if label is None:
+        if len(landscape) > 1:
+            raise ValueError(
+                "Nel livello ci sono più landscape (%s): indica quale con `label`."
+                % ", ".join(str(a.get_actor_label()) for a in landscape)
+            )
+        return landscape[0]
+    for attore in landscape:
+        if str(attore.get_actor_label()) == str(label):
+            return attore
+    raise ValueError(
+        "Landscape '%s' non trovato. Presenti: %s"
+        % (label, ", ".join(str(a.get_actor_label()) for a in landscape))
+    )
+
+
+def mcp_landscape_info(label=None):
+    """Componenti, materiale, target layer (pittura) ed edit layer di un landscape."""
+    landscape = mcp_require_landscape(label)
+    componenti = landscape.get_components_by_class(unreal.LandscapeComponent)
+
+    info = {
+        "label": str(landscape.get_actor_label()),
+        "class": str(landscape.get_class().get_name()),
+        "location": mcp_vec(landscape.get_actor_location()),
+        "scale": mcp_vec(landscape.get_actor_scale3d()),
+        "components": len(componenti),
+    }
+
+    materiale = landscape.get_editor_property("landscape_material")
+    info["material"] = materiale.get_path_name() if materiale else None
+
+    for chiave, proprieta in (
+        ("component_size_quads", "component_size_quads"),
+        ("subsection_size_quads", "subsection_size_quads"),
+        ("num_subsections", "num_subsections"),
+    ):
+        try:
+            info[chiave] = int(landscape.get_editor_property(proprieta))
+        except Exception:  # noqa: BLE001
+            info[chiave] = None
+
+    # `get_target_layer_names` e `get_edit_layers_bp` esistono solo su ALandscape,
+    # non su ALandscapeStreamingProxy: chi ha solo un proxy vede meno cose.
+    if hasattr(landscape, "get_target_layer_names"):
+        info["target_layers"] = [str(n) for n in landscape.get_target_layer_names()]
+    if hasattr(landscape, "get_edit_layers_bp"):
+        info["edit_layers"] = [str(x) for x in landscape.get_edit_layers_bp()]
+    if hasattr(landscape, "get_grass_enabled"):
+        info["grass_enabled"] = bool(landscape.get_grass_enabled())
+    return info
+
+
+def mcp_render_target_from_image(image_path, width=None, height=None, rt_format="RGBA8"):
+    """Carica un'immagine dal disco in un render target transitorio.
+
+    È il ponte fra un file heightmap/weightmap e le API di landscape, che
+    accettano solo `TextureRenderTarget2D`. Verificato dal vivo: un PNG a
+    gradiente riletto dal render target restituisce i valori attesi pixel per
+    pixel.
+    """
+    if not os.path.isfile(image_path):
+        raise ValueError("File immagine '%s' inesistente." % image_path)
+
+    mondo = _mcp_mondo_editor()
+    texture = unreal.RenderingLibrary.import_file_as_texture2d(mondo, image_path)
+    if texture is None:
+        raise RuntimeError(
+            "Unreal non è riuscito a importare '%s' come texture (formati tipici: "
+            "PNG, EXR, TGA)." % image_path
+        )
+
+    larghezza = int(width or texture.blueprint_get_size_x())
+    altezza = int(height or texture.blueprint_get_size_y())
+    render_target = unreal.RenderingLibrary.create_render_target2d(
+        mondo, larghezza, altezza, _mcp_rt_format(rt_format)
+    )
+    if render_target is None:
+        raise RuntimeError("Creazione del render target %dx%d fallita." % (larghezza, altezza))
+
+    canvas, _dimensione, contesto = unreal.RenderingLibrary.begin_draw_canvas_to_render_target(
+        mondo, render_target
+    )
+    if canvas is None:
+        unreal.RenderingLibrary.end_draw_canvas_to_render_target(mondo, contesto)
+        raise RuntimeError("Canvas non disponibile sul render target.")
+    try:
+        canvas.draw_texture(
+            texture,
+            unreal.Vector2D(0.0, 0.0),
+            unreal.Vector2D(float(larghezza), float(altezza)),
+            unreal.Vector2D(0.0, 0.0),
+            unreal.Vector2D(1.0, 1.0),
+        )
+    finally:
+        unreal.RenderingLibrary.end_draw_canvas_to_render_target(mondo, contesto)
+
+    return render_target, {
+        "image": image_path,
+        "width": larghezza,
+        "height": altezza,
+        "format": str(rt_format),
+    }
+
+
+def mcp_landscape_import_heightmap(image_path, label=None, rt_format="RGBA8", from_rg_channel=False):
+    """Sovrascrive l'heightmap di un landscape con un'immagine dal disco."""
+    landscape = mcp_require_landscape(label)
+    render_target, dettagli = mcp_render_target_from_image(image_path, rt_format=rt_format)
+
+    with mcp_transaction("MCP: heightmap di %s" % landscape.get_actor_label()):
+        esito = landscape.landscape_import_heightmap_from_render_target(
+            render_target, bool(from_rg_channel)
+        )
+    if not esito:
+        raise RuntimeError(
+            "Unreal ha rifiutato l'import dell'heightmap. Cause tipiche: il "
+            "render target non copre la risoluzione del landscape, o il "
+            "formato non è fra RTF_RGBA8/RGBA16f/RGBA32f."
+        )
+    return {
+        "landscape": str(landscape.get_actor_label()),
+        "imported": True,
+        "source": dettagli,
+        "from_rg_channel": bool(from_rg_channel),
+    }
+
+
+def mcp_landscape_import_weightmap(layer_name, image_path, label=None, rt_format="RGBA8"):
+    """Sovrascrive il weightmap di un layer di pittura con un'immagine.
+
+    Il layer deve già esistere sul landscape (`target_layers` in
+    `mcp_landscape_info`): i target layer nascono dal materiale del
+    landscape, non si creano da qui.
+    """
+    landscape = mcp_require_landscape(label)
+    if hasattr(landscape, "get_target_layer_names"):
+        disponibili = [str(n) for n in landscape.get_target_layer_names()]
+        if disponibili and str(layer_name) not in disponibili:
+            raise ValueError(
+                "Layer '%s' non presente sul landscape. Disponibili: %s"
+                % (layer_name, ", ".join(disponibili))
+            )
+
+    render_target, dettagli = mcp_render_target_from_image(image_path, rt_format=rt_format)
+    with mcp_transaction("MCP: weightmap %s" % layer_name):
+        esito = landscape.landscape_import_weightmap_from_render_target(
+            render_target, unreal.Name(str(layer_name))
+        )
+    if not esito:
+        raise RuntimeError("Unreal ha rifiutato l'import del weightmap '%s'." % layer_name)
+    return {
+        "landscape": str(landscape.get_actor_label()),
+        "layer": str(layer_name),
+        "imported": True,
+        "source": dettagli,
+    }
+
+
+def mcp_landscape_export_heightmap(
+    output_dir, file_name, label=None, resolution=1024, rt_format="RGBA8", into_rg_channel=False
+):
+    """Esporta l'heightmap del landscape come immagine sul disco.
+
+    Il formato del file lo decide il render target: RTF_RGBA8 esce in PNG,
+    i formati float in HDR.
+    """
+    landscape = mcp_require_landscape(label)
+    mondo = _mcp_mondo_editor()
+    lato = int(resolution)
+    render_target = unreal.RenderingLibrary.create_render_target2d(
+        mondo, lato, lato, _mcp_rt_format(rt_format)
+    )
+    esito = landscape.landscape_export_heightmap_to_render_target(
+        render_target, bool(into_rg_channel), True
+    )
+    if not esito:
+        raise RuntimeError("Unreal ha rifiutato l'export dell'heightmap.")
+
+    unreal.RenderingLibrary.export_render_target(mondo, render_target, output_dir, file_name)
+    return {
+        "landscape": str(landscape.get_actor_label()),
+        "file": os.path.join(output_dir, file_name),
+        "resolution": lato,
+        "format": str(rt_format),
+    }
+
+
+def mcp_landscape_set_material(material_path, label=None):
+    """Assegna il materiale a un landscape (definisce anche i suoi target layer)."""
+    landscape = mcp_require_landscape(label)
+    materiale = mcp_asset_lib().load_asset(material_path)
+    if materiale is None:
+        raise ValueError("Materiale '%s' non trovato." % material_path)
+
+    with mcp_transaction("MCP: materiale di %s" % landscape.get_actor_label()):
+        landscape.set_editor_property("landscape_material", materiale)
+    return mcp_landscape_info(str(landscape.get_actor_label()))
+
+
+def mcp_landscape_set_grass(enabled=True, label=None):
+    """Accende o spegne il grass system del landscape (foliage procedurale)."""
+    landscape = mcp_require_landscape(label)
+    if not hasattr(landscape, "set_grass_enabled"):
+        raise RuntimeError(
+            "'%s' è un %s: il grass si comanda dall'attore Landscape principale."
+            % (landscape.get_actor_label(), landscape.get_class().get_name())
+        )
+    landscape.set_grass_enabled(bool(enabled))
+    return {
+        "landscape": str(landscape.get_actor_label()),
+        "grass_enabled": bool(landscape.get_grass_enabled()),
+    }
+
+
+# =========================================================================== PCG
+#
+# Fase 10, verificata dal vivo su UE 5.8 il 2026-07-31 — ed è la sorpresa
+# della roadmap. Dopo Blueprint, UMG e Niagara ci si aspettava l'ennesimo
+# `EdGraph` protetto; invece il grafo PCG è pienamente scriptabile:
+# `add_node_of_type`, `add_edge`, `remove_edge`, `remove_node`,
+# `get_all_edges`, `nodes`, `set_node_position` sono tutti esposti, e le
+# proprietà di un nodo si scrivono sul suo `PCGSettings` come su un oggetto
+# qualunque. Verificato costruendo un grafo Input → SurfaceSampler →
+# StaticMeshSpawner, salvandolo e rileggendolo da zero: nodi, archi e
+# proprietà c'erano ancora, e i nomi dei nodi compaiono nel .uasset.
+#
+# La ragione è la stessa dei Behavior Tree della fase 6: il grafo PCG è un
+# grafo di dati veri (`UPCGNode` + `UPCGEdge`), non un `UEdGraph` di nodi K2
+# con il vero contenuto in una proprietà protetta. L'`UPCGEditorGraph` è solo
+# la sua rappresentazione visiva, e non serve toccarlo.
+
+
+def _mcp_pcg_graph(graph_path):
+    grafo = mcp_asset_lib().load_asset(graph_path)
+    if grafo is None:
+        raise ValueError("Grafo PCG '%s' non trovato." % graph_path)
+    if not isinstance(grafo, unreal.PCGGraph):
+        raise ValueError(
+            "'%s' è un %s, non un PCGGraph." % (graph_path, grafo.get_class().get_name())
+        )
+    return grafo
+
+
+def _mcp_pcg_pin_labels(pins):
+    etichette = []
+    for pin in pins or []:
+        try:
+            proprieta = pin.get_editor_property("properties")
+            etichette.append(str(proprieta.get_editor_property("label")))
+        except Exception:  # noqa: BLE001, S112
+            continue
+    return etichette
+
+
+def _mcp_pcg_node(grafo, nome):
+    """Un nodo del grafo per nome.
+
+    "input" e "output" sono alias dei due nodi che ogni grafo PCG ha già:
+    senza di loro chi chiama dovrebbe indovinare che si chiamano
+    `DefaultInputNode` e `DefaultOutputNode`.
+    """
+    chiave = str(nome).strip().lower()
+    if chiave in ("input", "in", "defaultinputnode"):
+        return grafo.get_input_node()
+    if chiave in ("output", "out", "defaultoutputnode"):
+        return grafo.get_output_node()
+
+    nodi = list(grafo.nodes)
+    for nodo in nodi:
+        if str(nodo.get_name()) == str(nome):
+            return nodo
+    for nodo in nodi:
+        if str(nodo.get_name()).lower() == chiave:
+            return nodo
+    raise ValueError(
+        "Nodo '%s' non trovato nel grafo. Presenti: %s"
+        % (nome, ", ".join(str(n.get_name()) for n in nodi) or "nessuno (grafo vuoto)")
+    )
+
+
+def mcp_create_pcg_graph(package_path, name):
+    """Crea un asset PCGGraph vuoto (con i suoi nodi Input e Output)."""
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    grafo = mcp_asset_tools().create_asset(
+        name, package_path, unreal.PCGGraph, unreal.PCGGraphFactory()
+    )
+    if grafo is None:
+        raise RuntimeError("Creazione del grafo PCG '%s' fallita." % full)
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True}
+
+
+def mcp_pcg_add_node(graph_path, settings_class, position=None):
+    """Aggiunge un nodo al grafo, dalla classe di settings che lo definisce.
+
+    In PCG il "tipo" di un nodo *è* la sua classe di settings: un
+    SurfaceSampler è un nodo con `PCGSurfaceSamplerSettings`.
+    """
+    grafo = _mcp_pcg_graph(graph_path)
+    cls = mcp_resolve_class(settings_class)
+    if cls is None:
+        raise ValueError("Classe di settings PCG '%s' non risolta." % settings_class)
+
+    esito = grafo.add_node_of_type(cls)
+    nodo = esito[0] if isinstance(esito, tuple) else esito
+    if nodo is None:
+        raise RuntimeError("Unreal non ha creato il nodo per '%s'." % settings_class)
+
+    if position is not None:
+        x, y = (position.get("x"), position.get("y")) if isinstance(position, dict) else position
+        nodo.set_node_position(int(x), int(y))
+
+    mcp_asset_lib().save_asset(graph_path)
+    return {
+        "graph": graph_path,
+        "node": str(nodo.get_name()),
+        "settings_class": str(settings_class),
+        "input_pins": _mcp_pcg_pin_labels(nodo.input_pins),
+        "output_pins": _mcp_pcg_pin_labels(nodo.output_pins),
+    }
+
+
+def mcp_pcg_connect(graph_path, from_node, from_pin, to_node, to_pin):
+    """Collega due nodi del grafo. `from_node`/`to_node` accettano anche
+    "input" e "output" per i nodi di ingresso e uscita del grafo."""
+    grafo = _mcp_pcg_graph(graph_path)
+    partenza = _mcp_pcg_node(grafo, from_node)
+    arrivo = _mcp_pcg_node(grafo, to_node)
+
+    disponibili_out = _mcp_pcg_pin_labels(partenza.output_pins)
+    disponibili_in = _mcp_pcg_pin_labels(arrivo.input_pins)
+    if disponibili_out and str(from_pin) not in disponibili_out:
+        raise ValueError(
+            "'%s' non ha un pin di uscita '%s'. Disponibili: %s"
+            % (partenza.get_name(), from_pin, ", ".join(disponibili_out))
+        )
+    if disponibili_in and str(to_pin) not in disponibili_in:
+        raise ValueError(
+            "'%s' non ha un pin di ingresso '%s'. Disponibili: %s"
+            % (arrivo.get_name(), to_pin, ", ".join(disponibili_in))
+        )
+
+    grafo.add_edge(partenza, unreal.Name(str(from_pin)), arrivo, unreal.Name(str(to_pin)))
+    mcp_asset_lib().save_asset(graph_path)
+    return {
+        "graph": graph_path,
+        "connected": "%s.%s -> %s.%s"
+        % (partenza.get_name(), from_pin, arrivo.get_name(), to_pin),
+        "edges": len(grafo.get_all_edges()),
+    }
+
+
+def mcp_pcg_disconnect(graph_path, from_node, from_pin, to_node, to_pin):
+    """Rimuove un collegamento fra due nodi."""
+    grafo = _mcp_pcg_graph(graph_path)
+    partenza = _mcp_pcg_node(grafo, from_node)
+    arrivo = _mcp_pcg_node(grafo, to_node)
+
+    rimosso = grafo.remove_edge(
+        partenza, unreal.Name(str(from_pin)), arrivo, unreal.Name(str(to_pin))
+    )
+    mcp_asset_lib().save_asset(graph_path)
+    return {"graph": graph_path, "removed": bool(rimosso), "edges": len(grafo.get_all_edges())}
+
+
+def mcp_pcg_remove_node(graph_path, node):
+    """Toglie un nodo dal grafo, con tutti i suoi collegamenti."""
+    grafo = _mcp_pcg_graph(graph_path)
+    nodo = _mcp_pcg_node(grafo, node)
+    nome = str(nodo.get_name())
+    grafo.remove_node(nodo)
+    mcp_asset_lib().save_asset(graph_path)
+    return {"graph": graph_path, "removed": nome, "nodes": [str(n.get_name()) for n in grafo.nodes]}
+
+
+def mcp_pcg_set_node_property(graph_path, node, property_name, value):
+    """Scrive una proprietà sulle settings di un nodo (densità del sampler,
+    mesh dello spawner, seed…)."""
+    grafo = _mcp_pcg_graph(graph_path)
+    nodo = _mcp_pcg_node(grafo, node)
+    settings = nodo.get_settings()
+    if settings is None:
+        raise RuntimeError("Il nodo '%s' non espone settings." % node)
+
+    settings.set_editor_property(property_name, mcp_coerce_value(value))
+    letto = settings.get_editor_property(property_name)
+    mcp_asset_lib().save_asset(graph_path)
+    return {
+        "graph": graph_path,
+        "node": str(nodo.get_name()),
+        "settings_class": str(settings.get_class().get_name()),
+        "property": property_name,
+        "value": letto if isinstance(letto, (bool, int, float, str)) or letto is None else str(letto),
+    }
+
+
+def mcp_pcg_graph_info(graph_path):
+    """Nodi (con pin e classe di settings) e archi di un grafo PCG."""
+    grafo = _mcp_pcg_graph(graph_path)
+
+    def descrivi(nodo, ruolo=None):
+        settings = nodo.get_settings()
+        posizione = nodo.get_node_position()
+        return {
+            "name": str(nodo.get_name()),
+            "role": ruolo,
+            "settings_class": str(settings.get_class().get_name()) if settings else None,
+            "input_pins": _mcp_pcg_pin_labels(nodo.input_pins),
+            "output_pins": _mcp_pcg_pin_labels(nodo.output_pins),
+            "position": {"x": int(posizione[0]), "y": int(posizione[1])} if posizione else None,
+        }
+
+    nodi = [descrivi(grafo.get_input_node(), "input"), descrivi(grafo.get_output_node(), "output")]
+    nodi += [descrivi(n) for n in grafo.nodes]
+
+    archi = []
+    for arco in grafo.get_all_edges():
+        # In `UPCGEdge` i nomi sono dal punto di vista dell'arco: `input_pin`
+        # è il pin da cui l'arco parte (un pin di *output* del nodo a monte).
+        origine = arco.get_editor_property("input_pin")
+        destinazione = arco.get_editor_property("output_pin")
+        if origine is None or destinazione is None:
+            continue
+        archi.append(
+            {
+                "from": str(origine.get_editor_property("node").get_name()),
+                "from_pin": _mcp_pcg_pin_labels([origine])[0] if _mcp_pcg_pin_labels([origine]) else None,
+                "to": str(destinazione.get_editor_property("node").get_name()),
+                "to_pin": _mcp_pcg_pin_labels([destinazione])[0]
+                if _mcp_pcg_pin_labels([destinazione])
+                else None,
+            }
+        )
+
+    return {"graph": graph_path, "nodes": nodi, "edges": archi}
+
+
+def mcp_pcg_spawn_volume(graph_path, label=None, location=None, size=None):
+    """Piazza un PCGVolume nel livello e ci attacca il grafo.
+
+    Il volume è il dominio su cui il grafo lavora. La sua dimensione si regola
+    con la scala dell'attore: il brush di default è 200×200×200 cm, quindi
+    `size` è espressa in centimetri e viene convertita in scala.
+    """
+    grafo = _mcp_pcg_graph(graph_path)
+    posizione = mcp_to_vector(location)
+
+    with mcp_transaction("MCP: volume PCG per %s" % graph_path):
+        volume = mcp_actor_subsystem().spawn_actor_from_class(
+            unreal.PCGVolume, posizione, unreal.Rotator(0.0, 0.0, 0.0)
+        )
+        if volume is None:
+            raise RuntimeError("Spawn del PCGVolume fallito.")
+        if label:
+            volume.set_actor_label(label)
+        if size is not None:
+            lati = mcp_to_vector(size, (200.0, 200.0, 200.0))
+            volume.set_actor_scale3d(
+                unreal.Vector(lati.x / 200.0, lati.y / 200.0, lati.z / 200.0)
+            )
+
+        componente = volume.get_component_by_class(unreal.PCGComponent)
+        if componente is None:
+            raise RuntimeError("Il PCGVolume non ha un PCGComponent.")
+        componente.set_graph(grafo)
+
+    return {
+        "actor": str(volume.get_actor_label()),
+        "graph": graph_path,
+        "location": mcp_vec(volume.get_actor_location()),
+        "scale": mcp_vec(volume.get_actor_scale3d()),
+    }
+
+
+def mcp_pcg_generate(label, force=True):
+    """Fa rigenerare il PCG di un attore (volume o attore con PCGComponent)."""
+    attore = mcp_require_actor(label)
+    componente = attore.get_component_by_class(unreal.PCGComponent)
+    if componente is None:
+        raise ValueError(
+            "'%s' non ha un PCGComponent: aggiungilo con `ue_add_component` o "
+            "usa un PCGVolume." % label
+        )
+    grafo = componente.get_graph()
+    componente.generate(bool(force))
+    return {
+        "actor": label,
+        "graph": grafo.get_path_name() if grafo else None,
+        "generated": True,
+    }
+
+
+def mcp_pcg_cleanup(label, remove_components=True):
+    """Cancella ciò che il PCG ha generato su un attore."""
+    attore = mcp_require_actor(label)
+    componente = attore.get_component_by_class(unreal.PCGComponent)
+    if componente is None:
+        raise ValueError("'%s' non ha un PCGComponent." % label)
+    componente.cleanup(bool(remove_components))
+    return {"actor": label, "cleaned": True}

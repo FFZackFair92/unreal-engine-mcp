@@ -1,6 +1,6 @@
 # Tool reference
 
-58 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+127 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -118,7 +118,7 @@ undoable with Ctrl+Z by whoever is watching the editor.
 | `ue_set_class_defaults` | `blueprint_path`, `properties` | Writes Class Defaults on the CDO. |
 | `ue_reparent_blueprint` | `blueprint_path`, `new_parent`, `remove_unused_variables` | Reassigns the parent class, typically to a generated C++ class. Variables matching a `UPROPERTY` on the new parent are absorbed; the rest survive renamed with `_0`. Reports which were absorbed. |
 | `ue_compile_blueprint` | `blueprint_path` | Compiles and saves. |
-| `ue_set_replication` | `blueprint_path`, `replicates`, `replicate_movement`, `always_relevant` | Networking flags on the CDO. |
+| `ue_set_replication` | `blueprint_path`, `replicates`, `replicate_movement`, `always_relevant` | Networking flags on the CDO. See [Networking](#networking-editor) for the rest. |
 
 **Not supported: authoring Blueprint node graphs.** UE 5.8 does not expose it to
 Python — `EdGraph.Nodes` is protected, pin types are not exposed and there is no
@@ -182,6 +182,242 @@ returning just the path.
 |---|---|---|
 | `ue_create_metasound_source` | `package_path`, `name` | Empty MetaSound Source asset (needs the MetaSound plugin). |
 | `ue_create_sound_cue` | `package_path`, `name`, `wave_path` | Sound Cue, optionally already wired to an imported SoundWave. |
+
+## Reflection (editor)
+
+UE's Python API has no generic way to list a class's properties/functions —
+`get_editor_property(name)` needs the name already known. These tools cover
+what the API *does* expose: walking the class/struct hierarchy and reading
+native enum values.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_find_classes` | `parent`, `name_contains`, `limit` | Classes (native and Blueprint) derived from `parent`, `parent` included. Project Blueprints show up with their generated name (`BP_PlayerCharacter_C`). |
+| `ue_find_structs` | `parent`, `name_contains`, `limit` | Structs derived from `parent` (`ScriptStruct`), `parent` included. |
+| `ue_reflect_enum` | `enum_name` | Name, numeric value and display name of every entry in a native engine enum (e.g. `"CollisionChannel"`, without the `E` prefix). Does not cover Blueprint-defined enums (`UserDefinedEnum` assets in `/Game/...`) — those need `ue_exec_python` + `unreal.load_asset(path)`. |
+
+## UMG (editor)
+
+Same wall as Blueprint node graphs: creating the Widget Blueprint *asset*
+works, but its `WidgetTree` (the actual layout — TextBlock, Button,
+CanvasPanel, positioning) is a protected property in UE's Python API and
+can't be read or written generically. Design the layout by hand in the
+Widget Designer; for logic, the same C++ workaround used elsewhere applies —
+give the widget a C++ parent class with `BindWidget` properties
+(`ue_cpp_class_create` → `ue_reparent_blueprint`).
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_widget_blueprint` | `package_path`, `name`, `parent_class`, `editor_utility` | Empty Widget Blueprint asset (or Editor Utility Widget with `editor_utility=True`). `parent_class` accepts a project C++ class, for the BindWidget path. |
+
+## Blueprint graph (editor)
+
+Partial, verified coverage: you can add event nodes for inherited overridable
+events and empty function graphs, and read the pins of a node you already
+have a reference to. You *cannot* list the nodes of an arbitrary graph or
+create arbitrary nodes (Print String, Branch, free function calls...) — `EdGraph`'s
+`Nodes` property is protected in UE's Python API, same wall as UMG's
+`WidgetTree`. A pin-connection primitive exists and was confirmed working,
+but isn't exposed as a tool: the only nodes reachable here are event nodes,
+and an event node has *only* output pins (checked on an 8-parameter event,
+`ReceiveHit`) — with no node exposing an input pin, there is no valid
+connection to make. Real logic still goes through the C++ path
+(`ue_cpp_class_create` → `ue_reparent_blueprint`); these tools set up the
+hook (the event exists, its graph too), not the logic.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_bp_list_graphs` | `blueprint_path` | Names of a Blueprint's graphs (EventGraph, UserConstructionScript, functions...). |
+| `ue_bp_list_events` | `blueprint_path` | Events visible on a Blueprint (custom, inherited overridable, interface), each with `is_implemented`. |
+| `ue_bp_add_event_override` | `blueprint_path`, `event_name`, `x`, `y` | Adds (or finds) the node for an inherited overridable event; returns its path and pins. |
+| `ue_bp_add_function_graph` | `blueprint_path`, `func_name` | Empty function graph with default Entry/Return nodes — internals not reachable from Python; body written by hand in the Blueprint Editor. |
+
+## Animation (editor)
+
+Unlike UMG and the Blueprint graph, writing here genuinely works: a
+BlendSpace's `BlendParameters`/`SampleData` are ordinary struct arrays, not
+protected — confirmed live by creating an asset, filling it, saving, and
+reloading from scratch on a real project (Remy_Skeleton,
+BS_Remy_Locomozione). An Anim Blueprint's AnimGraph is still an EdGraph like
+any other, though — same wall, so `ue_create_anim_blueprint` only creates
+the asset.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_skeleton_info` | `skeleton_path` | Bones and sockets from a Skeleton's reference pose. |
+| `ue_anim_sequence_info` | `anim_path` | Length, frame count, notify tracks/events, sync markers and curve names of an AnimSequence. |
+| `ue_create_blend_space_1d` | `package_path`, `name`, `skeleton_path`, `axis_name`, `axis_min`, `axis_max`, `grid_num`, `samples` | Creates a BlendSpace1D with one axis and, optionally, its samples (`[{"value": float, "animation": path}, ...]`). 1D only for now — BlendSpace (2D) uses the same data shape but wasn't verified live in this phase. |
+| `ue_create_anim_montage` | `package_path`, `name`, `source_animation_path` | AnimMontage wrapping an existing AnimSequence, with its default slot. |
+| `ue_create_anim_blueprint` | `package_path`, `name`, `skeleton_path`, `parent_class` | Empty Anim Blueprint asset bound to a Skeleton. The AnimGraph itself has to be drawn by hand in the Anim Blueprint Editor. |
+
+## Niagara / VFX (editor)
+
+Same wall again: `EmitterHandles` on `NiagaraSystem` is protected — no
+adding emitters or modules from Python, confirmed live even on populated
+templates from the engine's own system library. Reading an *existing*
+system's emitters and exposed user parameters works, though, and at the
+asset level — no running PIE or instantiated component needed.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_niagara_system` | `package_path`, `name` | Empty Niagara System asset. The emitter stack has to be built by hand in the Niagara Editor. |
+| `ue_niagara_system_info` | `system_path` | Emitters (name, enabled, lightweight) and exposed user parameters (name, type) of an existing Niagara System. |
+
+## Gameplay: physics, navmesh, AI (editor)
+
+Physics/collision and the navmesh are fully scriptable — confirmed live.
+Blackboard and Behavior Tree break the "graphs are protected" pattern from
+UMG/Blueprint/Niagara: their tree (`RootNode`, `Children`, `Decorators`,
+`Services`) really is writable from Python, because they aren't a real
+`EdGraph` under the hood, just plain `UObject`s and structs. EQS is blocked
+the same way UMG/Blueprint/Niagara are — only the empty asset is scriptable.
+AI Perception adds through the generic `ue_add_component`; its `SensesConfig`
+has to be set by hand in the Blueprint's Details panel (`EditDefaultsOnly`,
+not reliably reachable from the component template via Python).
+
+Behavior Tree nodes are addressed by a dot-path of child indices from the
+root: `"root"` is the root node itself, `"0"` its first child, `"0.1"` the
+second child of that first child, and so on. `ue_bt_add_node` returns the
+path of the node it just created, meant to be reused in later calls.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_set_component_physics` | `actor`, `component`, `simulate_physics?`, `collision_enabled?`, `collision_profile?` | Physics simulation and collision on a component. `collision_enabled` accepts `NoCollision`/`QueryOnly`/`PhysicsOnly`/`QueryAndPhysics`/`QueryAndProbe`/`ProbeOnly`, case/underscore-insensitive. |
+| `ue_component_physics_info` | `actor`, `component` | Current simulate/collision-enabled/collision-profile state. |
+| `ue_nav_rebuild` | — | Rebuilds the navmesh (`RebuildNavigation` console command). Needs at least one `NavMeshBoundsVolume` in the level — spawn one with `ue_spawn_actor`. |
+| `ue_nav_query_point` | `origin`, `radius` | A random reachable point on the navmesh within a radius of an origin. |
+| `ue_nav_find_path` | `start`, `end` | Synchronous pathfinding on the navmesh — no running PIE needed. |
+| `ue_create_blackboard` | `package_path`, `name` | Empty Blackboard Data asset. |
+| `ue_blackboard_add_key` | `blackboard_path`, `key_name`, `key_type` | Adds a key (`object`/`class`/`bool`/`int`/`float`/`string`/`name`/`vector`/`rotator`/`enum`). |
+| `ue_blackboard_info` | `blackboard_path` | Lists the keys of an existing Blackboard Data. |
+| `ue_create_behavior_tree` | `package_path`, `name`, `blackboard_path?`, `root_composite?` | Creates a Behavior Tree with a root composite node already set (Selector by default), optionally linked to a Blackboard. |
+| `ue_bt_add_node` | `bt_path`, `parent_path`, `node_class`, `index?` | Adds a composite or task node (inferred from the base class) as a child of an existing composite. |
+| `ue_bt_add_decorator` | `bt_path`, `node_path`, `decorator_class` | Adds a decorator to a node's child link (not valid on `"root"`). |
+| `ue_bt_add_service` | `bt_path`, `node_path`, `service_class` | Adds a service to a composite node (Selector/Sequence only, not tasks). |
+| `ue_bt_set_node_property` | `bt_path`, `node_path`, `property_name`, `value` | Sets a property on a node. Auto-handles blackboard-bindable fields (`FValueOrBBKey_*` structs, e.g. `BTTask_Wait.WaitTime`) by writing the fixed default value. |
+| `ue_bt_info` | `bt_path` | Recursive dump of the tree: nodes, decorators, services, paths. |
+| `ue_create_eqs_asset` | `package_path`, `name` | Empty Environment Query asset. `Options` is protected — build the query by hand in the EQS Editor. |
+
+## GAS: Gameplay Ability System (editor)
+
+Requires the `GameplayAbilities` plugin — enable it with `ue_project_set_plugins`
+and restart the editor before these classes exist in Python.
+
+GameplayEffect and AttributeSet are plain Blueprintable classes: they already
+work with the generic `ue_create_blueprint` (`parent_class="GameplayEffect"`
+or `"AttributeSet"`), no dedicated tool needed. GameplayAbility has its own
+asset type instead (`GameplayAbilityBlueprint`, not a plain `Blueprint`),
+which is why `ue_create_gameplay_ability` exists. Adding an attribute
+(`GameplayAttributeData`) to an AttributeSet already works with
+`ue_add_variable` — pass the full struct path as `sub_type`
+(`/Script/GameplayAbilities.GameplayAttributeData`, not in the short-name
+whitelist). The ability's actual logic (`ActivateAbility` and its nodes) is
+still a Blueprint graph — not scriptable, same as everywhere else.
+
+**The wall, and how it's worked around**: the normal way to build a
+modifier — `GameplayModifierInfo.Attribute`/`.ModifierOp` via
+`set_editor_property` — is blocked ("cannot be edited on instances"), and
+`GameplayAttribute.AttributeName` is read-only. `ue_ge_add_modifier` works
+around it by building the whole `GameplayModifierInfo` struct at once via
+`import_text` — the same technique already used in this file for
+`EdGraphPinType`. Verified live end-to-end: built a modifier pointing at a
+real attribute on a real AttributeSet Blueprint, saved the GameplayEffect,
+reloaded the asset from scratch — the modifier was really there, values
+included. Not verified in PIE, only that it persists on the asset.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_gameplay_ability` | `package_path`, `name`, `instancing_policy?`, `net_execution_policy?` | Creates a GameplayAbility Blueprint (dedicated asset type). Optionally sets InstancingPolicy/NetExecutionPolicy. |
+| `ue_create_gameplay_effect` | `package_path`, `name`, `duration_policy?`, `period?` | Creates a GameplayEffect Blueprint (plain Blueprint, GameplayEffect parent). Optionally sets DurationPolicy and the periodic-application interval. |
+| `ue_ge_add_modifier` | `ge_path`, `attribute_set_path`, `attribute_name`, `modifier_op`, `magnitude` | Adds a modifier linking an attribute on an existing AttributeSet Blueprint, an operation (`add`/`add_final`/`multiply`/`divide`/`multiply_compound`/`override`), and a fixed magnitude. Constant `ScalableFloat` only — no curves or attribute-based magnitude yet. |
+| `ue_ge_add_component` | `ge_path`, `component_class` | Adds a `GameplayEffectComponent` (e.g. `AssetTagsGameplayEffectComponent`) to a GameplayEffect. Only the addition — configuring tags/conditions inside it isn't covered, use `ue_exec_python` or the editor. |
+| `ue_ge_info` | `ge_path` | Duration policy, period, modifiers (attribute/op/magnitude), and GameplayEffectComponents of an existing GameplayEffect. |
+
+## Networking (editor)
+
+`ue_set_replication` decides *whether* an actor replicates; these decide *how
+much bandwidth it costs*. All of it is plain `get/set_editor_property` on the
+Blueprint CDO — no protected properties here, verified live on UE 5.8 by
+reading the property names back out of the saved `.uasset`.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_set_net_config` | `blueprint_path`, `dormancy?`, `net_update_frequency?`, `min_net_update_frequency?`, `net_priority?`, `net_cull_distance?`, `only_relevant_to_owner?`, `net_use_owner_relevancy?`, `net_load_on_client?` | Dormancy (`awake`/`initial`/`dormant_all`/`dormant_partial`/`never`), update rates, replication priority and relevancy. Incremental: only the parameters you pass are touched. `net_cull_distance` is in cm and is squared for you, because that's how Unreal stores it. |
+| `ue_net_info` | `blueprint_path` | Everything above plus `replicates`/`replicate_movement`/`always_relevant`, and which components replicate. |
+| `ue_set_component_replication` | `blueprint_path`, `component_name`, `replicates` | A replicated actor does *not* replicate its components automatically — this is the switch. The `_GEN_VARIABLE` suffix Unreal adds to component templates is handled for you. |
+| `ue_set_component_default` | `blueprint_path`, `component_name`, `property_name`, `value` | Writes a property on a component *template*, not on a placed instance. |
+
+`ue_set_component_default` closes a gap left open by the gameplay phase: an
+`EditDefaultsOnly` property such as `SensesConfig` on an AIPerceptionComponent
+is rejected on a spawned actor ("cannot be edited on instances"), and reaching
+the Blueprint's component template looked unavailable. It isn't:
+`SubobjectDataBlueprintFunctionLibrary.get_object` turns a subobject handle
+into the template. Verified live — a Sight sense config with custom radii
+written from Python, saved, and found again in the `.uasset`.
+
+## Landscape (editor)
+
+**You cannot create a landscape from Python.** Verified live on UE 5.8:
+spawning `Landscape` gives you a `LandscapePlaceholder` — an empty actor with
+no components, no target layers, not even `ALandscape`'s methods. The classes
+that really create one (`LandscapeSubsystem`, `LandscapeEditorObject`,
+`ActorFactoryLandscape`) exist in the engine but are not exposed to its
+Python. Create the terrain once with Landscape Mode in the editor; everything
+after that is scriptable from here.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_landscape_list` | — | Landscapes in the current level. Empty means there is nothing to work on. |
+| `ue_landscape_info` | `label?` | Components, material, paint target layers, edit layers, grass. `label` is optional when the level has exactly one landscape. |
+| `ue_landscape_import_heightmap` | `image_path`, `label?`, `rt_format?`, `from_rg_channel?` | Overwrites the heightmap from an image file on disk. Bring the image to the landscape's resolution first — nothing rescales it. |
+| `ue_landscape_import_weightmap` | `layer_name`, `image_path`, `label?`, `rt_format?` | Paints a target layer from a greyscale image. The layer must already exist — target layers come from the landscape material. |
+| `ue_landscape_export_heightmap` | `output_dir`, `file_name`, `label?`, `resolution?`, `rt_format?`, `into_rg_channel?` | Exports the heightmap to disk. `RGBA8` writes a PNG, float formats write HDR. |
+| `ue_landscape_set_material` | `material_path`, `label?` | Assigns the landscape material — which is also what defines the paintable layers. |
+| `ue_landscape_set_grass` | `enabled`, `label?` | Turns the procedural grass system on or off. |
+
+Unreal only accepts a heightmap as a `TextureRenderTarget2D`, so these tools
+build one for you: `import_file_as_texture2d` → `begin_draw_canvas_to_render_target`
+→ `Canvas.draw_texture`. That chain is verified live up to and including the
+render target (a 64×64 gradient PNG read back pixel by pixel with the right
+values); the final `landscape_import_heightmap_from_render_target` call is
+**not** verified, because there was no landscape to try it on and Python
+cannot make one.
+
+`RGBA8` gives 256 height levels. For a real 16-bit heightmap use `RGBA16f` or
+`RGBA32f` with `from_rg_channel=True`, which is how Unreal packs 16 bits of
+height into two channels.
+
+## PCG: Procedural Content Generation (editor)
+
+The surprise of the parity roadmap. After Blueprint, UMG and Niagara all hit
+the same protected-graph wall, PCG turns out to be **fully scriptable** —
+nodes, edges, positions and node properties. Verified live on UE 5.8 by
+building Input → SurfaceSampler → StaticMeshSpawner, saving, and reloading the
+asset from scratch: nodes, edges and `points_per_squared_meter` were all still
+there, and the node names show up in the `.uasset`.
+
+The reason is the same as Behavior Trees: a PCG graph is a graph of real data
+objects (`UPCGNode` + `UPCGEdge`), not a `UEdGraph` of K2 nodes with the actual
+content hidden behind a protected property. `UPCGEditorGraph` is only its
+visual representation, and you never need to touch it.
+
+Requires the PCG plugin — enable it with `ue_project_set_plugins`.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_pcg_graph` | `package_path`, `name` | Empty PCGGraph asset, with its Input and Output nodes already in it. |
+| `ue_pcg_add_node` | `graph_path`, `settings_class`, `position?` | Adds a node and returns its name and pins. In PCG a node's *type is* its settings class: `PCGSurfaceSamplerSettings`, `PCGStaticMeshSpawnerSettings`, `PCGCreatePointsGridSettings`… |
+| `ue_pcg_connect` | `graph_path`, `from_node`, `from_pin`, `to_node`, `to_pin` | Links an output pin to an input pin. `"input"` and `"output"` are aliases for the graph's own two nodes. Wrong pin names are rejected with the real list. |
+| `ue_pcg_disconnect` | `graph_path`, `from_node`, `from_pin`, `to_node`, `to_pin` | Removes a link, and says whether one was actually there. |
+| `ue_pcg_remove_node` | `graph_path`, `node` | Removes a node and its links. |
+| `ue_pcg_set_node_property` | `graph_path`, `node`, `property_name`, `value` | Writes a property on the node's settings (`points_per_squared_meter`, `seed`, a mesh path…). |
+| `ue_pcg_graph_info` | `graph_path` | Nodes (name, settings class, pins, position) and edges. This is how you learn the pin names before wiring anything. |
+| `ue_pcg_spawn_volume` | `graph_path`, `label?`, `location?`, `size?` | Places a PCGVolume with the graph attached. `size` is in cm; the default brush is 200 cm a side, so it becomes actor scale. |
+| `ue_pcg_generate` | `label`, `force` | Regenerates the PCG on an actor. Call it after editing the graph. |
+| `ue_pcg_cleanup` | `label`, `remove_components` | Deletes what PCG generated, leaving graph and volume in place. |
+
+Pin names are the visible labels, spaces included — `"Bounding Shape"`, not
+`BoundingShape`. Ask `ue_pcg_graph_info` rather than guessing.
 
 ## Free asset downloads (local)
 

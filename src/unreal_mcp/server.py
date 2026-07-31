@@ -43,8 +43,12 @@ mcp = FastMCP(
         "(1 unit = 1 cm) with Z up. Compiling C++ needs the editor closed (ue_build_start), "
         "unless the change only touches function bodies (ue_live_compile). "
         "Blueprint node graphs cannot be scripted: put logic in a C++ parent class "
-        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). Material graphs, on the "
-        "other hand, are fully scriptable (ue_create_material). "
+        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). Same wall for UMG "
+        "widget trees, Niagara emitter stacks and EQS. Material graphs, Behavior Trees "
+        "and PCG graphs, on the other hand, are fully scriptable "
+        "(ue_create_material, ue_bt_add_node, ue_pcg_add_node/ue_pcg_connect). "
+        "A landscape cannot be created from Python — it has to exist already "
+        "(Landscape Mode in the editor); ue_landscape_* then drives it. "
         "Do not assume the action is at the world origin: real levels are often built "
         "thousands of units away from [0,0,0], so an actor spawned there can be "
         "off-screen and invisible. Anchor new actors to what is already in the scene — "
@@ -1463,6 +1467,105 @@ async def ue_set_replication(
 
 
 @mcp.tool()
+async def ue_set_net_config(
+    blueprint_path: str,
+    dormancy: str | None = None,
+    net_update_frequency: float | None = None,
+    min_net_update_frequency: float | None = None,
+    net_priority: float | None = None,
+    net_cull_distance: float | None = None,
+    only_relevant_to_owner: bool | None = None,
+    net_use_owner_relevancy: bool | None = None,
+    net_load_on_client: bool | None = None,
+) -> dict:
+    """Regola *quanto* costa in banda un attore replicato: dormancy, frequenza
+    di aggiornamento, priorità e relevancy. `ue_set_replication` decide *se*
+    replicare, questo decide con che intensità.
+
+    Solo i parametri passati vengono toccati, gli altri restano come sono.
+
+    Args:
+        blueprint_path: Blueprint Actor da configurare.
+        dormancy: "awake" | "initial" | "dormant_all" | "dormant_partial" | "never".
+            "initial" è la scelta giusta per attori di scena che non cambiano
+            mai dopo lo spawn: smettono di consumare banda finché non li si
+            risveglia.
+        net_update_frequency: aggiornamenti al secondo quando è rilevante (default UE 100).
+        min_net_update_frequency: minimo a cui l'engine può scendere (default UE 2).
+        net_priority: peso relativo nella coda di replication (default UE 1.0).
+        net_cull_distance: distanza in cm oltre la quale il client smette di
+            riceverlo (default UE 15000). Scritta come quadrato, che è come
+            Unreal la memorizza.
+        only_relevant_to_owner: replica solo al client che lo possiede.
+        net_use_owner_relevancy: eredita la relevancy dall'owner.
+        net_load_on_client: se False l'attore non viene creato sui client al
+            caricamento del livello.
+    """
+    return await run(
+        "result = mcp_set_net_config("
+        f"{lit(blueprint_path)}, {lit(dormancy)}, {lit(net_update_frequency)}, "
+        f"{lit(min_net_update_frequency)}, {lit(net_priority)}, {lit(net_cull_distance)}, "
+        f"{lit(only_relevant_to_owner)}, {lit(net_use_owner_relevancy)}, {lit(net_load_on_client)})"
+    )
+
+
+@mcp.tool()
+async def ue_net_info(blueprint_path: str) -> dict:
+    """Stato di rete completo di un Blueprint: replication, dormancy,
+    frequenze, priorità, relevancy e quali componenti replicano."""
+    return await run(f"result = mcp_net_info({lit(blueprint_path)})")
+
+
+@mcp.tool()
+async def ue_set_component_replication(
+    blueprint_path: str, component_name: str, replicates: bool = True
+) -> dict:
+    """Attiva la replication di un singolo componente di un Blueprint.
+
+    Un attore replicato non replica automaticamente i suoi componenti: le
+    proprietà di un componente arrivano ai client solo se il componente è
+    marcato come replicato.
+
+    Args:
+        blueprint_path: Blueprint che contiene il componente.
+        component_name: nome come si vede nell'editor (il suffisso
+            `_GEN_VARIABLE` dei template è gestito da solo).
+        replicates: True per attivare.
+    """
+    return await run(
+        "result = mcp_set_component_replication("
+        f"{lit(blueprint_path)}, {lit(component_name)}, {bool(replicates)})"
+    )
+
+
+@mcp.tool()
+async def ue_set_component_default(
+    blueprint_path: str, component_name: str, property_name: str, value: object
+) -> dict:
+    """Scrive una proprietà sul *template* di un componente di un Blueprint,
+    non su un'istanza piazzata nel livello.
+
+    È la via per le proprietà `EditDefaultsOnly`, che Unreal rifiuta di
+    scrivere su un attore spawnato ("cannot be edited on instances") — per
+    esempio `SensesConfig` di un AIPerceptionComponent. Per gli attori già
+    nel livello usa invece `ue_set_actor_property`.
+
+    Args:
+        blueprint_path: Blueprint che contiene il componente.
+        component_name: nome come si vede nell'editor.
+        property_name: nome della proprietà (snake_case o PascalCase secondo
+            quanto accetta la classe).
+        value: valore JSON; dict con x/y/z, pitch/yaw/roll o r/g/b vengono
+            convertiti nei tipi Unreal corrispondenti, e i path `/Game/...`
+            vengono caricati come asset.
+    """
+    return await run(
+        "result = mcp_set_component_default("
+        f"{lit(blueprint_path)}, {lit(component_name)}, {lit(property_name)}, {lit(value)})"
+    )
+
+
+@mcp.tool()
 async def ue_configure_pie(
     num_players: int = 2, net_mode: str = "listen_server", one_process: bool = True
 ) -> dict:
@@ -1547,6 +1650,892 @@ async def ue_create_sound_cue(
     return await run(
         f"result = mcp_create_sound_cue({lit(package_path)}, {lit(name)}, {lit(wave_path)})"
     )
+
+
+# ================================================================== reflection
+
+
+@mcp.tool()
+async def ue_find_classes(
+    parent: str, name_contains: str | None = None, limit: int = 200
+) -> dict:
+    """Elenca le classi (native e Blueprint) derivate da una classe base, base inclusa.
+
+    Copre il caso "che sottoclassi di Character esistono nel progetto?" o
+    "elencami le luci disponibili": la Blueprint del progetto compare col
+    suo nome generato (es. "BP_PlayerCharacter_C").
+
+    Args:
+        parent: nome esposto ai binding Python (es. "Character", "Actor") o
+            percorso completo (es. "/Script/Engine.Light",
+            "/Game/.../BP_Nemico.BP_Nemico_C").
+        name_contains: filtro case-insensitive sul nome, opzionale.
+        limit: massimo numero di risultati.
+    """
+    return await run(
+        f"result = mcp_find_classes({lit(parent)}, {lit(name_contains)}, {int(limit)})"
+    )
+
+
+@mcp.tool()
+async def ue_find_structs(
+    parent: str, name_contains: str | None = None, limit: int = 200
+) -> dict:
+    """Elenca gli struct derivati da uno struct base, base incluso.
+
+    Args:
+        parent: nome esposto ai binding Python (es. "Vector") o percorso
+            completo (es. "/Script/CoreUObject.Vector").
+        name_contains: filtro case-insensitive sul nome, opzionale.
+        limit: massimo numero di risultati.
+    """
+    return await run(
+        f"result = mcp_find_structs({lit(parent)}, {lit(name_contains)}, {int(limit)})"
+    )
+
+
+@mcp.tool()
+async def ue_reflect_enum(enum_name: str) -> dict:
+    """Elenca nome, valore numerico e display name di un enum nativo del motore.
+
+    Il nome va passato senza il prefisso "E" delle UENUM C++: "CollisionChannel",
+    non "ECollisionChannel". Non copre gli enum definiti come Blueprint asset
+    (`UserDefinedEnum` in /Game/...): quelli non hanno un binding Python
+    generato, vanno letti con ue_exec_python e `unreal.load_asset(path)`.
+
+    Args:
+        enum_name: es. "CollisionChannel", "ObjectTypeQuery".
+    """
+    return await run(f"result = mcp_reflect_enum({lit(enum_name)})")
+
+
+# ========================================================================= UMG
+
+
+@mcp.tool()
+async def ue_create_widget_blueprint(
+    package_path: str,
+    name: str,
+    parent_class: str = "UserWidget",
+    editor_utility: bool = False,
+) -> dict:
+    """Crea un asset Widget Blueprint (UMG) vuoto.
+
+    Il layout (aggiungere TextBlock/Button/CanvasPanel, il posizionamento) NON
+    è scriptabile: il `WidgetTree` è una proprietà protetta nella Python API
+    di UE, stesso limite dei grafi Blueprint. Va disegnato a mano nel Widget
+    Designer. Per la logica, la via che funziona è la stessa già in uso per i
+    grafi Blueprint: `ue_cpp_class_create` con proprietà `BindWidget` (nomi
+    che devono combaciare con quelli dati ai widget nel Designer) come parent
+    class di questo Widget Blueprint, poi `ue_reparent_blueprint` se creato
+    dopo.
+
+    Args:
+        package_path: es. "/Game/UI".
+        name: es. "WBP_MainMenu".
+        parent_class: nome esposto ai binding Python (es. "UserWidget") o
+            percorso completo di una classe C++ del progetto, per la via
+            BindWidget.
+        editor_utility: True per un Editor Utility Widget (tool per l'editor,
+            non per il gioco) invece di un Widget Blueprint normale.
+    """
+    return await run(
+        f"result = mcp_create_widget_blueprint({lit(package_path)}, {lit(name)}, "
+        f"{lit(parent_class)}, {lit(editor_utility)})"
+    )
+
+
+# ============================================================ blueprint graph
+#
+# Copertura parziale, verificata dal vivo: si possono aggiungere nodi evento
+# per eventi ereditati overridabili e grafi funzione vuoti, e leggere i pin
+# di un nodo di cui si ha il riferimento. NON si possono elencare i nodi di
+# un grafo qualunque né creare nodi arbitrari (Print String, Branch, chiamate
+# a funzione libere...): la proprietà `Nodes` di `EdGraph` è protetta nella
+# Python API di UE, stesso limite del `WidgetTree` in UMG. Un tool per
+# collegare due pin (`try_create_connection`) esiste ed è stato verificato
+# funzionante, ma è stato scartato: gli unici nodi raggiungibili da qui sono
+# nodi evento (`K2Node_Event`), e un nodo evento ha *solo* pin di output —
+# verificato su un evento con 8 parametri (ReceiveHit), zero input. Senza un
+# nodo con almeno un pin di input non c'è nessuna connessione valida da fare,
+# quindi il tool sarebbe stato inutile nella pratica, non solo limitato. Per
+# logica vera resta la via C++ (ue_cpp_class_create -> ue_reparent_blueprint);
+# questi tool predispongono l'aggancio (l'evento esiste, il suo grafo pure),
+# non scrivono la logica.
+
+
+@mcp.tool()
+async def ue_bp_list_graphs(blueprint_path: str) -> dict:
+    """Elenca i grafi di un Blueprint (EventGraph, UserConstructionScript, funzioni...).
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/BP_Player".
+    """
+    return await run(f"result = mcp_bp_list_graphs({lit(blueprint_path)})")
+
+
+@mcp.tool()
+async def ue_bp_list_events(blueprint_path: str) -> dict:
+    """Elenca gli eventi visibili su un Blueprint: custom, ereditati overridabili, di interfaccia.
+
+    `is_implemented` dice se esiste già un nodo per quell'evento nel grafo.
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/BP_Player".
+    """
+    return await run(f"result = mcp_bp_list_events({lit(blueprint_path)})")
+
+
+@mcp.tool()
+async def ue_bp_add_event_override(
+    blueprint_path: str, event_name: str, x: int = 0, y: int = 0
+) -> dict:
+    """Aggiunge (o ritrova) il nodo di un evento ereditato overridabile nell'event graph.
+
+    Restituisce il path del nodo e i suoi pin — l'unico modo per riferirsi a
+    quel nodo in seguito con ue_bp_connect_pins, dato che il grafo non elenca
+    i propri nodi via Python.
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/BP_Player".
+        event_name: nome dell'evento ereditato, es. "ReceiveBeginPlay",
+            "ReceiveTick", "ReceiveEndPlay". Vedi ue_bp_list_events per i nomi
+            disponibili su questo Blueprint.
+        x: posizione orizzontale del nodo nel grafo (solo visuale).
+        y: posizione verticale del nodo nel grafo (solo visuale).
+    """
+    return await run(
+        f"result = mcp_bp_add_event_override({lit(blueprint_path)}, {lit(event_name)}, "
+        f"{int(x)}, {int(y)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_add_function_graph(blueprint_path: str, func_name: str) -> dict:
+    """Crea un grafo funzione vuoto (nodi Entry/Return di default).
+
+    I nodi interni non sono raggiungibili da qui: il corpo va scritto a mano
+    nel Blueprint Editor, o lasciato vuoto come slot da riempire in seguito.
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/BP_Player".
+        func_name: es. "ApriPorta".
+    """
+    return await run(
+        f"result = mcp_bp_add_function_graph({lit(blueprint_path)}, {lit(func_name)})"
+    )
+
+
+# ======================================================================= animazione
+#
+# A differenza di UMG e del grafo Blueprint (fasi 2-3), qui la scrittura
+# funziona davvero: i dati di BlendSpace sono array di struct ordinari, non
+# protetti, verificato dal vivo salvando e ricaricando l'asset da zero.
+# L'AnimGraph di un Anim Blueprint resta invece un EdGraph come gli altri:
+# stesso muro, quindi ue_create_anim_blueprint crea solo l'asset.
+
+
+@mcp.tool()
+async def ue_skeleton_info(skeleton_path: str) -> dict:
+    """Elenca ossa e socket di uno Skeleton, dalla reference pose.
+
+    Args:
+        skeleton_path: es. "/Game/MyGame/Characters/Hero/Hero_Skeleton".
+    """
+    return await run(f"result = mcp_skeleton_info({lit(skeleton_path)})")
+
+
+@mcp.tool()
+async def ue_anim_sequence_info(anim_path: str) -> dict:
+    """Durata, notify, sync marker e curve di un AnimSequence.
+
+    Args:
+        anim_path: es. "/Game/MyGame/Characters/Hero/Animations/Idle".
+    """
+    return await run(f"result = mcp_anim_sequence_info({lit(anim_path)})")
+
+
+@mcp.tool()
+async def ue_create_blend_space_1d(
+    package_path: str,
+    name: str,
+    skeleton_path: str,
+    axis_name: str = "Speed",
+    axis_min: float = 0.0,
+    axis_max: float = 1.0,
+    grid_num: int = 4,
+    samples: list[dict] | None = None,
+) -> dict:
+    """Crea un BlendSpace1D con un asse e, opzionalmente, i suoi sample.
+
+    Solo 1D per ora: BlendSpace (2D) usa la stessa struttura dati ma non è
+    stata verificata dal vivo in questa fase.
+
+    Args:
+        package_path: es. "/Game/MyGame/Characters/Hero/Animations".
+        name: es. "BS_Locomotion".
+        skeleton_path: Skeleton a cui il BlendSpace è associato.
+        axis_name: nome dell'asse, es. "Speed".
+        axis_min: valore minimo dell'asse.
+        axis_max: valore massimo dell'asse.
+        grid_num: numero di suddivisioni della griglia.
+        samples: lista di `{"value": float, "animation": path}`, es.
+            `[{"value": 0, "animation": ".../Idle"}, {"value": 300, "animation": ".../Running"}]`.
+    """
+    return await run(
+        f"result = mcp_create_blend_space_1d({lit(package_path)}, {lit(name)}, "
+        f"{lit(skeleton_path)}, {lit(axis_name)}, {float(axis_min)}, {float(axis_max)}, "
+        f"{int(grid_num)}, {lit(samples)})"
+    )
+
+
+@mcp.tool()
+async def ue_create_anim_montage(package_path: str, name: str, source_animation_path: str) -> dict:
+    """Crea un AnimMontage a partire da un AnimSequence esistente.
+
+    Args:
+        package_path: es. "/Game/MyGame/Characters/Hero/Animations".
+        name: es. "AM_Attack".
+        source_animation_path: AnimSequence da incapsulare nel montage.
+    """
+    return await run(
+        f"result = mcp_create_anim_montage({lit(package_path)}, {lit(name)}, "
+        f"{lit(source_animation_path)})"
+    )
+
+
+@mcp.tool()
+async def ue_create_anim_blueprint(
+    package_path: str, name: str, skeleton_path: str, parent_class: str = "AnimInstance"
+) -> dict:
+    """Crea l'asset Anim Blueprint associato a uno Skeleton.
+
+    L'AnimGraph non è raggiungibile da qui (stesso limite del grafo
+    Blueprint): va disegnato a mano nell'Anim Blueprint Editor.
+
+    Args:
+        package_path: es. "/Game/MyGame/Characters/Hero".
+        name: es. "ABP_Hero".
+        skeleton_path: Skeleton a cui l'Anim Blueprint è associato.
+        parent_class: nome esposto ai binding Python (default "AnimInstance")
+            o percorso completo di una classe C++ del progetto.
+    """
+    return await run(
+        f"result = mcp_create_anim_blueprint({lit(package_path)}, {lit(name)}, "
+        f"{lit(skeleton_path)}, {lit(parent_class)})"
+    )
+
+
+# ========================================================================= niagara
+#
+# `EmitterHandles` di NiagaraSystem è protetta come `Nodes`/`WidgetTree`:
+# niente aggiunta di emitter o moduli via Python, verificato anche su
+# template popolati della libreria di sistema. L'introspezione di un sistema
+# esistente invece funziona davvero e a livello di asset, senza bisogno del
+# PIE in esecuzione.
+
+
+@mcp.tool()
+async def ue_create_niagara_system(package_path: str, name: str) -> dict:
+    """Crea un asset Niagara System vuoto.
+
+    L'emitter stack (aggiungere emitter, moduli, parametri) non è
+    raggiungibile da qui — stesso limite del grafo Blueprint e del
+    WidgetTree di UMG. Va costruito a mano nel Niagara Editor.
+
+    Args:
+        package_path: es. "/Game/MyGame/VFX".
+        name: es. "NS_Explosion".
+    """
+    return await run(f"result = mcp_create_niagara_system({lit(package_path)}, {lit(name)})")
+
+
+@mcp.tool()
+async def ue_niagara_system_info(system_path: str) -> dict:
+    """Emitter e parametri esposti (user parameters) di un Niagara System esistente.
+
+    Funziona a livello di asset: non serve un PIE in esecuzione né un
+    componente istanziato in scena.
+
+    Args:
+        system_path: es. "/Game/MyGame/VFX/NS_Explosion".
+    """
+    return await run(f"result = mcp_niagara_system_info({lit(system_path)})")
+
+
+# ========================================================================= gameplay
+#
+# Fisica/collisione e navmesh sono pienamente scriptabili (verificato dal
+# vivo). Blackboard e Behavior Tree rompono il pattern "grafo = protetto"
+# delle sezioni precedenti: qui l'albero (RootNode, Children, Decorators,
+# Services) SI scrive via Python, perché non sono un vero EdGraph ma UObject
+# e struct normali. EQS resta bloccato come UMG/Blueprint/Niagara. L'AI
+# Perception si aggiunge con ue_add_component generico, ma SensesConfig va
+# configurato a mano (EditDefaultsOnly, non raggiungibile in modo affidabile
+# dal component template via Python in tempi ragionevoli).
+
+
+@mcp.tool()
+async def ue_set_component_physics(
+    actor: str,
+    component: str,
+    simulate_physics: bool | None = None,
+    collision_enabled: str | None = None,
+    collision_profile: str | None = None,
+) -> dict:
+    """Fisica e collisione di un componente (StaticMesh/Skeletal/Primitive).
+
+    Args:
+        actor: etichetta dell'attore nell'Outliner.
+        component: nome o classe del componente (es. "StaticMeshComponent").
+        simulate_physics: attiva/disattiva la simulazione fisica.
+        collision_enabled: "NoCollision" | "QueryOnly" | "PhysicsOnly" |
+            "QueryAndPhysics" | "QueryAndProbe" | "ProbeOnly" (case/underscore
+            insensitive, es. va bene anche "query_and_physics").
+        collision_profile: nome profilo collisione (es. "PhysicsActor", "BlockAll").
+    """
+    return await run(
+        "result = mcp_set_component_physics("
+        f"{lit(actor)}, {lit(component)}, {lit(simulate_physics)}, "
+        f"{lit(collision_enabled)}, {lit(collision_profile)})"
+    )
+
+
+@mcp.tool()
+async def ue_component_physics_info(actor: str, component: str) -> dict:
+    """Stato fisica/collisione attuale di un componente."""
+    return await run(f"result = mcp_component_physics_info({lit(actor)}, {lit(component)})")
+
+
+@mcp.tool()
+async def ue_nav_rebuild() -> dict:
+    """Rigenera il navmesh del livello corrente (equivalente al comando
+    console `RebuildNavigation`). Serve almeno un `NavMeshBoundsVolume` nel
+    livello: piazzalo con `ue_spawn_actor` (classe "NavMeshBoundsVolume")."""
+    return await run("result = mcp_nav_rebuild()")
+
+
+@mcp.tool()
+async def ue_nav_query_point(origin: dict, radius: float = 500.0) -> dict:
+    """Trova un punto raggiungibile a caso sul navmesh entro un raggio da un'origine.
+
+    Args:
+        origin: {"x":.., "y":.., "z":..} in centimetri.
+        radius: raggio di ricerca in centimetri.
+    """
+    return await run(f"result = mcp_nav_query_point({lit(origin)}, {lit(radius)})")
+
+
+@mcp.tool()
+async def ue_nav_find_path(start: dict, end: dict) -> dict:
+    """Calcola un percorso sul navmesh tra due punti (pathfinding sincrono,
+    non serve il PIE in esecuzione).
+
+    Args:
+        start, end: {"x":.., "y":.., "z":..} in centimetri.
+    """
+    return await run(f"result = mcp_nav_find_path({lit(start)}, {lit(end)})")
+
+
+@mcp.tool()
+async def ue_create_blackboard(package_path: str, name: str) -> dict:
+    """Crea un asset Blackboard Data vuoto (solo la chiave "SelfActor" di default)."""
+    return await run(f"result = mcp_create_blackboard({lit(package_path)}, {lit(name)})")
+
+
+@mcp.tool()
+async def ue_blackboard_add_key(blackboard_path: str, key_name: str, key_type: str = "object") -> dict:
+    """Aggiunge una chiave a un Blackboard Data esistente.
+
+    Args:
+        blackboard_path: es. "/Game/MyGame/AI/BB_Guard".
+        key_name: es. "TargetActor".
+        key_type: object | class | bool | int | float | string | name |
+            vector | rotator | enum.
+    """
+    return await run(
+        f"result = mcp_blackboard_add_key({lit(blackboard_path)}, {lit(key_name)}, {lit(key_type)})"
+    )
+
+
+@mcp.tool()
+async def ue_blackboard_info(blackboard_path: str) -> dict:
+    """Elenca le chiavi di un Blackboard Data esistente."""
+    return await run(f"result = mcp_blackboard_info({lit(blackboard_path)})")
+
+
+@mcp.tool()
+async def ue_create_behavior_tree(
+    package_path: str,
+    name: str,
+    blackboard_path: str | None = None,
+    root_composite: str = "BTComposite_Selector",
+) -> dict:
+    """Crea un Behavior Tree con un nodo radice già impostato (Selector o
+    Sequence), opzionalmente collegato a un Blackboard.
+
+    Args:
+        package_path: es. "/Game/MyGame/AI".
+        name: es. "BT_Guard".
+        blackboard_path: Blackboard da collegare (opzionale).
+        root_composite: "BTComposite_Selector" | "BTComposite_Sequence" |
+            qualunque classe composite valida.
+    """
+    return await run(
+        "result = mcp_create_behavior_tree("
+        f"{lit(package_path)}, {lit(name)}, {lit(blackboard_path)}, {lit(root_composite)})"
+    )
+
+
+@mcp.tool()
+async def ue_bt_add_node(bt_path: str, parent_path: str, node_class: str, index: int | None = None) -> dict:
+    """Aggiunge un nodo (composite o task) come figlio di un nodo composite esistente.
+
+    Il tipo di nodo (composite vs task) è dedotto dalla classe: se eredita da
+    BTCompositeNode va in ChildComposite, altrimenti in ChildTask. Usa
+    `ue_bt_info` per vedere i path esistenti prima di aggiungere.
+
+    Args:
+        bt_path: path del Behavior Tree.
+        parent_path: "root" per la radice, oppure un path tipo "0" o "0.1"
+            (indici dei figli separati da punto, restituiti da questa stessa
+            funzione o da `ue_bt_info`).
+        node_class: es. "BTComposite_Sequence", "BTTask_Wait", "BTTask_MoveTo".
+        index: posizione tra i figli esistenti (in coda se omesso).
+    """
+    return await run(
+        "result = mcp_bt_add_node("
+        f"{lit(bt_path)}, {lit(parent_path)}, {lit(node_class)}, {lit(index)})"
+    )
+
+
+@mcp.tool()
+async def ue_bt_add_decorator(bt_path: str, node_path: str, decorator_class: str) -> dict:
+    """Aggiunge un decorator (condizione) al child link di un nodo.
+
+    Args:
+        bt_path: path del Behavior Tree.
+        node_path: path del nodo (non può essere "root": la radice non ha un
+            child link proprio), es. "0" o "0.1".
+        decorator_class: es. "BTDecorator_Blackboard", "BTDecorator_Cooldown".
+    """
+    return await run(
+        f"result = mcp_bt_add_decorator({lit(bt_path)}, {lit(node_path)}, {lit(decorator_class)})"
+    )
+
+
+@mcp.tool()
+async def ue_bt_add_service(bt_path: str, node_path: str, service_class: str) -> dict:
+    """Aggiunge un service a un nodo composite (solo Selector/Sequence, non i task).
+
+    Args:
+        bt_path: path del Behavior Tree.
+        node_path: "root" o un path tipo "0" — deve essere un nodo composite.
+        service_class: es. "BTService_DefaultFocus".
+    """
+    return await run(
+        f"result = mcp_bt_add_service({lit(bt_path)}, {lit(node_path)}, {lit(service_class)})"
+    )
+
+
+@mcp.tool()
+async def ue_bt_set_node_property(bt_path: str, node_path: str, property_name: str, value: Any) -> dict:
+    """Imposta una proprietà su un nodo del Behavior Tree.
+
+    Gestisce in automatico i campi bindable da blackboard (es.
+    `BTTask_Wait.WaitTime`, uno struct `FValueOrBBKey_Float`): scrive nel
+    valore di default fisso invece che nella chiave blackboard.
+
+    Args:
+        bt_path: path del Behavior Tree.
+        node_path: "root" o un path tipo "0.1".
+        property_name: nome della proprietà UE (es. "WaitTime", "BlackboardKey").
+        value: valore JSON da scrivere (segue le stesse regole di ue_set_actor_property).
+    """
+    return await run(
+        "result = mcp_bt_set_node_property("
+        f"{lit(bt_path)}, {lit(node_path)}, {lit(property_name)}, {lit(value)})"
+    )
+
+
+@mcp.tool()
+async def ue_bt_info(bt_path: str) -> dict:
+    """Dump ricorsivo dell'albero di un Behavior Tree (nodi, decorator, service, path)."""
+    return await run(f"result = mcp_bt_info({lit(bt_path)})")
+
+
+@mcp.tool()
+async def ue_create_eqs_asset(package_path: str, name: str) -> dict:
+    """Crea un asset Environment Query (EQS) vuoto.
+
+    Le query (Options, generator, test) non sono raggiungibili da qui — stesso
+    limite del grafo Blueprint, del WidgetTree e dell'emitter stack Niagara.
+    Va costruito a mano nell'EQS Editor.
+
+    Args:
+        package_path: es. "/Game/MyGame/AI".
+        name: es. "EQS_FindCover".
+    """
+    return await run(f"result = mcp_create_eqs_asset({lit(package_path)}, {lit(name)})")
+
+
+# ========================================================================= GAS
+#
+# Il plugin GameplayAbilities va abilitato (`ue_project_set_plugins`) ed
+# editor riavviato prima che queste classi esistano in Python. GameplayEffect
+# e AttributeSet sono Blueprint "normali": si creano già con
+# `ue_create_blueprint` (`parent_class="GameplayEffect"`/`"AttributeSet"`).
+# Un attributo si aggiunge a un AttributeSet con `ue_add_variable`
+# (`var_type="struct"`, `sub_type="/Script/GameplayAbilities.GameplayAttributeData"`).
+# Il muro reale — `GameplayModifierInfo.Attribute`/`.ModifierOp` rifiutano
+# `set_editor_property` — è aggirato in `ue_ge_add_modifier` costruendo lo
+# struct intero via `import_text`, verificato dal vivo persistere dopo
+# salvataggio e ricarica dell'asset (non verificato in PIE).
+
+
+@mcp.tool()
+async def ue_create_gameplay_ability(
+    package_path: str,
+    name: str,
+    instancing_policy: str | None = None,
+    net_execution_policy: str | None = None,
+) -> dict:
+    """Crea un GameplayAbility Blueprint (asset dedicato, non un Blueprint generico).
+
+    La logica dell'abilità (ActivateAbility, i suoi nodi) resta un EdGraph
+    come tutti i grafi Blueprint — non scriptabile, va disegnata a mano.
+    Le proprietà dati invece si impostano già qui.
+
+    Args:
+        package_path: es. "/Game/MyGame/Abilities".
+        name: es. "GA_Dash".
+        instancing_policy: "InstancedPerActor" | "InstancedPerExecution" | "NonInstanced".
+        net_execution_policy: "LocalPredicted" | "LocalOnly" | "ServerInitiated" | "ServerOnly".
+    """
+    return await run(
+        "result = mcp_create_gameplay_ability("
+        f"{lit(package_path)}, {lit(name)}, {lit(instancing_policy)}, {lit(net_execution_policy)})"
+    )
+
+
+@mcp.tool()
+async def ue_create_gameplay_effect(
+    package_path: str, name: str, duration_policy: str | None = None, period: float | None = None
+) -> dict:
+    """Crea un GameplayEffect Blueprint (Blueprint generico con parent GameplayEffect).
+
+    Args:
+        package_path: es. "/Game/MyGame/Effects".
+        name: es. "GE_Damage".
+        duration_policy: "Instant" | "HasDuration" | "Infinite".
+        period: intervallo di applicazione in secondi (per effetti periodici).
+    """
+    return await run(
+        f"result = mcp_create_gameplay_effect({lit(package_path)}, {lit(name)}, {lit(duration_policy)}, {lit(period)})"
+    )
+
+
+@mcp.tool()
+async def ue_ge_add_modifier(
+    ge_path: str, attribute_set_path: str, attribute_name: str, modifier_op: str, magnitude: float
+) -> dict:
+    """Aggiunge un modifier a un GameplayEffect: collega un attributo di un
+    AttributeSet Blueprint esistente, un'operazione e un valore fisso.
+
+    Aggira un limite della Python API di UE (vedi nota sopra): il modo
+    normale di costruire un modifier è bloccato, questo tool lo aggira con
+    una tecnica di serializzazione testuale. Solo `ScalableFloat` costante,
+    niente curve o attribute-based magnitude per ora.
+
+    Args:
+        ge_path: path del GameplayEffect Blueprint.
+        attribute_set_path: path dell'AttributeSet Blueprint che possiede l'attributo.
+        attribute_name: nome della variabile GameplayAttributeData su quell'AttributeSet (es. "Health").
+        modifier_op: "add" | "add_final" | "multiply" | "divide" | "multiply_compound" | "override".
+        magnitude: valore fisso applicato (es. -10 per un danno di 10).
+    """
+    return await run(
+        "result = mcp_ge_add_modifier("
+        f"{lit(ge_path)}, {lit(attribute_set_path)}, {lit(attribute_name)}, {lit(modifier_op)}, {lit(magnitude)})"
+    )
+
+
+@mcp.tool()
+async def ue_ge_add_component(ge_path: str, component_class: str) -> dict:
+    """Aggiunge un GameplayEffectComponent (es. "AssetTagsGameplayEffectComponent",
+    "TargetTagRequirementsGameplayEffectComponent", "ChanceToApplyGameplayEffectComponent")
+    a un GameplayEffect. Solo l'aggiunta: configurare tag/condizioni al suo
+    interno non è coperto, usa `ue_exec_python` o l'editor."""
+    return await run(f"result = mcp_ge_add_component({lit(ge_path)}, {lit(component_class)})")
+
+
+@mcp.tool()
+async def ue_ge_info(ge_path: str) -> dict:
+    """Duration policy, periodo, modifier (attributo/operazione/valore) e
+    GameplayEffectComponent di un GameplayEffect esistente."""
+    return await run(f"result = mcp_ge_info({lit(ge_path)})")
+
+
+# ======================================================================= landscape
+#
+# **Creare** un landscape da Python non si può, verificato dal vivo su UE 5.8:
+# spawnare `Landscape` dà un `LandscapePlaceholder` vuoto, e le classi che lo
+# creano davvero (`LandscapeSubsystem`, `LandscapeEditorObject`,
+# `ActorFactoryLandscape`) non sono esposte al Python del motore. Il terreno
+# va creato una volta con Landscape Mode nell'editor: da lì in poi heightmap,
+# weightmap, materiale e grass si guidano da qui.
+
+
+@mcp.tool()
+async def ue_landscape_list() -> dict:
+    """I landscape presenti nel livello corrente.
+
+    Se la lista è vuota il livello non ha terreni, e nessun altro tool di
+    questa famiglia ha su cosa lavorare: aggiungine uno dall'editor con
+    Landscape Mode (Python non può crearlo)."""
+    return await run("result = mcp_landscape_list()")
+
+
+@mcp.tool()
+async def ue_landscape_info(label: str | None = None) -> dict:
+    """Componenti, materiale, target layer di pittura ed edit layer di un
+    landscape. Con un solo landscape nel livello `label` si può omettere."""
+    return await run(f"result = mcp_landscape_info({lit(label)})")
+
+
+@mcp.tool()
+async def ue_landscape_import_heightmap(
+    image_path: str,
+    label: str | None = None,
+    rt_format: str = "RGBA8",
+    from_rg_channel: bool = False,
+) -> dict:
+    """Sovrascrive l'heightmap di un landscape con un'immagine dal disco.
+
+    L'immagine viene importata come texture e disegnata in un render target
+    temporaneo, che è l'unica forma in cui Unreal accetta un heightmap da
+    script. Sovrascrive il terreno esistente: non è annullabile oltre l'undo
+    dell'editor.
+
+    Args:
+        image_path: file locale (PNG, EXR, TGA…). Va portato alla risoluzione
+            del landscape prima: il render target non lo riscala.
+        label: quale landscape, se il livello ne ha più di uno.
+        rt_format: "RGBA8" (8 bit, 256 livelli di altezza) | "RGBA16f" |
+            "RGBA32f". Per un heightmap a 16 bit serve un formato float.
+        from_rg_channel: solo per i formati float — legge l'altezza dai canali
+            R e G invece che dal solo R, che è come Unreal codifica i 16 bit.
+    """
+    return await run(
+        "result = mcp_landscape_import_heightmap("
+        f"{lit(image_path)}, {lit(label)}, {lit(rt_format)}, {bool(from_rg_channel)})"
+    )
+
+
+@mcp.tool()
+async def ue_landscape_import_weightmap(
+    layer_name: str, image_path: str, label: str | None = None, rt_format: str = "RGBA8"
+) -> dict:
+    """Dipinge un layer del landscape da un'immagine in scala di grigi
+    (bianco = layer al massimo, nero = assente).
+
+    Il layer deve già esistere: i target layer nascono dal materiale del
+    landscape, `ue_landscape_info` li elenca.
+    """
+    return await run(
+        "result = mcp_landscape_import_weightmap("
+        f"{lit(layer_name)}, {lit(image_path)}, {lit(label)}, {lit(rt_format)})"
+    )
+
+
+@mcp.tool()
+async def ue_landscape_export_heightmap(
+    output_dir: str,
+    file_name: str,
+    label: str | None = None,
+    resolution: int = 1024,
+    rt_format: str = "RGBA8",
+    into_rg_channel: bool = False,
+) -> dict:
+    """Esporta l'heightmap del landscape come immagine sul disco.
+
+    Il formato del file lo decide il render target: RGBA8 esce in PNG, i
+    formati float in HDR.
+
+    Args:
+        output_dir: cartella locale di destinazione.
+        file_name: nome del file, estensione compresa.
+        label: quale landscape, se il livello ne ha più di uno.
+        resolution: lato del render target in pixel (quadrato).
+        rt_format: "RGBA8" | "RGBA16f" | "RGBA32f".
+        into_rg_channel: comprime i 16 bit di altezza nei canali R e G.
+    """
+    return await run(
+        "result = mcp_landscape_export_heightmap("
+        f"{lit(output_dir)}, {lit(file_name)}, {lit(label)}, {int(resolution)}, "
+        f"{lit(rt_format)}, {bool(into_rg_channel)})"
+    )
+
+
+@mcp.tool()
+async def ue_landscape_set_material(material_path: str, label: str | None = None) -> dict:
+    """Assegna il materiale al landscape. È il materiale che definisce quali
+    target layer si possono dipingere: cambiarlo cambia la lista."""
+    return await run(f"result = mcp_landscape_set_material({lit(material_path)}, {lit(label)})")
+
+
+@mcp.tool()
+async def ue_landscape_set_grass(enabled: bool = True, label: str | None = None) -> dict:
+    """Accende o spegne il grass system del landscape (l'erba procedurale
+    generata dal materiale)."""
+    return await run(f"result = mcp_landscape_set_grass({bool(enabled)}, {lit(label)})")
+
+
+# ============================================================================ PCG
+#
+# La sorpresa della roadmap: a differenza di Blueprint, UMG e Niagara, il
+# grafo PCG è pienamente scriptabile — nodi, archi, posizioni e proprietà,
+# verificati dal vivo su UE 5.8 costruendo Input → SurfaceSampler →
+# StaticMeshSpawner, salvando e rileggendo l'asset da zero. Il motivo è lo
+# stesso dei Behavior Tree: è un grafo di dati veri, non un `EdGraph` di nodi
+# K2 con il contenuto in una proprietà protetta.
+#
+# Il plugin PCG dev'essere abilitato nel progetto (`ue_project_set_plugins`).
+
+
+@mcp.tool()
+async def ue_create_pcg_graph(package_path: str, name: str) -> dict:
+    """Crea un asset PCGGraph vuoto — con i suoi nodi Input e Output già dentro.
+
+    Args:
+        package_path: es. "/Game/MyGame/PCG".
+        name: es. "PCG_Foresta".
+    """
+    return await run(f"result = mcp_create_pcg_graph({lit(package_path)}, {lit(name)})")
+
+
+@mcp.tool()
+async def ue_pcg_add_node(
+    graph_path: str, settings_class: str, position: dict | list | None = None
+) -> dict:
+    """Aggiunge un nodo al grafo PCG e restituisce i suoi pin.
+
+    In PCG il tipo di un nodo *è* la sua classe di settings: un SurfaceSampler
+    è un nodo con `PCGSurfaceSamplerSettings`, uno spawner di mesh ha
+    `PCGStaticMeshSpawnerSettings`. La convenzione è sempre
+    `PCG<Nome>Settings`.
+
+    Args:
+        graph_path: path dell'asset PCGGraph.
+        settings_class: es. "PCGSurfaceSamplerSettings", "PCGStaticMeshSpawnerSettings",
+            "PCGCreatePointsGridSettings", "PCGDensityFilterSettings".
+        position: posizione nell'editor del grafo, {"x": .., "y": ..} o [x, y].
+            Serve solo alla leggibilità per chi apre il grafo a mano.
+    """
+    return await run(
+        f"result = mcp_pcg_add_node({lit(graph_path)}, {lit(settings_class)}, {lit(position)})"
+    )
+
+
+@mcp.tool()
+async def ue_pcg_connect(
+    graph_path: str, from_node: str, from_pin: str, to_node: str, to_pin: str
+) -> dict:
+    """Collega l'uscita di un nodo PCG all'ingresso di un altro.
+
+    `from_node` e `to_node` accettano il nome del nodo (come lo restituisce
+    `ue_pcg_add_node`) oppure gli alias "input" e "output" per i due nodi che
+    ogni grafo ha già. I nomi dei pin sono quelli elencati da
+    `ue_pcg_add_node` / `ue_pcg_graph_info`, spazi compresi ("Bounding Shape").
+    """
+    return await run(
+        "result = mcp_pcg_connect("
+        f"{lit(graph_path)}, {lit(from_node)}, {lit(from_pin)}, {lit(to_node)}, {lit(to_pin)})"
+    )
+
+
+@mcp.tool()
+async def ue_pcg_disconnect(
+    graph_path: str, from_node: str, from_pin: str, to_node: str, to_pin: str
+) -> dict:
+    """Rimuove un collegamento fra due nodi del grafo PCG."""
+    return await run(
+        "result = mcp_pcg_disconnect("
+        f"{lit(graph_path)}, {lit(from_node)}, {lit(from_pin)}, {lit(to_node)}, {lit(to_pin)})"
+    )
+
+
+@mcp.tool()
+async def ue_pcg_remove_node(graph_path: str, node: str) -> dict:
+    """Toglie un nodo dal grafo PCG, con tutti i suoi collegamenti."""
+    return await run(f"result = mcp_pcg_remove_node({lit(graph_path)}, {lit(node)})")
+
+
+@mcp.tool()
+async def ue_pcg_set_node_property(
+    graph_path: str, node: str, property_name: str, value: object
+) -> dict:
+    """Imposta una proprietà sulle settings di un nodo PCG.
+
+    Args:
+        graph_path: path del grafo.
+        node: nome del nodo.
+        property_name: es. "points_per_squared_meter" su un SurfaceSampler,
+            "seed" su quasi tutti i nodi.
+        value: valore JSON; i path "/Game/..." vengono caricati come asset.
+    """
+    return await run(
+        "result = mcp_pcg_set_node_property("
+        f"{lit(graph_path)}, {lit(node)}, {lit(property_name)}, {lit(value)})"
+    )
+
+
+@mcp.tool()
+async def ue_pcg_graph_info(graph_path: str) -> dict:
+    """Nodi (nome, classe di settings, pin, posizione) e archi di un grafo PCG.
+
+    È il modo di sapere come si chiamano i pin prima di collegarli."""
+    return await run(f"result = mcp_pcg_graph_info({lit(graph_path)})")
+
+
+@mcp.tool()
+async def ue_pcg_spawn_volume(
+    graph_path: str,
+    label: str | None = None,
+    location: dict | list | None = None,
+    size: dict | list | None = None,
+) -> dict:
+    """Piazza un PCGVolume nel livello con il grafo già collegato.
+
+    Il volume è il dominio in cui il grafo lavora: senza, il grafo non ha
+    niente su cui generare.
+
+    Args:
+        graph_path: grafo da collegare.
+        label: nome dell'attore nel livello.
+        location: centro del volume in cm. Attenzione al centro del mondo: se
+            il livello è costruito lontano da [0,0,0], lì il volume è fuori
+            campo — leggi prima un attore di riferimento con `ue_list_actors`.
+        size: dimensioni in cm, {"x":..,"y":..,"z":..}. Default 200×200×200.
+    """
+    return await run(
+        "result = mcp_pcg_spawn_volume("
+        f"{lit(graph_path)}, {lit(label)}, {lit(location)}, {lit(size)})"
+    )
+
+
+@mcp.tool()
+async def ue_pcg_generate(label: str, force: bool = True) -> dict:
+    """Fa rigenerare il PCG di un attore (un PCGVolume o qualunque attore con
+    un PCGComponent). Da chiamare dopo aver modificato il grafo."""
+    return await run(f"result = mcp_pcg_generate({lit(label)}, {bool(force)})")
+
+
+@mcp.tool()
+async def ue_pcg_cleanup(label: str, remove_components: bool = True) -> dict:
+    """Cancella quello che il PCG ha generato su un attore, lasciando il grafo
+    e il volume al loro posto."""
+    return await run(f"result = mcp_pcg_cleanup({lit(label)}, {bool(remove_components)})")
 
 
 # ================================================================== resources
