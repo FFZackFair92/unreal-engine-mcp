@@ -298,3 +298,146 @@ ma la ricerca: una proprietà protetta chiude *una strada*, non *la
 destinazione*, e prima di dichiarare un fronte chiuso vale la pena cercare
 quale classe del motore fa quel lavoro. UMG, Niagara ed EQS sono ancora
 chiusi con la conoscenza attuale, ma vanno rivisitati a ogni major.
+
+**Confronto con la concorrenza (2026-07-31, v0.9.0, 143 tool)**: verificato
+lo stato del repo dopo le fasi 8-10 (test suite verde, `ruff check .` pulito,
+`docs/TOOLS.it.md` allineato a `docs/TOOLS.md` — mancavano 13 tool tradotti,
+corretto) e confrontato con due concorrenti attivi:
+
+- **db-lyon/ue-mcp** (21 categorie, 569+ azioni secondo il README attuale —
+  la cifra di 24/736+ vista su alcuni aggregatori è superata): ha **foliage**
+  (nessun tool nostro) e **sequencer come authoring**, non solo render
+  (`ue_render_sequence`/`ue_render_status` renderizzano una sequenza già
+  fatta, non ne creano/editano le track). Ha anche una **modalità offline**
+  (parsing di `.uasset`/`.umap` via UAssetAPI senza editor aperto) e un
+  **motore di flow YAML** per incatenare più chiamate — entrambe assenti qui.
+- **ChiR24/Unreal_mcp** (23 tool esposti, plugin C++ nativo "Automation
+  Bridge" + server TypeScript): copre anche `manage_geometry` (Geometry
+  Script), sequencer completo, e tool gameplay di alto livello
+  (combattimento, inventario, interazione) che qui non esistono.
+
+Nessuna di queste capacità è strutturalmente irraggiungibile con l'approccio
+attuale (editor live + Remote Control API Python): foliage
+(`EditorFoliageLibrary`) e sequencer (`LevelSequenceEditorBlueprintLibrary`,
+`MovieScene*`) sono scriptabili in Python come landscape/PCG/animazione, e il
+motore di flow YAML vive lato server MCP, non richiede API engine. Il vero
+limite dell'approccio Python-only è throughput per chiamate batch e accesso a
+`UPROPERTY`/`UFUNCTION` non esposte a Python — non una categoria di feature
+specifica. La modalità offline .uasset è l'unica cosa davvero fuori scope: un
+sottosistema parallelo (parser binario, nuova dipendenza), non un tool in
+più. Priorità suggerita per una fase 12 futura: foliage (facile) → sequencer
+authoring (gap più citato, sforzo medio) → flow YAML (facile, solo server) →
+valutare offline parsing come iniziativa separata.
+
+## Fase 14: i tre gap del confronto, chiusi
+
+✅ fatta il 31/07/2026, seguendo alla lettera la priorità suggerita sopra.
+Foliage, sequencer authoring e motore di flow YAML: i tre gap rimasti dopo la
+chiusura della roadmap principale. 162 tool pubblici ora.
+
+### 14a — Foliage
+
+`ue_create_foliage_type`, `ue_set_foliage_property`,
+`ue_foliage_add_instances`, `ue_foliage_scatter`, `ue_foliage_list`,
+`ue_foliage_query`, `ue_foliage_remove`, `ue_create_foliage_spawner`,
+`ue_foliage_spawn_volume`, `ue_foliage_simulate`.
+
+Interamente scriptabile, ma **non dalla porta che il nome suggerisce**:
+`EditorFoliageLibrary` e `FoliageEditorSubsystem` non esistono nella Python API
+di UE 5.8 — verificato con `hasattr` prima di scrivere una riga, come ormai è
+prassi. Quello che esiste è `InstancedFoliageActor.add_instances` /
+`remove_all_instances` (UFUNCTION statiche vere) e i
+`FoliageInstancedStaticMeshComponent` dell'`InstancedFoliageActor` del livello,
+che espongono `get_instances_overlapping_sphere`, `get_instance_transform`,
+`remove_instances`, `get_instance_count`.
+
+**La trappola della fase, e vale la pena ricordarla**: `FoliageStatistics` — la
+libreria che *sembra* fatta apposta per contare le istanze — risponde sempre 0
+nel mondo dell'editor. Provata dal vivo su un box che ne conteneva davvero
+cinque, con entrambi i world context plausibili (l'`InstancedFoliageActor` e il
+world dell'editor): zero in tutti e due i casi. È una libreria di gameplay e
+vuole un mondo di gioco. Se `mcp_foliage_query` fosse passato da lì avrebbe
+risposto "nessuna istanza" su un livello pieno di foliage, senza errori — il
+peggior tipo di bug. Passa invece dai componenti.
+
+Seconda trappola, più piccola ma istruttiva: `line_trace_single` restituisce un
+`HitResult` che è chiuso da tutte e due le parti. `colpo.blocking_hit` è un
+`AttributeError`, e `colpo.get_editor_property("blocking_hit")` risponde
+"Failed to find property". L'unica via che funziona è `to_dict()`. Entrambe
+scoperte facendo fallire il codice sull'editor vero, non leggendo la
+documentazione.
+
+Verificato dal vivo su UE 5.8: FoliageType da `/Engine/BasicShapes/Cube`, due
+istanze esplicite più dodici sparse con seed fisso, query che le ritrova con le
+trasformate in world space, rimozione dentro una sfera (8 tolte, 6 rimaste),
+spawner procedurale con volume collegato e risimulazione.
+
+### 14b — Sequencer authoring
+
+`ue_create_level_sequence`, `ue_sequence_info`, `ue_sequence_add_actor`,
+`ue_sequence_add_track`, `ue_sequence_add_key`, `ue_sequence_set_range`,
+`ue_sequence_remove`, `ue_sequence_open`.
+
+Nessun muro, contro le aspettative maturate su UMG e Niagara:
+`MovieSceneSequenceExtensions`, `MovieSceneBindingExtensions`,
+`MovieSceneTrackExtensions` e `MovieSceneSectionExtensions` sono esposte per
+intero, e i canali hanno `add_key`/`get_keys`/`remove_key`. Il sequencer era
+già presente ma in una direzione sola: `ue_render_sequence` renderizza una
+sequenza che ha costruito qualcun altro.
+
+**Due trappole, entrambe gestite dai tool e riprodotte anche nel finto**, perché
+sono esattamente il genere di cosa che un test con nomi hard-coded non vedrebbe
+mai:
+
+1. I nomi dei canali hanno un suffisso numerico **instabile**: la stessa
+   sezione di trasformata ha dato `Location.Z_0` alla prima creazione e
+   `Location.Z_3` alla seconda, nella stessa sessione di editor. I tool
+   indirizzano i canali per nome senza suffisso.
+2. I nomi visualizzati di track e binding sono **localizzati** — su editor
+   italiano la track di trasformata si chiama "Trasforma", esattamente come la
+   palette dei nodi Blueprint della fase 11. Le track si indirizzano per tipo o
+   per indice, mai per nome.
+
+Verificato dal vivo su UE 5.8: sequenza a 30 fps, attore possessato, track di
+trasformata con due chiavi su `Rotation.Y`, track di visibilità con una chiave
+booleana, salvata e ritrovata nel `.uasset` (i nomi
+`MovieScene3DTransformTrack`, `MovieSceneVisibilityTrack`, il binding e la
+sezione ci sono tutti). Provate anche rimozione di track e di binding, cambio
+di range e frame rate, e apertura/chiusura della finestra del Sequencer.
+
+### 14c — Motore di flow YAML
+
+`ue_flow_run`.
+
+L'unica delle tre che non tocca l'editor: vive interamente lato server e si
+limita a chiamare i tool che già esistono. Il motivo è il contesto e non la
+velocità — una scena si costruisce quasi sempre con la stessa sequenza di dieci
+o venti chiamate, e farla passare dal modello un passo alla volta gli lascia in
+memoria diciannove risposte JSON che non gli servono più.
+
+Tre scelte da ricordare:
+
+- **PyYAML è opzionale.** Il repo tiene le dipendenze al minimo per scelta, e
+  JSON è un sottoinsieme di YAML: senza PyYAML i flow JSON funzionano e quelli
+  YAML danno un errore che dice come installarlo, invece di un traceback dentro
+  il parser.
+- **Niente `eval`, da nessuna parte.** I riferimenti sono un percorso puntato
+  con una regex stretta, e le condizioni sono tre forme dichiarative
+  (`equals`, `not_equals`, `exists`). Un flow non deve poter eseguire codice
+  arbitrario. Per lo stesso motivo la risoluzione dei tool filtra sui prefissi
+  `ue_`/`preset_`: senza, un flow potrebbe chiamare `run` e mandare Python
+  qualunque dentro l'editor.
+- **Il dry run ha un segnaposto per i `save`.** Senza, ogni flow che usa il
+  risultato di un passo precedente — cioè quasi ogni flow — risulterebbe rotto
+  in dry run, e il dry run smetterebbe di essere utile proprio dove serve.
+
+Niente cicli, niente espressioni: la logica sta in chi genera il flow.
+
+### Cosa resta
+
+Il **parsing offline di `.uasset`/`.umap`** (la modalità senza editor di
+db-lyon) resta l'unica cosa fuori scope, e per la stessa ragione di prima: è un
+sottosistema parallelo — parser binario, nuova dipendenza — non un tool in più.
+Restano fuori anche i tool gameplay di alto livello di ChiR24 (combattimento,
+inventario, interazione), che però sono composizioni di primitive, non
+capacità mancanti: il posto giusto per quelli è `local_tools.py`, o un flow.

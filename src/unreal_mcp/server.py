@@ -16,6 +16,7 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP, Image
 
 from . import assets, local
+from . import flow as flow_engine
 from .bridge import (
     BridgeConfig,
     UnrealBridge,
@@ -55,6 +56,13 @@ mcp = FastMCP(
         "(ue_create_material, ue_bt_add_node, ue_pcg_add_node/ue_pcg_connect). "
         "A landscape cannot be created from Python — it has to exist already "
         "(Landscape Mode in the editor); ue_landscape_* then drives it. "
+        "Foliage and Level Sequences are fully authorable "
+        "(ue_foliage_scatter/ue_foliage_query, ue_sequence_add_track/ue_sequence_add_key); "
+        "for sequences, name channels without their numeric suffix ('Location.Z', not "
+        "'Location.Z_3' — the suffix is unstable) and address tracks by type or index, "
+        "because display names are localised. "
+        "When the same scene takes ten or twenty calls, write them once as a YAML flow "
+        "and run ue_flow_run (dry_run=True first) instead of spending a turn per call. "
         "Do not assume the action is at the world origin: real levels are often built "
         "thousands of units away from [0,0,0], so an actor spawned there can be "
         "off-screen and invisible. Anchor new actors to what is already in the scene — "
@@ -2855,6 +2863,516 @@ async def ue_pcg_cleanup(label: str, remove_components: bool = True) -> dict:
     """Cancella quello che il PCG ha generato su un attore, lasciando il grafo
     e il volume al loro posto."""
     return await run(f"result = mcp_pcg_cleanup({lit(label)}, {bool(remove_components)})")
+
+
+# ======================================================================= FOLIAGE
+#
+# Il gap più citato nel confronto con db-lyon/ue-mcp, e si è rivelato
+# interamente scriptabile — ma non da `EditorFoliageLibrary`, che su UE 5.8 non
+# esiste proprio. Si passa da `InstancedFoliageActor.add_instances` e dai
+# `FoliageInstancedStaticMeshComponent` del livello.
+#
+# Attenzione a `FoliageStatistics`: è la libreria che *sembra* fatta per
+# contare le istanze, e nel mondo dell'editor risponde sempre 0 (verificato dal
+# vivo su un box con 5 istanze dentro). `ue_foliage_query` non la usa.
+
+
+@mcp.tool()
+async def ue_create_foliage_type(
+    package_path: str, name: str, mesh_path: str, properties: dict | None = None
+) -> dict:
+    """Crea un FoliageType a partire da una static mesh.
+
+    Il FoliageType è la "specie": dice quale mesh piazzare e con quali regole
+    (densità, scala casuale, allineamento alla normale, collisione). Le istanze
+    si piazzano poi con `ue_foliage_add_instances` o `ue_foliage_scatter`.
+
+    Args:
+        package_path: es. "/Game/MyGame/Foliage".
+        name: es. "FT_Erba".
+        mesh_path: la static mesh, es. "/Game/Meshes/SM_Erba".
+        properties: proprietà iniziali, es. {"density": 300, "random_yaw": True}.
+    """
+    return await run(
+        "result = mcp_create_foliage_type("
+        f"{lit(package_path)}, {lit(name)}, {lit(mesh_path)}, {lit(properties)})"
+    )
+
+
+@mcp.tool()
+async def ue_set_foliage_property(
+    foliage_type_path: str, property_name: str, value: object
+) -> dict:
+    """Scrive una proprietà su un FoliageType e rilegge il valore risultante.
+
+    Args:
+        foliage_type_path: path dell'asset FoliageType.
+        property_name: es. "density", "radius", "random_yaw", "align_to_normal",
+            "scale_x", "collision_with_world", "cull_distance".
+        value: valore JSON; i path "/Game/..." vengono caricati come asset.
+    """
+    return await run(
+        "result = mcp_set_foliage_property("
+        f"{lit(foliage_type_path)}, {lit(property_name)}, {lit(value)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_add_instances(foliage_type_path: str, transforms: list) -> dict:
+    """Piazza istanze di foliage alle trasformate date, nel livello corrente.
+
+    Args:
+        foliage_type_path: path dell'asset FoliageType.
+        transforms: lista di {"location": {...}, "rotation": {...}, "scale": {...}}
+            — oppure di sole posizioni ([x,y,z] o {"x":..}) quando rotazione e
+            scala non interessano. Le posizioni sono in cm: se il livello è
+            costruito lontano dall'origine, leggi prima un attore di riferimento
+            con `ue_list_actors`.
+    """
+    return await run(
+        f"result = mcp_foliage_add_instances({lit(foliage_type_path)}, {lit(transforms)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_scatter(
+    foliage_type_path: str,
+    center: dict | list,
+    radius: float,
+    count: int,
+    seed: int | None = None,
+    align_to_ground: bool = True,
+    z_offset: float = 0.0,
+) -> dict:
+    """Sparge N istanze a caso in un cerchio, appoggiandole al terreno.
+
+    È il tool da usare per riempire una zona: `ue_foliage_add_instances` vuole
+    ogni trasformata scritta a mano.
+
+    Args:
+        foliage_type_path: path dell'asset FoliageType.
+        center: centro del cerchio in cm.
+        radius: raggio in cm.
+        count: quante istanze.
+        seed: seme del generatore — passalo per ottenere due volte lo stesso
+            risultato.
+        align_to_ground: appoggia ogni istanza a terra con un line trace
+            dall'alto. Senza, restano tutte alla quota del centro.
+        z_offset: alza (o abbassa) di tanto ogni istanza dopo l'appoggio.
+    """
+    return await run(
+        "result = mcp_foliage_scatter("
+        f"{lit(foliage_type_path)}, {lit(center)}, {float(radius)}, {int(count)}, "
+        f"{lit(seed)}, {bool(align_to_ground)}, {float(z_offset)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_list() -> dict:
+    """Il foliage piazzato nel livello: mesh, componente e numero di istanze.
+
+    Elenca quello che c'è davvero nel livello, non i FoliageType come asset
+    (per quelli usa `ue_list_assets`)."""
+    return await run("result = mcp_foliage_list()")
+
+
+@mcp.tool()
+async def ue_foliage_query(
+    foliage_type_path: str, center: dict | list, radius: float, limit: int = 100
+) -> dict:
+    """Le istanze di un FoliageType dentro una sfera, con le loro trasformate.
+
+    Args:
+        foliage_type_path: path dell'asset FoliageType.
+        center: centro della sfera in cm.
+        radius: raggio in cm.
+        limit: quante trasformate restituire al massimo (il conteggio totale è
+            sempre esatto).
+    """
+    return await run(
+        "result = mcp_foliage_query("
+        f"{lit(foliage_type_path)}, {lit(center)}, {float(radius)}, {int(limit)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_remove(
+    foliage_type_path: str,
+    center: dict | list | None = None,
+    radius: float | None = None,
+) -> dict:
+    """Toglie istanze di foliage: tutte, o solo quelle dentro una sfera.
+
+    Senza `center` e `radius` cancella tutte le istanze di quel FoliageType nel
+    livello."""
+    return await run(
+        "result = mcp_foliage_remove("
+        f"{lit(foliage_type_path)}, {lit(center)}, {lit(radius)})"
+    )
+
+
+@mcp.tool()
+async def ue_create_foliage_spawner(
+    package_path: str,
+    name: str,
+    foliage_types: list[str] | None = None,
+    tile_size: float | None = None,
+) -> dict:
+    """Crea un ProceduralFoliageSpawner con dentro i suoi FoliageType.
+
+    Lo spawner è la ricetta (quali specie, con quale competizione fra loro); il
+    volume creato da `ue_foliage_spawn_volume` è dove viene applicata.
+
+    Args:
+        package_path: es. "/Game/MyGame/Foliage".
+        name: es. "PFS_Bosco".
+        foliage_types: path dei FoliageType da includere.
+        tile_size: lato della tile di simulazione in cm (default 10000).
+    """
+    return await run(
+        "result = mcp_create_foliage_spawner("
+        f"{lit(package_path)}, {lit(name)}, {lit(foliage_types)}, {lit(tile_size)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_spawn_volume(
+    spawner_path: str,
+    label: str | None = None,
+    location: dict | list | None = None,
+    size: dict | list | None = None,
+) -> dict:
+    """Piazza un ProceduralFoliageVolume con lo spawner già collegato.
+
+    Args:
+        spawner_path: path del ProceduralFoliageSpawner.
+        label: nome dell'attore nel livello.
+        location: centro del volume in cm (occhio all'origine del mondo).
+        size: dimensioni in cm. Default 200×200×200.
+    """
+    return await run(
+        "result = mcp_foliage_spawn_volume("
+        f"{lit(spawner_path)}, {lit(label)}, {lit(location)}, {lit(size)})"
+    )
+
+
+@mcp.tool()
+async def ue_foliage_simulate(label: str, clear: bool = False) -> dict:
+    """Fa simulare il foliage procedurale di un volume — o lo azzera con
+    `clear=True`. Da chiamare dopo aver cambiato lo spawner."""
+    return await run(f"result = mcp_foliage_simulate({lit(label)}, {bool(clear)})")
+
+
+# ===================================================================== SEQUENCER
+#
+# Fino alla 0.9.0 il sequencer c'era solo in uscita: `ue_render_sequence`
+# renderizza una sequenza già fatta. Questi tool la costruiscono.
+#
+# Due cose da sapere prima di usarli, entrambe trovate dal vivo su UE 5.8:
+# i nomi dei canali hanno un suffisso numerico instabile (si indica
+# "Location.Z", non "Location.Z_3"), e i nomi visualizzati di track e binding
+# sono localizzati — per questo le track si indirizzano per tipo o per indice.
+
+
+@mcp.tool()
+async def ue_create_level_sequence(
+    package_path: str, name: str, fps: int | None = None, length_frames: int | None = None
+) -> dict:
+    """Crea una Level Sequence vuota.
+
+    Args:
+        package_path: es. "/Game/MyGame/Cinematics".
+        name: es. "LS_Intro".
+        fps: frame rate di visualizzazione (default 30).
+        length_frames: durata in frame; imposta il range di playback da 0.
+    """
+    return await run(
+        "result = mcp_create_level_sequence("
+        f"{lit(package_path)}, {lit(name)}, {lit(fps)}, {lit(length_frames)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_info(sequence_path: str) -> dict:
+    """Binding, track, sezioni e canali di una Level Sequence.
+
+    Chiamalo prima di mettere chiavi: è il modo di sapere come si chiamano i
+    canali e quali indici usare per track e sezioni."""
+    return await run(f"result = mcp_sequence_info({lit(sequence_path)})")
+
+
+@mcp.tool()
+async def ue_sequence_add_actor(
+    sequence_path: str, label: str, spawnable: bool = False
+) -> dict:
+    """Aggiunge un attore del livello alla sequenza.
+
+    Args:
+        sequence_path: path della Level Sequence.
+        label: label dell'attore nel livello.
+        spawnable: se True la sequenza si porta dietro una copia dell'attore e
+            la crea e distrugge da sé (cinematica autonoma); se False anima
+            l'attore che è già nel livello.
+    """
+    return await run(
+        f"result = mcp_sequence_add_actor({lit(sequence_path)}, {lit(label)}, {bool(spawnable)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_add_track(
+    sequence_path: str,
+    binding: str,
+    track_type: str,
+    start: int | None = None,
+    end: int | None = None,
+) -> dict:
+    """Aggiunge una track a un binding, con la sua prima sezione già dentro.
+
+    Args:
+        sequence_path: path della Level Sequence.
+        binding: nome del binding (di norma la label dell'attore) o il suo indice.
+        track_type: alias comodo — "transform", "visibility", "audio",
+            "animation", "camera_cut", "event", "fade" — oppure il nome esatto
+            della classe (es. "MovieSceneFloatTrack").
+        start: primo frame della sezione (default: inizio del playback).
+        end: ultimo frame della sezione (default: fine del playback).
+    """
+    return await run(
+        "result = mcp_sequence_add_track("
+        f"{lit(sequence_path)}, {lit(binding)}, {lit(track_type)}, {lit(start)}, {lit(end)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_add_key(
+    sequence_path: str,
+    binding: str,
+    channel: str,
+    frame: int,
+    value: object,
+    track: int | None = None,
+    track_type: str | None = None,
+    section: int = 0,
+    interpolation: str | None = None,
+) -> dict:
+    """Mette una chiave su un canale e rilegge tutte le chiavi del canale.
+
+    Args:
+        sequence_path: path della Level Sequence.
+        binding: nome o indice del binding.
+        channel: nome del canale **senza suffisso numerico** — "Location.Z",
+            "Rotation.Y", "Scale.X". Il suffisso che Unreal appiccica
+            ("Location.Z_3") cambia da una creazione all'altra: elencali con
+            `ue_sequence_info`.
+        frame: numero di frame.
+        value: valore (float, int o bool a seconda del canale).
+        track: indice della track nel binding. Se il binding ne ha una sola,
+            si può omettere.
+        track_type: in alternativa a `track`, il tipo di track da cercare.
+        section: indice della sezione nella track (default 0).
+        interpolation: AUTO, USER, BREAK, LINEAR, CONSTANT.
+    """
+    return await run(
+        "result = mcp_sequence_add_key("
+        f"{lit(sequence_path)}, {lit(binding)}, {lit(channel)}, {int(frame)}, {lit(value)}, "
+        f"{lit(track)}, {lit(track_type)}, {int(section)}, {lit(interpolation)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_set_range(
+    sequence_path: str,
+    start: int | None = None,
+    end: int | None = None,
+    fps: int | None = None,
+) -> dict:
+    """Cambia il range di playback e/o il frame rate della sequenza."""
+    return await run(
+        "result = mcp_sequence_set_range("
+        f"{lit(sequence_path)}, {lit(start)}, {lit(end)}, {lit(fps)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_remove(
+    sequence_path: str,
+    binding: str,
+    track: int | None = None,
+    track_type: str | None = None,
+) -> dict:
+    """Toglie una track da un binding — o l'intero binding, se non indichi
+    né `track` né `track_type`."""
+    return await run(
+        "result = mcp_sequence_remove("
+        f"{lit(sequence_path)}, {lit(binding)}, {lit(track)}, {lit(track_type)})"
+    )
+
+
+@mcp.tool()
+async def ue_sequence_open(sequence_path: str, close: bool = False) -> dict:
+    """Apre la sequenza nell'editor del Sequencer (o la chiude con `close=True`).
+
+    I tool scrivono sull'asset e basta: questo è il modo di vedere il risultato
+    senza cercare l'asset a mano nel Content Browser."""
+    return await run(f"result = mcp_sequence_open({lit(sequence_path)}, {bool(close)})")
+
+
+# ========================================================================== FLOW
+#
+# Un flow è una lista di chiamate a tool descritta in YAML (o JSON) ed eseguita
+# in una sola chiamata MCP. Vive interamente lato server: non tocca l'editor se
+# non attraverso i tool che invoca, e `ue_flow_run(dry_run=True)` non lo tocca
+# affatto.
+#
+# Il motivo è il contesto, non la velocità: una scena si costruisce quasi
+# sempre con la stessa sequenza di dieci o venti chiamate, e farla passare dal
+# modello un passo alla volta gli lascia in memoria diciannove risposte JSON
+# che non gli servono più.
+
+
+def _tool_di_flow(nome: str):
+    """Risolve un nome di tool alla funzione del modulo, con un errore utile.
+
+    I tool sono funzioni a livello di modulo con lo stesso nome del tool: la
+    risoluzione passa da lì e non dal registry di FastMCP, che cambia forma fra
+    le versioni. Il filtro esclude tutto ciò che non è un tool per evitare che
+    un flow chiami `run`, `lit` o qualunque altro interno.
+    """
+    candidato = globals().get(nome)
+    disponibili = {
+        chiave
+        for chiave, valore in globals().items()
+        if chiave.startswith(("ue_", "preset_")) and callable(valore)
+    }
+    if nome not in disponibili or candidato is None:
+        vicini = sorted(t for t in disponibili if nome.split("_")[-1] in t)[:5]
+        raise RuntimeError(
+            f"Il flow chiama un tool che non esiste: '{nome}'."
+            + (f" Forse intendevi: {', '.join(vicini)}." if vicini else "")
+        )
+    if nome == "ue_flow_run":
+        raise RuntimeError("Un flow non può chiamare se stesso.")
+    return candidato
+
+
+@mcp.tool()
+async def ue_flow_run(
+    flow: str,
+    variables: dict | None = None,
+    dry_run: bool = False,
+    stop_on_error: bool = True,
+) -> dict:
+    """Esegue una sequenza di chiamate a tool descritta in YAML (o JSON).
+
+    Serve quando la stessa scena si costruisce con dieci o venti chiamate
+    sempre uguali: il flow le descrive una volta e le esegue in un colpo solo,
+    restituendo il riassunto invece di venti risposte intere.
+
+    Forma di un flow::
+
+        variables:
+          base: {x: 0, y: 0, z: 100}
+        steps:
+          - tool: ue_spawn_actor
+            args: {class_name: StaticMeshActor, location: "${base}", label: Cubo}
+            save: cubo
+          - tool: ue_set_actor_transform
+            args: {label: "${cubo.label}", scale: [2, 2, 2]}
+          - tool: ue_screenshot
+            when: {exists: cubo.label}
+
+    Ogni passo accetta `tool`, `args`, `save` (nome della variabile in cui
+    mettere il risultato), `when` (booleano, `${riferimento}`, o
+    `{equals: [a,b]}` / `{not_equals: [a,b]}` / `{exists: percorso}`),
+    `continue_on_error` e `name`.
+
+    Nei valori, `${nome}` e `${nome.chiave.0}` riprendono quello che un passo
+    precedente ha salvato. Una stringa fatta solo di riferimento conserva il
+    tipo del valore (un dict resta un dict); dentro una frase viene interpolata
+    come testo.
+
+    Non ci sono cicli né espressioni, ed è voluto: la logica sta in chi scrive
+    il flow, non nel flow.
+
+    Args:
+        flow: il testo YAML/JSON, oppure il path di un file .yaml/.json.
+        variables: variabili iniziali, che si sommano a quelle del flow.
+        dry_run: valida forma, nomi dei tool e riferimenti senza eseguire
+            niente. Da usare sempre la prima volta che un flow gira.
+        stop_on_error: fermarsi al primo passo fallito. Con False prosegue e
+            riporta gli errori nel riassunto (un singolo passo può comunque
+            dichiarare `continue_on_error: true`).
+    """
+    try:
+        definizione = flow_engine.carica_flow(flow)
+        passi = flow_engine.normalizza_passi(definizione)
+    except flow_engine.FlowError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    contesto: dict[str, Any] = dict(definizione.get("variables") or {})
+    contesto.update(variables or {})
+
+    esiti: list[dict] = []
+    falliti = 0
+
+    for indice, passo in enumerate(passi):
+        voce: dict[str, Any] = {"step": indice, "name": passo["name"], "tool": passo["tool"]}
+        try:
+            funzione = _tool_di_flow(passo["tool"])
+
+            if not flow_engine.condizione_vera(passo["when"], contesto):
+                voce["status"] = "skipped"
+                esiti.append(voce)
+                continue
+
+            argomenti = flow_engine.espandi(passo["args"], contesto)
+
+            if dry_run:
+                voce["status"] = "ok (dry run)"
+                voce["args"] = argomenti
+                esiti.append(voce)
+                # In dry run non c'è un risultato vero da salvare: si mette un
+                # segnaposto, altrimenti ogni ${riferimento} dei passi
+                # successivi fallirebbe e il dry run direbbe che il flow è
+                # rotto quando non lo è.
+                if passo["save"]:
+                    contesto[str(passo["save"])] = flow_engine.SegnapostoDryRun()
+                continue
+
+            risultato = await funzione(**argomenti)
+            if passo["save"]:
+                contesto[str(passo["save"])] = risultato
+            voce["status"] = "ok"
+            voce["result"] = flow_engine.riepiloga(risultato)
+
+        except Exception as exc:  # noqa: BLE001 - qualunque errore di un passo è dato del flow
+            falliti += 1
+            voce["status"] = "error"
+            voce["error"] = str(exc)[:600]
+            esiti.append(voce)
+            if stop_on_error and not passo["continue_on_error"]:
+                return {
+                    "dry_run": bool(dry_run),
+                    "steps": len(passi),
+                    "executed": len(esiti),
+                    "failed": falliti,
+                    "stopped_at": indice,
+                    "results": esiti,
+                    "variables": sorted(contesto),
+                }
+            continue
+
+        esiti.append(voce)
+
+    return {
+        "dry_run": bool(dry_run),
+        "steps": len(passi),
+        "executed": len(esiti),
+        "failed": falliti,
+        "results": esiti,
+        "variables": sorted(contesto),
+    }
 
 
 # ================================================================== resources

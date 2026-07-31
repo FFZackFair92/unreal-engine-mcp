@@ -1,6 +1,6 @@
 # Riferimento dei tool
 
-143 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
+162 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
 
 **Livello locale** — gira come processo sulla tua macchina. Trova i motori, crea
 progetti, apre e chiude l'editor, compila il C++, produce il pacchetto, scarica
@@ -62,6 +62,7 @@ ue_cpp_class_create → ue_editor_close → ue_build_start
 | `ue_build_status` | `tail_lines` | In corso o finita, codice di uscita, errori e warning del compilatore già estratti, coda del log. |
 | `ue_live_compile` | `max_wait_seconds` | Ricompila **a editor aperto**, via Live Coding. Applica patch solo al corpo delle funzioni: aggiungere o modificare `UCLASS`/`UFUNCTION`/`UPROPERTY` cambia i dati di reflection e richiede comunque `ue_build_start`. |
 | `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version` | Cook + build + stage + pak tramite `RunUAT BuildCookRun`. Produce un eseguibile autonomo. **Editor chiuso.** |
+| `ue_build_unblock` | `dry_run`, `engine_version` | Trova — e con `dry_run=False` termina — i processi che tengono il lock globale di build di Epic, quello che `ue_build_status` segnala come `blocked`. Cerca sulla *riga di comando*, non sul nome dell'immagine: su UE 5 UnrealBuildTool è un assembly .NET dentro `dotnet.exe`, quindi `taskkill /IM UnrealBuildTool.exe` non lo trova mai. |
 | `ue_package_status` | `tail_lines` | Fase corrente (Cook, Stage, Package, Archive), errori e percorso dell'`.exe` prodotto. |
 
 Né build né packaging attendono la fine dentro la chiamata: supererebbero il
@@ -85,6 +86,10 @@ timeout MCP. Partono e si consulta il tool di stato.
 | `ue_list_assets` | `path`, `recursive`, `class_filter` | Elenca gli asset sotto un path, filtrabili per nome di classe. |
 | `ue_new_level` | `path`, `template` | Crea un livello e lo apre. |
 | `ue_open_level` | `path` | Apre un livello esistente. |
+| `ue_delete_asset` | `path`, `force` | Elimina un asset o una cartella. Per default rifiuta se qualcosa lo referenzia — eliminarlo comunque lascia riferimenti rotti in livelli e Blueprint — ed elenca chi lo referenzia così puoi decidere. |
+| `ue_rename_asset` | `path`, `new_path` | Sposta o rinomina un asset, aggiornando i riferimenti. |
+| `ue_duplicate_asset` | `path`, `new_path` | Duplica un asset: il modo rapido per fare una variante. |
+| `ue_make_folder` | `path` | Crea una cartella nel Content Browser. Idempotente. |
 
 ## Attori (editor)
 
@@ -97,6 +102,9 @@ timeout MCP. Partono e si consulta il tool di stato.
 | `ue_set_actor_property` | `label`, `properties`, `component` | Imposta proprietà su un attore **già piazzato** o su un suo componente: la mesh, l'intensità di una luce, il raggio di un trigger. I vettori sono `{"x":…}`, i colori `{"r":…}`, e le stringhe `/Game/...` vengono caricate come asset. |
 | `ue_list_actor_components` | `label` | Componenti di un attore piazzato, con nome e classe: dice cosa passare come `component` qui sopra. |
 | `ue_delete_actor` | `label` | Rimuove un attore dal livello. |
+| `ue_attach_actor` | `child_label`, `parent_label`, `socket`, `attach_rule` | Aggancia un attore a un altro, così muovere il padre muove anche il figlio. `attach_rule` è `KEEP_WORLD`, `KEEP_RELATIVE` o `SNAP_TO_TARGET`. |
+| `ue_detach_actor` | `label`, `keep_world` | Sgancia un attore dal suo padre. |
+| `ue_actor_hierarchy` | `label` | Albero padre/figlio degli attori del livello, o di un sottoalbero. |
 
 Le modifiche agli attori sono avvolte in `ScopedEditorTransaction`: tutto quello
 qui sopra è annullabile con Ctrl+Z da chi sta guardando l'editor.
@@ -131,11 +139,38 @@ programmabili**: questi tool creano e collegano davvero i nodi.
 | `ue_create_material_instance` | `package_path`, `name`, `parent_path`, `parameters` | Material Instance da un materiale padre. Un numero è uno scalare, `{"r","g","b"}` un colore, un bool uno static switch, un path `/Game/...` una texture. |
 | `ue_assign_material` | `label`, `material_path`, `slot`, `component` | Assegna un materiale a un attore piazzato. |
 
+## Console e rendering
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_console_command` | `command`, `wait_seconds` | Esegue un comando console dell'editor e restituisce **cosa ha stampato**. I comandi console non restituiscono valori, scrivono nel log, quindi il tool confronta il log prima e dopo la chiamata; un comando che non stampa nulla lo dice esplicitamente invece di lasciare l'ambiguità. Passa dall'interprete Python dell'editor, non dal gate `bAllowConsoleCommandRemoteExecution` — stessa avvertenza di `ue_exec_python`. |
+| `ue_render_sequence` | `uproject`, `sequence`, `config`, `map_path`, `output_dir`, `resolution`, `force` | Renderizza una Level Sequence tramite la Movie Render Queue in un processo headless `UnrealEditor-Cmd`. La MRQ nell'editor è asincrona e terrebbe occupato l'editor per tutto il render; un processo separato si segue come una build. `config` (un preset Movie Pipeline salvato) è come si scelgono formato, risoluzione e cartella di output — senza, la MRQ usa i default di progetto e potrebbe non scrivere nulla. |
+| `ue_render_status` | `tail_lines`, `uproject`, `wait_seconds` | Avanzamento del render. `succeeded` si decide dai **file prodotti**, non dal codice di uscita: un run headless della MRQ può uscire con 0 avendo renderizzato zero frame. I file nuovi si trovano confrontando la cartella di output con uno snapshot preso all'avvio, non tramite data di modifica — confrontare l'orologio di un processo con quello di un filesystem su rete condivisa non trova niente. |
+
+> Questi due sono i tool meno verificati del progetto. Le loro parti pure sono
+> testate — mappatura del formato, costruzione del comando, validazione dei
+> path, raccolta dell'output — ma nessun test qui ha mai renderizzato un frame
+> con un motore reale.
+
+## Camera della viewport (editor)
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_get_camera` | — | Dove si trova la camera della viewport dell'editor e cosa sta guardando. Vale la pena chiamarlo **prima di spawnare**: i livelli reali sono spesso costruiti a migliaia di unità da `[0,0,0]`, quindi un attore piazzato all'origine può risultare fuori schermo e invisibile. |
+| `ue_set_camera` | `location`, `rotation` | Sposta la camera. Passando solo uno dei due argomenti, l'altro resta invariato. |
+| `ue_focus_actor` | `label`, `distance` | Inquadra un attore, come premere F nell'editor. Il complemento di `ue_screenshot` — senza, si fotografa qualunque cosa la camera stesse guardando per caso. |
+
 ## Screenshot (editor)
 
 | Tool | Parametri | Cosa fa |
 |---|---|---|
-| `ue_screenshot` | `filename`, `width`, `height` | Cattura la viewport dell'editor in un PNG sotto `<Progetto>/Saved/Screenshots/MCP` e ne restituisce il percorso. La cattura avviene uno o due frame dopo, quindi il tool attende il file e segnala se non è mai comparso. |
+| `ue_screenshot` | `filename`, `width`, `height`, `return_image` | Cattura la viewport dell'editor e **restituisce l'immagine stessa** come `ImageContent` MCP, così il modello la vede davvero — un semplice percorso lascerebbe l'agente cieco quanto prima. Il PNG resta comunque su disco sotto `<Progetto>/Saved/Screenshots/MCP`. La cattura avviene uno o due frame dopo, quindi il tool attende il file e segnala se non è mai comparso. |
+
+La risoluzione di default è volutamente modesta (960×540): il PNG viaggia
+codificato in base64 dentro la risposta, e a 1280×720 spesso costa più
+contesto di quanto l'immagine faccia risparmiare. Sopra `UE_MCP_MAX_SCREENSHOT`
+(1.5 MB) l'immagine non viene allegata e il tool spiega perché.
+`return_image=False` torna a restituire solo il percorso.
 
 ## Play In Editor (editor)
 
@@ -495,6 +530,120 @@ Richiede il plugin PCG — abilitalo con `ue_project_set_plugins`.
 
 I nomi dei pin sono le etichette visibili, spazi compresi — `"Bounding Shape"`,
 non `BoundingShape`. Chiedili a `ue_pcg_graph_info` invece di indovinarli.
+
+## Foliage (editor)
+
+Interamente scriptabile — ma non dalla porta che ci si aspetta.
+`EditorFoliageLibrary` e `FoliageEditorSubsystem` **non esistono** nella Python
+API di UE 5.8 (verificato con `hasattr` dal vivo, non dedotto). Quello che
+esiste è meglio: `InstancedFoliageActor.add_instances` /
+`remove_all_instances` sono UFUNCTION statiche vere, e i
+`FoliageInstancedStaticMeshComponent` dell'`InstancedFoliageActor` del livello
+espongono tutta la superficie di query e rimozione per istanza.
+
+> **Non usare `FoliageStatistics`.** È la libreria che *sembra* fatta per
+> contare le istanze, e nel mondo dell'editor risponde sempre 0 — provata dal
+> vivo su un box che ne conteneva davvero cinque, con entrambi i world context
+> plausibili. È una libreria di gameplay e vuole un mondo di gioco.
+> `ue_foliage_query` passa invece dai componenti, e risponde bene senza PIE.
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_create_foliage_type` | `package_path`, `name`, `mesh_path`, `properties?` | Crea un FoliageType da una static mesh — la "specie": quale mesh, e con quali regole (densità, scala casuale, allineamento alla normale, collisione). |
+| `ue_set_foliage_property` | `foliage_type_path`, `property_name`, `value` | Scrive una proprietà e rilegge quello che è finito davvero lì. |
+| `ue_foliage_add_instances` | `foliage_type_path`, `transforms` | Piazza istanze alle trasformate date. Accetta `{location, rotation, scale}` o le sole posizioni. |
+| `ue_foliage_scatter` | `foliage_type_path`, `center`, `radius`, `count`, `seed?`, `align_to_ground`, `z_offset` | Sparge N istanze a caso in un cerchio, appoggiando ognuna al terreno con un line trace. È il tool per riempire una zona. |
+| `ue_foliage_list` | — | Quello che è davvero piazzato nel livello: mesh, componente, numero di istanze. |
+| `ue_foliage_query` | `foliage_type_path`, `center`, `radius`, `limit` | Le istanze dentro una sfera, con le trasformate in world space. Il conteggio è sempre esatto; `limit` taglia solo quello che torna. |
+| `ue_foliage_remove` | `foliage_type_path`, `center?`, `radius?` | Toglie istanze — tutte, o solo quelle dentro una sfera. |
+| `ue_create_foliage_spawner` | `package_path`, `name`, `foliage_types?`, `tile_size?` | Un ProceduralFoliageSpawner: la ricetta (quali specie, in competizione come). |
+| `ue_foliage_spawn_volume` | `spawner_path`, `label?`, `location?`, `size?` | Piazza un ProceduralFoliageVolume con lo spawner attaccato — dove la ricetta si applica. |
+| `ue_foliage_simulate` | `label`, `clear` | Fa girare (o azzera) la simulazione procedurale su un volume. |
+
+`ue_foliage_scatter` usa la radice quadrata sul raggio apposta: senza, i punti
+casuali si addensano al centro del cerchio.
+
+## Authoring del Sequencer (editor)
+
+Fino alla 0.9.0 il sequencer andava in una direzione sola —
+`ue_render_sequence` renderizza una sequenza che ha costruito qualcun altro.
+Questi tool la costruiscono.
+
+Nessun muro, contro le aspettative maturate su UMG e Niagara:
+`MovieSceneSequenceExtensions`, `MovieSceneBindingExtensions`,
+`MovieSceneTrackExtensions` e `MovieSceneSectionExtensions` sono esposte per
+intero, e i canali hanno `add_key` / `get_keys`. Verificato dal vivo su UE 5.8
+costruendo una sequenza a 30 fps con un attore possessato, una track di
+trasformata con due chiavi su `Rotation.Y` e una di visibilità, salvandola e
+ritrovando tutto nel `.uasset`.
+
+**Due trappole, entrambe gestite dai tool:**
+
+1. **I nomi dei canali hanno un suffisso numerico instabile.** La stessa
+   sezione di trasformata ha dato `Location.Z_0` la prima volta e
+   `Location.Z_3` la seconda, nella stessa sessione di editor. I canali si
+   indicano *senza* suffisso — `"Location.Z"`.
+2. **I nomi visualizzati di track e binding sono localizzati**, esattamente
+   come la palette dei nodi Blueprint: su editor italiano la track di
+   trasformata si chiama "Trasforma". Le track si indirizzano per tipo o per
+   indice, mai per nome visualizzato.
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_create_level_sequence` | `package_path`, `name`, `fps?`, `length_frames?` | Level Sequence vuota, con frame rate e range di playback impostati. |
+| `ue_sequence_info` | `sequence_path` | Binding, track, sezioni e canali. Chiamalo prima di mettere chiavi: è così che si sa come si chiamano i canali e quali indici usare. |
+| `ue_sequence_add_actor` | `sequence_path`, `label`, `spawnable` | Lega un attore del livello. Con `spawnable=True` la sequenza si porta dietro una copia e la crea e distrugge da sé — quello che serve a una cinematica autonoma. |
+| `ue_sequence_add_track` | `sequence_path`, `binding`, `track_type`, `start?`, `end?` | Aggiunge una track *e la sua prima sezione* (una track senza sezione non anima niente). Alias: `transform`, `visibility`, `audio`, `animation`, `camera_cut`, `event`, `fade` — o il nome esatto della classe. |
+| `ue_sequence_add_key` | `sequence_path`, `binding`, `channel`, `frame`, `value`, `track?`, `track_type?`, `section`, `interpolation?` | Mette una chiave e rilegge tutte le chiavi del canale. |
+| `ue_sequence_set_range` | `sequence_path`, `start?`, `end?`, `fps?` | Cambia range di playback e frame rate. |
+| `ue_sequence_remove` | `sequence_path`, `binding`, `track?`, `track_type?` | Toglie una track — o l'intero binding, se non se ne indica nessuna. |
+| `ue_sequence_open` | `sequence_path`, `close` | Apre (o chiude) la sequenza nella finestra del Sequencer. I tool scrivono sull'asset; questo è il modo di guardare il risultato. |
+
+## Flow: incatenare chiamate a tool (lato server)
+
+Un flow è una lista di chiamate a tool scritta in YAML (o JSON) ed eseguita in
+una sola chiamata MCP. Vive interamente lato server: non tocca l'editor se non
+attraverso i tool che invoca, e con `dry_run=True` non lo tocca affatto.
+
+Il motivo è il contesto, non la velocità. Una scena si costruisce quasi sempre
+con la stessa sequenza di dieci o venti chiamate, e farla passare dal modello
+una alla volta gli lascia in memoria diciannove risposte JSON che non gli
+servono più.
+
+```yaml
+variables:
+  base: {x: 0, y: 0, z: 100}
+steps:
+  - tool: ue_spawn_actor
+    args: {class_ref: StaticMeshActor, location: "${base}", label: Cubo}
+    save: cubo
+  - tool: ue_set_actor_transform
+    args: {label: "${cubo.label}", scale: [2, 2, 2]}
+  - tool: ue_screenshot
+    when: {exists: cubo.label}
+```
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_flow_run` | `flow`, `variables?`, `dry_run`, `stop_on_error` | Esegue il flow. `flow` è il testo YAML/JSON, oppure il path di un file. |
+
+Ogni passo accetta `tool`, `args`, `save` (la variabile in cui mettere il
+risultato), `when`, `continue_on_error` e `name`. Nei valori, `${nome}` e
+`${nome.chiave.0}` riprendono quello che un passo precedente ha salvato: una
+stringa fatta *solo* di riferimento conserva il tipo del valore (un dict resta
+un dict), mentre un riferimento dentro a una frase più lunga viene interpolato
+come testo.
+
+`when` è un booleano, un `${riferimento}`, oppure `{equals: [a, b]}`,
+`{not_equals: [a, b]}`, `{exists: percorso}` — niente `eval`, per scelta.
+
+Non ci sono cicli né espressioni, ed è voluto: la logica sta in chi scrive il
+flow, non nel flow. La prima volta usa `dry_run=True`, che valida forma, nomi
+dei tool e riferimenti senza eseguire niente.
+
+> **PyYAML è una dipendenza opzionale.** JSON è un sottoinsieme di YAML, quindi
+> i flow in JSON funzionano con l'installazione nuda; quelli in YAML chiedono
+> `pip install pyyaml` invece di fallire dentro il parser.
 
 ## Download di asset gratuiti (locale)
 

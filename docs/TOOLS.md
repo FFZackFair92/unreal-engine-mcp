@@ -1,6 +1,6 @@
 # Tool reference
 
-143 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+162 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -60,6 +60,7 @@ ue_cpp_class_create → ue_editor_close → ue_build_start
 | `ue_build_status` | `tail_lines`, `uproject`, `wait_seconds` | Running or finished, exit code, parsed compiler errors and warnings, log tail. State is kept per project, so parallel builds do not overwrite each other. With `wait_seconds > 0` it polls inside the call and reports progress instead of returning immediately. |
 | `ue_live_compile` | `max_wait_seconds` | Recompiles **with the editor open**, via Live Coding. Only patches function bodies: adding or changing `UCLASS`/`UFUNCTION`/`UPROPERTY` changes reflection data and still needs `ue_build_start`. |
 | `ue_package_start` | `uproject`, `configuration`, `maps`, `output_dir`, `dedicated_server`, `engine_version`, `engine_root`, `target_platform` | Cook + build + stage + pak via `RunUAT BuildCookRun`. Produces a standalone executable. **Editor must be closed.** |
+| `ue_build_unblock` | `dry_run`, `engine_version`, `engine_root` | Finds — and with `dry_run=False` kills — the processes holding Epic's global build lock, which `ue_build_status` reports as `blocked`. Searches the *command line*, not the image name: on UE 5, UnrealBuildTool is a .NET assembly inside `dotnet.exe`, so `taskkill /IM UnrealBuildTool.exe` never finds it. |
 | `ue_package_status` | `tail_lines`, `uproject`, `wait_seconds` | Current phase (Cook, Stage, Package, Archive), errors, and the path of the produced `.exe`. Same per-project state and `wait_seconds` behaviour as the build status. |
 
 Neither build nor package waits for completion inside the *start* call: they
@@ -519,6 +520,116 @@ Requires the PCG plugin — enable it with `ue_project_set_plugins`.
 
 Pin names are the visible labels, spaces included — `"Bounding Shape"`, not
 `BoundingShape`. Ask `ue_pcg_graph_info` rather than guessing.
+
+## Foliage (editor)
+
+Fully scriptable — but not through the door you'd expect. `EditorFoliageLibrary`
+and `FoliageEditorSubsystem` **do not exist** in the UE 5.8 Python API (checked
+with `hasattr` live, not assumed). What does exist is better:
+`InstancedFoliageActor.add_instances` / `remove_all_instances` are real static
+UFUNCTIONs, and the `FoliageInstancedStaticMeshComponent`s on the level's
+`InstancedFoliageActor` expose the whole per-instance query and removal surface.
+
+> **Do not use `FoliageStatistics`.** It's the library that *looks* like it was
+> made for counting instances, and in the editor world it always returns 0 —
+> tested live against a box that really did contain five instances, with both
+> plausible world contexts. It's a gameplay library and wants a game world.
+> `ue_foliage_query` goes through the components instead, and answers correctly
+> without PIE.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_foliage_type` | `package_path`, `name`, `mesh_path`, `properties?` | Creates a FoliageType from a static mesh — the "species": which mesh, and the rules (density, random scale, alignment to normal, collision). |
+| `ue_set_foliage_property` | `foliage_type_path`, `property_name`, `value` | Writes a property and reads back what actually landed. |
+| `ue_foliage_add_instances` | `foliage_type_path`, `transforms` | Places instances at given transforms. Accepts `{location, rotation, scale}` or bare positions. |
+| `ue_foliage_scatter` | `foliage_type_path`, `center`, `radius`, `count`, `seed?`, `align_to_ground`, `z_offset` | Scatters N instances at random in a circle, dropping each one onto the ground with a line trace. The tool to reach for when filling an area. |
+| `ue_foliage_list` | — | What's actually placed in the level: mesh, component, instance count. |
+| `ue_foliage_query` | `foliage_type_path`, `center`, `radius`, `limit` | Instances inside a sphere, with their world-space transforms. The count is always exact; `limit` only caps what comes back. |
+| `ue_foliage_remove` | `foliage_type_path`, `center?`, `radius?` | Removes instances — all of them, or only those inside a sphere. |
+| `ue_create_foliage_spawner` | `package_path`, `name`, `foliage_types?`, `tile_size?` | A ProceduralFoliageSpawner: the recipe (which species, competing how). |
+| `ue_foliage_spawn_volume` | `spawner_path`, `label?`, `location?`, `size?` | Places a ProceduralFoliageVolume with the spawner attached — where the recipe applies. |
+| `ue_foliage_simulate` | `label`, `clear` | Runs (or clears) the procedural simulation on a volume. |
+
+`ue_foliage_scatter` uses `sqrt` on the radius on purpose: without it, random
+points bunch up in the middle of the circle.
+
+## Sequencer authoring (editor)
+
+Until 0.9.0 the sequencer only went one way — `ue_render_sequence` renders a
+sequence somebody else built. These tools build it.
+
+No wall here, against the expectations UMG and Niagara had set:
+`MovieSceneSequenceExtensions`, `MovieSceneBindingExtensions`,
+`MovieSceneTrackExtensions` and `MovieSceneSectionExtensions` are exposed in
+full, and channels have `add_key` / `get_keys`. Verified live on UE 5.8 by
+building a 30 fps sequence with a possessed actor, a transform track with two
+keys on `Rotation.Y` and a visibility track, saving it and finding all of it
+back in the `.uasset`.
+
+**Two traps, both handled by the tools:**
+
+1. **Channel names carry an unstable numeric suffix.** The same transform
+   section gave `Location.Z_0` the first time and `Location.Z_3` the second, in
+   the same editor session. Address channels *without* the suffix —
+   `"Location.Z"`.
+2. **Track and binding display names are localised**, exactly like the
+   Blueprint node palette: on an Italian editor the transform track is called
+   "Trasforma". Tracks are addressed by type or index, never by display name.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_level_sequence` | `package_path`, `name`, `fps?`, `length_frames?` | Empty Level Sequence, with frame rate and playback range set. |
+| `ue_sequence_info` | `sequence_path` | Bindings, tracks, sections and channels. Call it before keying: it's how you learn the channel names and the indices. |
+| `ue_sequence_add_actor` | `sequence_path`, `label`, `spawnable` | Binds a level actor. `spawnable=True` makes the sequence carry its own copy and create/destroy it — what a self-contained cinematic needs. |
+| `ue_sequence_add_track` | `sequence_path`, `binding`, `track_type`, `start?`, `end?` | Adds a track *and its first section* (a track without a section animates nothing). Aliases: `transform`, `visibility`, `audio`, `animation`, `camera_cut`, `event`, `fade` — or an exact class name. |
+| `ue_sequence_add_key` | `sequence_path`, `binding`, `channel`, `frame`, `value`, `track?`, `track_type?`, `section`, `interpolation?` | Adds a key and reads back every key on the channel. |
+| `ue_sequence_set_range` | `sequence_path`, `start?`, `end?`, `fps?` | Changes playback range and frame rate. |
+| `ue_sequence_remove` | `sequence_path`, `binding`, `track?`, `track_type?` | Removes a track — or the whole binding, with neither given. |
+| `ue_sequence_open` | `sequence_path`, `close` | Opens (or closes) the sequence in the Sequencer window. The tools write to the asset; this is how you look at the result. |
+
+## Flow: chaining tool calls (server-side)
+
+A flow is a list of tool calls written in YAML (or JSON) and run in a single MCP
+call. It lives entirely on the server side: it never touches the editor except
+through the tools it invokes, and `dry_run=True` doesn't touch it at all.
+
+The point is context, not speed. A scene is nearly always built with the same
+ten or twenty calls, and going through the model one call at a time leaves it
+holding nineteen JSON replies it no longer needs.
+
+```yaml
+variables:
+  base: {x: 0, y: 0, z: 100}
+steps:
+  - tool: ue_spawn_actor
+    args: {class_ref: StaticMeshActor, location: "${base}", label: Cubo}
+    save: cubo
+  - tool: ue_set_actor_transform
+    args: {label: "${cubo.label}", scale: [2, 2, 2]}
+  - tool: ue_screenshot
+    when: {exists: cubo.label}
+```
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_flow_run` | `flow`, `variables?`, `dry_run`, `stop_on_error` | Runs the flow. `flow` is the YAML/JSON text, or the path to a file. |
+
+Each step takes `tool`, `args`, `save` (the variable to put the result in),
+`when`, `continue_on_error` and `name`. In values, `${name}` and
+`${name.key.0}` pull back what an earlier step saved: a string that is *only* a
+reference keeps the value's type (a dict stays a dict), while a reference inside
+a longer sentence is interpolated as text.
+
+`when` is a boolean, a `${reference}`, or one of `{equals: [a, b]}`,
+`{not_equals: [a, b]}`, `{exists: path}` — no `eval`, on purpose.
+
+There are no loops and no expressions, and that's deliberate: the logic belongs
+to whoever writes the flow, not to the flow. Run `dry_run=True` the first time —
+it validates shape, tool names and references without executing anything.
+
+> **PyYAML is an optional dependency.** JSON is a subset of YAML, so JSON flows
+> work with a bare install; YAML ones ask you to `pip install pyyaml` instead of
+> failing inside the parser.
 
 ## Free asset downloads (local)
 

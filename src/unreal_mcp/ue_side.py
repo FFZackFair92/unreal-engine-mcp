@@ -1371,6 +1371,18 @@ def _mcp_time():
     return modulo
 
 
+def _mcp_random():
+    import random as modulo
+
+    return modulo
+
+
+def _mcp_math():
+    import math as modulo
+
+    return modulo
+
+
 # ---------------------------------------------------------------- networking
 
 
@@ -4351,3 +4363,833 @@ def mcp_pcg_cleanup(label, remove_components=True):
         raise ValueError("'%s' non ha un PCGComponent." % label)
     componente.cleanup(bool(remove_components))
     return {"actor": label, "cleaned": True}
+
+
+# ======================================================================= FOLIAGE
+#
+# Fase 14a, verificata dal vivo su UE 5.8 il 2026-07-31. È il gap più citato
+# nel confronto con db-lyon/ue-mcp, e si è rivelato interamente scriptabile —
+# ma non dalla porta che ci si aspetta.
+#
+# `EditorFoliageLibrary` e `FoliageEditorSubsystem` **non esistono** nella
+# Python API di UE 5.8 (verificato con `hasattr`, non dedotto). Quello che
+# esiste è meglio: `InstancedFoliageActor.add_instances` /
+# `remove_all_instances` sono UFUNCTION statiche vere, e i
+# `FoliageInstancedStaticMeshComponent` dell'`InstancedFoliageActor` del
+# livello espongono l'intera superficie di query e rimozione per istanza
+# (`get_instances_overlapping_box/sphere`, `get_instance_transform`,
+# `remove_instances`, `get_instance_count`).
+#
+# **La trappola della fase**: `FoliageStatistics` — la libreria che *sembra*
+# fatta per contare le istanze — restituisce sempre 0 nel mondo dell'editor.
+# Provata dal vivo su un box che conteneva davvero 5 istanze, con entrambi i
+# world context plausibili (l'`InstancedFoliageActor` e il world dell'editor):
+# zero in tutti e due i casi. È una libreria di gameplay, vuole un mondo di
+# gioco. Per questo `mcp_foliage_query` passa dai componenti e non da lì: dà
+# la risposta giusta senza bisogno del PIE.
+
+
+def _mcp_foliage_type(path):
+    """Carica un FoliageType, con un errore che dice cosa si è caricato invece."""
+    tipo = mcp_asset_lib().load_asset(path)
+    if tipo is None:
+        raise ValueError("FoliageType '%s' non trovato." % path)
+    if not isinstance(tipo, unreal.FoliageType):
+        raise ValueError(
+            "'%s' è un %s, non un FoliageType. Crealo con `ue_create_foliage_type`."
+            % (path, tipo.get_class().get_name())
+        )
+    return tipo
+
+
+def _mcp_foliage_actors():
+    """Gli `InstancedFoliageActor` del livello corrente (di norma uno solo)."""
+    return [
+        attore
+        for attore in mcp_actor_subsystem().get_all_level_actors()
+        if isinstance(attore, unreal.InstancedFoliageActor)
+    ]
+
+
+def _mcp_foliage_components(mesh=None):
+    """I componenti di foliage del livello, opzionalmente filtrati per mesh.
+
+    Il legame componente → FoliageType non è leggibile (l'`InstancedFoliageActor`
+    non espone né `foliage_infos` né `foliage_types` come proprietà: provate
+    dal vivo, non esistono). Il legame che *è* leggibile è
+    componente → `static_mesh`, e siccome un FoliageType conosce la propria
+    mesh, quello basta a chiudere il cerchio.
+    """
+    componenti = []
+    for attore in _mcp_foliage_actors():
+        for componente in attore.get_components_by_class(
+            unreal.FoliageInstancedStaticMeshComponent
+        ):
+            propria = componente.get_editor_property("static_mesh")
+            if mesh is not None and propria != mesh:
+                continue
+            componenti.append(componente)
+    return componenti
+
+
+def _mcp_foliage_mesh_of(tipo):
+    mesh = tipo.get_editor_property("mesh")
+    if mesh is None:
+        raise ValueError(
+            "Il FoliageType '%s' non ha una mesh: impostala con "
+            "`ue_set_foliage_property(..., 'mesh', '/Game/...')`." % tipo.get_name()
+        )
+    return mesh
+
+
+def mcp_create_foliage_type(package_path, name, mesh_path, properties=None):
+    """Crea un FoliageType_InstancedStaticMesh e ci attacca la static mesh."""
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    mesh = mcp_asset_lib().load_asset(mesh_path)
+    if mesh is None:
+        raise ValueError("Static mesh '%s' non trovata." % mesh_path)
+    if not isinstance(mesh, unreal.StaticMesh):
+        raise ValueError(
+            "'%s' è un %s, non una StaticMesh." % (mesh_path, mesh.get_class().get_name())
+        )
+
+    tipo = mcp_asset_tools().create_asset(
+        name,
+        package_path,
+        unreal.FoliageType_InstancedStaticMesh,
+        unreal.FoliageType_InstancedStaticMeshFactory(),
+    )
+    if tipo is None:
+        raise RuntimeError("Creazione del FoliageType '%s' fallita." % full)
+
+    tipo.set_editor_property("mesh", mesh)
+    for chiave, valore in (properties or {}).items():
+        tipo.set_editor_property(chiave, mcp_coerce_value(valore))
+    mcp_asset_lib().save_asset(full)
+    return {"path": full, "created": True, "mesh": str(mesh_path)}
+
+
+def mcp_set_foliage_property(foliage_type_path, property_name, value):
+    """Scrive una proprietà sul FoliageType (densità, raggio, scala, collisione…)."""
+    tipo = _mcp_foliage_type(foliage_type_path)
+    tipo.set_editor_property(property_name, mcp_coerce_value(value))
+    letto = tipo.get_editor_property(property_name)
+    mcp_asset_lib().save_asset(foliage_type_path)
+    return {
+        "foliage_type": foliage_type_path,
+        "property": property_name,
+        "value": letto
+        if isinstance(letto, (bool, int, float, str)) or letto is None
+        else str(letto),
+    }
+
+
+def mcp_foliage_add_instances(foliage_type_path, transforms):
+    """Piazza istanze di foliage nel livello, alle trasformate date.
+
+    `transforms` è una lista di dict `{"location": .., "rotation": .., "scale": ..}`
+    — o direttamente di posizioni, per il caso comune in cui rotazione e scala
+    non interessano.
+    """
+    tipo = _mcp_foliage_type(foliage_type_path)
+    if not transforms:
+        raise ValueError("Nessuna trasformata da piazzare.")
+
+    trasformate = []
+    for voce in transforms:
+        if isinstance(voce, dict) and ("location" in voce or "rotation" in voce or "scale" in voce):
+            posizione = mcp_to_vector(voce.get("location"))
+            rotazione = mcp_to_rotator(voce.get("rotation"))
+            scala = mcp_to_vector(voce.get("scale"), (1.0, 1.0, 1.0))
+        else:
+            posizione, rotazione, scala = (
+                mcp_to_vector(voce),
+                unreal.Rotator(0.0, 0.0, 0.0),
+                unreal.Vector(1.0, 1.0, 1.0),
+            )
+        trasformate.append(unreal.Transform(posizione, rotazione, scala))
+
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    with mcp_transaction("MCP: foliage %s" % tipo.get_name()):
+        unreal.InstancedFoliageActor.add_instances(mondo, tipo, trasformate)
+
+    mesh = _mcp_foliage_mesh_of(tipo)
+    totale = sum(c.get_instance_count() for c in _mcp_foliage_components(mesh))
+    return {
+        "foliage_type": foliage_type_path,
+        "added": len(trasformate),
+        "total_instances": int(totale),
+    }
+
+
+def mcp_foliage_scatter(
+    foliage_type_path, center, radius, count, seed=None, align_to_ground=True, z_offset=0.0
+):
+    """Sparge `count` istanze a caso in un cerchio, appoggiandole al terreno.
+
+    L'allineamento al terreno è un line trace dall'alto verso il basso: senza,
+    le istanze restano tutte alla quota del centro, che su un terreno non piatto
+    vuol dire mezze sepolte e mezze in aria.
+    """
+    tipo = _mcp_foliage_type(foliage_type_path)
+    centro = mcp_to_vector(center)
+    raggio = float(radius)
+    quanti = int(count)
+    if quanti <= 0:
+        raise ValueError("`count` dev'essere positivo.")
+
+    generatore = _mcp_random().Random(seed)
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+
+    trasformate = []
+    appoggiate = 0
+    for _ in range(quanti):
+        # sqrt sul raggio: senza, i punti si addensano al centro del cerchio.
+        distanza = raggio * (generatore.random() ** 0.5)
+        angolo = generatore.random() * 2.0 * 3.141592653589793
+        x = centro.x + distanza * _mcp_math().cos(angolo)
+        y = centro.y + distanza * _mcp_math().sin(angolo)
+        z = centro.z
+
+        if align_to_ground:
+            colpo = unreal.SystemLibrary.line_trace_single(
+                mondo,
+                unreal.Vector(x, y, centro.z + 10000.0),
+                unreal.Vector(x, y, centro.z - 10000.0),
+                unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,
+                False,
+                [],
+                unreal.DrawDebugTrace.NONE,
+                True,
+            )
+            # `line_trace_single` restituisce None quando non colpisce niente,
+            # e un `HitResult` altrimenti. L'HitResult è chiuso da tutte e due
+            # le parti, verificato dal vivo: `colpo.blocking_hit` è un
+            # AttributeError, e `get_editor_property("blocking_hit")` risponde
+            # "Failed to find property". L'unica via che funziona è `to_dict()`.
+            colpito = colpo.to_dict() if colpo is not None else None
+            if colpito and colpito.get("blocking_hit"):
+                z = colpito["location"].z
+                appoggiate += 1
+
+        trasformate.append(
+            {
+                "location": {"x": x, "y": y, "z": z + float(z_offset)},
+                "rotation": {"roll": 0.0, "pitch": 0.0, "yaw": generatore.random() * 360.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            }
+        )
+
+    esito = mcp_foliage_add_instances(foliage_type_path, trasformate)
+    esito["grounded"] = appoggiate
+    esito["seed"] = seed
+    esito["foliage_type"] = foliage_type_path
+    del tipo
+    return esito
+
+
+def mcp_foliage_list():
+    """Il foliage presente nel livello: mesh, numero di istanze, componente.
+
+    Non elenca i FoliageType come asset (per quelli c'è `ue_list_assets`): elenca
+    ciò che è davvero piazzato, che è la domanda che ci si pone di solito.
+    """
+    voci = []
+    for attore in _mcp_foliage_actors():
+        for componente in attore.get_components_by_class(
+            unreal.FoliageInstancedStaticMeshComponent
+        ):
+            mesh = componente.get_editor_property("static_mesh")
+            voci.append(
+                {
+                    "actor": str(attore.get_actor_label()),
+                    "component": str(componente.get_name()),
+                    "mesh": str(mesh.get_path_name()) if mesh else None,
+                    "instances": int(componente.get_instance_count()),
+                }
+            )
+    return {"foliage": voci, "total_instances": sum(v["instances"] for v in voci)}
+
+
+def mcp_foliage_query(foliage_type_path, center, radius, limit=100):
+    """Le istanze di un FoliageType dentro una sfera, con le loro trasformate.
+
+    Passa dai componenti e non da `FoliageStatistics`: quest'ultima è una
+    libreria di gameplay e nel mondo dell'editor risponde sempre 0 — verificato
+    dal vivo su un box che conteneva 5 istanze reali.
+    """
+    tipo = _mcp_foliage_type(foliage_type_path)
+    mesh = _mcp_foliage_mesh_of(tipo)
+    centro = mcp_to_vector(center)
+    raggio = float(radius)
+
+    trovate = []
+    totale = 0
+    for componente in _mcp_foliage_components(mesh):
+        indici = componente.get_instances_overlapping_sphere(centro, raggio, True)
+        totale += len(indici)
+        for indice in indici:
+            if len(trovate) >= int(limit):
+                break
+            trasformata = componente.get_instance_transform(indice, world_space=True)
+            trovate.append(
+                {
+                    "component": str(componente.get_name()),
+                    "index": int(indice),
+                    "location": mcp_vec(trasformata.translation),
+                    "scale": mcp_vec(trasformata.scale3d),
+                }
+            )
+
+    return {
+        "foliage_type": foliage_type_path,
+        "mesh": str(mesh.get_path_name()),
+        "count": int(totale),
+        "returned": len(trovate),
+        "instances": trovate,
+    }
+
+
+def mcp_foliage_remove(foliage_type_path, center=None, radius=None):
+    """Toglie le istanze di un FoliageType: tutte, o solo quelle in una sfera.
+
+    Senza `center`/`radius` usa `remove_all_instances`, che è l'UFUNCTION del
+    motore. Con la sfera passa dai componenti, rimuovendo per indice — in ordine
+    decrescente, perché `remove_instances` rinumera quelli che restano.
+    """
+    tipo = _mcp_foliage_type(foliage_type_path)
+
+    if center is None or radius is None:
+        mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+        with mcp_transaction("MCP: rimuovi foliage %s" % tipo.get_name()):
+            unreal.InstancedFoliageActor.remove_all_instances(mondo, tipo)
+        return {"foliage_type": foliage_type_path, "removed": "all", "remaining": 0}
+
+    mesh = _mcp_foliage_mesh_of(tipo)
+    centro = mcp_to_vector(center)
+    rimosse = 0
+    with mcp_transaction("MCP: rimuovi foliage %s" % tipo.get_name()):
+        for componente in _mcp_foliage_components(mesh):
+            indici = sorted(
+                componente.get_instances_overlapping_sphere(centro, float(radius), True),
+                reverse=True,
+            )
+            if not indici:
+                continue
+            componente.remove_instances([int(i) for i in indici])
+            rimosse += len(indici)
+
+    rimaste = sum(c.get_instance_count() for c in _mcp_foliage_components(mesh))
+    return {
+        "foliage_type": foliage_type_path,
+        "removed": int(rimosse),
+        "remaining": int(rimaste),
+    }
+
+
+def mcp_create_foliage_spawner(package_path, name, foliage_types=None, tile_size=None):
+    """Crea un ProceduralFoliageSpawner, con i suoi FoliageType già dentro.
+
+    Lo spawner è la ricetta; il `ProceduralFoliageVolume` è dove viene applicata.
+    """
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    spawner = mcp_asset_tools().create_asset(
+        name, package_path, unreal.ProceduralFoliageSpawner, unreal.ProceduralFoliageSpawnerFactory()
+    )
+    if spawner is None:
+        raise RuntimeError("Creazione dello spawner '%s' fallita." % full)
+
+    involucri = []
+    for percorso in foliage_types or []:
+        involucro = unreal.FoliageTypeObject()
+        involucro.set_editor_property("foliage_type_object", _mcp_foliage_type(percorso))
+        involucri.append(involucro)
+    if involucri:
+        spawner.set_editor_property("foliage_types", involucri)
+    if tile_size is not None:
+        spawner.set_editor_property("tile_size", float(tile_size))
+
+    mcp_asset_lib().save_asset(full)
+    return {
+        "path": full,
+        "created": True,
+        "foliage_types": list(foliage_types or []),
+        "tile_size": float(spawner.get_editor_property("tile_size")),
+    }
+
+
+def mcp_foliage_spawn_volume(spawner_path, label=None, location=None, size=None):
+    """Piazza un ProceduralFoliageVolume con lo spawner già collegato."""
+    spawner = mcp_asset_lib().load_asset(spawner_path)
+    if spawner is None or not isinstance(spawner, unreal.ProceduralFoliageSpawner):
+        raise ValueError("ProceduralFoliageSpawner '%s' non trovato." % spawner_path)
+
+    with mcp_transaction("MCP: volume di foliage per %s" % spawner_path):
+        volume = mcp_actor_subsystem().spawn_actor_from_class(
+            unreal.ProceduralFoliageVolume, mcp_to_vector(location), unreal.Rotator(0.0, 0.0, 0.0)
+        )
+        if volume is None:
+            raise RuntimeError("Spawn del ProceduralFoliageVolume fallito.")
+        if label:
+            volume.set_actor_label(label)
+        if size is not None:
+            # Come per il PCGVolume: il brush di default è 200 cm per lato, la
+            # dimensione si esprime in cm e diventa scala.
+            lati = mcp_to_vector(size, (200.0, 200.0, 200.0))
+            volume.set_actor_scale3d(
+                unreal.Vector(lati.x / 200.0, lati.y / 200.0, lati.z / 200.0)
+            )
+
+        componente = volume.get_component_by_class(unreal.ProceduralFoliageComponent)
+        if componente is None:
+            raise RuntimeError("Il ProceduralFoliageVolume non ha un ProceduralFoliageComponent.")
+        componente.set_editor_property("foliage_spawner", spawner)
+
+    return {
+        "actor": str(volume.get_actor_label()),
+        "spawner": spawner_path,
+        "location": mcp_vec(volume.get_actor_location()),
+        "scale": mcp_vec(volume.get_actor_scale3d()),
+    }
+
+
+def mcp_foliage_simulate(label, clear=False):
+    """Fa (ri)simulare il foliage procedurale di un volume, o lo azzera."""
+    attore = mcp_require_actor(label)
+    if not isinstance(attore, unreal.ProceduralFoliageVolume):
+        raise ValueError(
+            "'%s' è un %s, non un ProceduralFoliageVolume."
+            % (label, attore.get_class().get_name())
+        )
+
+    if clear:
+        unreal.ProceduralFoliageEditorLibrary.clear_procedural_foliage_volumes([attore])
+    else:
+        unreal.ProceduralFoliageEditorLibrary.resimulate_procedural_foliage_volumes([attore])
+
+    return {"actor": label, "cleared" if clear else "simulated": True}
+
+
+# ===================================================================== SEQUENCER
+#
+# Fase 14b, verificata dal vivo su UE 5.8 il 2026-07-31. Fino alla 0.9.0 il
+# sequencer c'era solo in uscita (`ue_render_sequence` renderizza una sequenza
+# già fatta): questi tool la costruiscono.
+#
+# Nessun muro. `MovieSceneSequenceExtensions`, `MovieSceneBindingExtensions`,
+# `MovieSceneTrackExtensions` e `MovieSceneSectionExtensions` sono esposte per
+# intero, e i canali (`MovieSceneScriptingDoubleChannel` e parenti) hanno
+# `add_key`/`get_keys`/`remove_key`. Verificato costruendo Sole → track di
+# trasformata → sezione 0-90 → due chiavi su Location.Z, salvando e rileggendo
+# l'asset da zero: binding, track, range e chiavi c'erano ancora.
+#
+# **Due trappole trovate dal vivo**, entrambe gestite qui:
+#
+# 1. I nomi dei canali hanno un suffisso numerico progressivo e *instabile*:
+#    la stessa sezione di trasformata ha dato `Location.Z_0` alla prima prova e
+#    `Location.Z_3` alla seconda, nella stessa sessione di editor. Confrontare
+#    per nome esatto funziona finché non funziona più. `_mcp_seq_canale`
+#    confronta sul nome senza suffisso.
+# 2. I nomi visualizzati di track e binding sono **localizzati**, come la
+#    palette dei nodi Blueprint della fase 11: su editor italiano la track di
+#    trasformata si chiama "Trasforma". Per questo i tool indirizzano le track
+#    per classe (`MovieScene3DTransformTrack`) e per indice, mai per nome.
+
+
+_MCP_SEQ_TRACK_ALIAS = {
+    "transform": "MovieScene3DTransformTrack",
+    "trasformata": "MovieScene3DTransformTrack",
+    "visibility": "MovieSceneVisibilityTrack",
+    "audio": "MovieSceneAudioTrack",
+    "animation": "MovieSceneSkeletalAnimationTrack",
+    "skeletalanimation": "MovieSceneSkeletalAnimationTrack",
+    "camera_cut": "MovieSceneCameraCutTrack",
+    "cameracut": "MovieSceneCameraCutTrack",
+    "event": "MovieSceneEventTrack",
+    "fade": "MovieSceneFadeTrack",
+}
+
+
+def _mcp_sequence(sequence_path):
+    sequenza = mcp_asset_lib().load_asset(sequence_path)
+    if sequenza is None:
+        raise ValueError("Level Sequence '%s' non trovata." % sequence_path)
+    if not isinstance(sequenza, unreal.LevelSequence):
+        raise ValueError(
+            "'%s' è un %s, non una LevelSequence."
+            % (sequence_path, sequenza.get_class().get_name())
+        )
+    return sequenza
+
+
+def _mcp_seq_track_class(nome):
+    """Classe di una track, da un alias comodo o dal nome esatto della classe."""
+    chiave = str(nome).strip().lower().replace(" ", "_")
+    risolto = _MCP_SEQ_TRACK_ALIAS.get(chiave, nome)
+    if not hasattr(unreal, risolto):
+        raise ValueError(
+            "Tipo di track '%s' non riconosciuto. Alias disponibili: %s. In "
+            "alternativa passa il nome esatto della classe (es. "
+            "'MovieSceneFloatTrack')." % (nome, ", ".join(sorted(_MCP_SEQ_TRACK_ALIAS)))
+        )
+    return getattr(unreal, risolto)
+
+
+def _mcp_seq_binding(sequenza, binding):
+    """Un binding per nome visualizzato o per indice.
+
+    Il nome è quello che il Sequencer mostra, e per un possessable coincide con
+    la label dell'attore al momento del binding.
+    """
+    bindings = sequenza.get_bindings()
+    if isinstance(binding, int) or (isinstance(binding, str) and binding.lstrip("-").isdigit()):
+        indice = int(binding)
+        if not -len(bindings) <= indice < len(bindings):
+            raise ValueError(
+                "Indice di binding %d fuori range: la sequenza ne ha %d."
+                % (indice, len(bindings))
+            )
+        return bindings[indice]
+
+    for candidato in bindings:
+        if str(candidato.get_display_name()) == str(binding):
+            return candidato
+    raise ValueError(
+        "Binding '%s' non trovato. Presenti: %s"
+        % (binding, ", ".join(str(b.get_display_name()) for b in bindings) or "nessuno")
+    )
+
+
+def _mcp_seq_track(legame, track, track_type=None):
+    """Una track di un binding, per indice o per classe."""
+    tracks = legame.get_tracks()
+    if track is None:
+        if track_type is not None:
+            cls = _mcp_seq_track_class(track_type)
+            # Confronto sul nome della classe e non con `isinstance`: le track
+            # arrivano dal motore come oggetti di una classe generata, e il
+            # nome è comunque quello che i tool riportano a chi chiama.
+            atteso = getattr(cls, "__unreal_name__", getattr(cls, "__name__", str(cls)))
+            corrispondenti = [
+                t for t in tracks if str(t.get_class().get_name()) == str(atteso)
+            ]
+            if not corrispondenti:
+                presenti = ", ".join(str(t.get_class().get_name()) for t in tracks) or "nessuna"
+                raise ValueError(
+                    "Il binding '%s' non ha una track di tipo %s. Presenti: %s"
+                    % (legame.get_display_name(), atteso, presenti)
+                )
+            return corrispondenti[0]
+        if len(tracks) != 1:
+            raise ValueError(
+                "Il binding '%s' ha %d track: indica quale con `track` "
+                "(indice) o `track_type`." % (legame.get_display_name(), len(tracks))
+            )
+        return tracks[0]
+
+    indice = int(track)
+    if not -len(tracks) <= indice < len(tracks):
+        raise ValueError(
+            "Indice di track %d fuori range: il binding ne ha %d." % (indice, len(tracks))
+        )
+    return tracks[indice]
+
+
+def _mcp_seq_nome_canale(canale):
+    """Il nome del canale senza il suffisso numerico instabile.
+
+    `Location.Z_3` → `Location.Z`. Il suffisso cambia fra una creazione e
+    l'altra nella stessa sessione (verificato dal vivo): indirizzare i canali
+    per nome completo è un bug che aspetta.
+    """
+    nome = str(canale.get_name())
+    testa, separatore, coda = nome.rpartition("_")
+    if separatore and coda.isdigit():
+        return testa
+    return nome
+
+
+def _mcp_seq_canale(sezione, channel):
+    canali = sezione.get_all_channels()
+    voluto = str(channel).strip()
+    for candidato in canali:
+        if _mcp_seq_nome_canale(candidato).lower() == voluto.lower():
+            return candidato
+    for candidato in canali:
+        if str(candidato.get_name()).lower() == voluto.lower():
+            return candidato
+    raise ValueError(
+        "Canale '%s' non trovato nella sezione. Disponibili: %s"
+        % (channel, ", ".join(_mcp_seq_nome_canale(c) for c in canali) or "nessuno")
+    )
+
+
+def _mcp_seq_interp(nome):
+    if nome is None:
+        return unreal.MovieSceneKeyInterpolation.AUTO
+    chiave = str(nome).strip().upper()
+    if not hasattr(unreal.MovieSceneKeyInterpolation, chiave):
+        raise ValueError(
+            "Interpolazione '%s' non riconosciuta. Valori: AUTO, USER, BREAK, "
+            "LINEAR, CONSTANT." % nome
+        )
+    return getattr(unreal.MovieSceneKeyInterpolation, chiave)
+
+
+def mcp_create_level_sequence(package_path, name, fps=None, length_frames=None):
+    """Crea una LevelSequence vuota, con frame rate e durata già impostati."""
+    full = "%s/%s" % (package_path.rstrip("/"), name)
+    if mcp_asset_lib().does_asset_exist(full):
+        return {"path": full, "created": False, "reason": "esiste già"}
+
+    sequenza = mcp_asset_tools().create_asset(
+        name, package_path, unreal.LevelSequence, unreal.LevelSequenceFactoryNew()
+    )
+    if sequenza is None:
+        raise RuntimeError("Creazione della Level Sequence '%s' fallita." % full)
+
+    if fps is not None:
+        sequenza.set_display_rate(unreal.FrameRate(int(fps), 1))
+    if length_frames is not None:
+        sequenza.set_playback_start(0)
+        sequenza.set_playback_end(int(length_frames))
+
+    mcp_asset_lib().save_asset(full)
+    ritmo = sequenza.get_display_rate()
+    return {
+        "path": full,
+        "created": True,
+        "fps": float(ritmo.numerator) / float(ritmo.denominator),
+        "playback": [int(sequenza.get_playback_start()), int(sequenza.get_playback_end())],
+    }
+
+
+def mcp_sequence_info(sequence_path):
+    """Binding, track, sezioni e canali di una Level Sequence.
+
+    È il modo di sapere come si chiamano i canali prima di metterci le chiavi —
+    e di vedere gli indici da usare, visto che i nomi visualizzati sono
+    localizzati.
+    """
+    sequenza = _mcp_sequence(sequence_path)
+    ritmo = sequenza.get_display_rate()
+
+    legami = []
+    for indice, legame in enumerate(sequenza.get_bindings()):
+        tracks = []
+        for indice_track, track in enumerate(legame.get_tracks()):
+            sezioni = []
+            for indice_sezione, sezione in enumerate(track.get_sections()):
+                sezioni.append(
+                    {
+                        "index": indice_sezione,
+                        "range": [
+                            int(sezione.get_start_frame()) if sezione.has_start_frame() else None,
+                            int(sezione.get_end_frame()) if sezione.has_end_frame() else None,
+                        ],
+                        "channels": [
+                            {
+                                "name": _mcp_seq_nome_canale(canale),
+                                "keys": int(canale.get_num_keys())
+                                if hasattr(canale, "get_num_keys")
+                                else None,
+                            }
+                            for canale in sezione.get_all_channels()
+                        ],
+                    }
+                )
+            tracks.append(
+                {
+                    "index": indice_track,
+                    "class": str(track.get_class().get_name()),
+                    "display_name": str(track.get_display_name()),
+                    "sections": sezioni,
+                }
+            )
+        classe = legame.get_possessed_object_class()
+        legami.append(
+            {
+                "index": indice,
+                "name": str(legame.get_display_name()),
+                "class": str(classe.get_name()) if classe else None,
+                "tracks": tracks,
+            }
+        )
+
+    return {
+        "sequence": sequence_path,
+        "fps": float(ritmo.numerator) / float(ritmo.denominator),
+        "playback": [int(sequenza.get_playback_start()), int(sequenza.get_playback_end())],
+        "bindings": legami,
+    }
+
+
+def mcp_sequence_add_actor(sequence_path, label, spawnable=False):
+    """Aggiunge un attore del livello alla sequenza, come possessable o spawnable.
+
+    Possessable: la sequenza anima un attore che esiste già nel livello.
+    Spawnable: la sequenza si porta dietro una copia dell'attore e la crea e
+    distrugge da sé — è quello che serve per una cinematica autonoma.
+    """
+    sequenza = _mcp_sequence(sequence_path)
+    attore = mcp_require_actor(label)
+
+    legame = (
+        sequenza.add_spawnable_from_instance(attore)
+        if spawnable
+        else sequenza.add_possessable(attore)
+    )
+    if legame is None or not legame.is_valid():
+        raise RuntimeError("Unreal non ha creato il binding per '%s'." % label)
+
+    mcp_asset_lib().save_asset(sequence_path)
+    classe = legame.get_possessed_object_class()
+    return {
+        "sequence": sequence_path,
+        "binding": str(legame.get_display_name()),
+        "class": str(classe.get_name()) if classe else None,
+        "spawnable": bool(spawnable),
+    }
+
+
+def mcp_sequence_add_track(sequence_path, binding, track_type, start=None, end=None):
+    """Aggiunge una track a un binding, con la sua prima sezione.
+
+    Una track senza sezione non anima niente: per questo la sezione viene
+    creata sempre, e il suo range di default è quello di playback della
+    sequenza.
+    """
+    sequenza = _mcp_sequence(sequence_path)
+    legame = _mcp_seq_binding(sequenza, binding)
+    cls = _mcp_seq_track_class(track_type)
+
+    track = legame.add_track(cls)
+    if track is None:
+        raise RuntimeError("Unreal non ha creato la track %s." % cls.__name__)
+
+    sezione = track.add_section()
+    primo = int(start) if start is not None else int(sequenza.get_playback_start())
+    ultimo = int(end) if end is not None else int(sequenza.get_playback_end())
+    sezione.set_range(primo, ultimo)
+
+    mcp_asset_lib().save_asset(sequence_path)
+    return {
+        "sequence": sequence_path,
+        "binding": str(legame.get_display_name()),
+        "track": str(track.get_class().get_name()),
+        "track_index": len(legame.get_tracks()) - 1,
+        "range": [primo, ultimo],
+        "channels": [_mcp_seq_nome_canale(c) for c in sezione.get_all_channels()],
+    }
+
+
+def mcp_sequence_add_key(
+    sequence_path,
+    binding,
+    channel,
+    frame,
+    value,
+    track=None,
+    track_type=None,
+    section=0,
+    interpolation=None,
+):
+    """Mette una chiave su un canale, e rilegge quello che è finito davvero lì.
+
+    Il canale si indica senza suffisso numerico (`"Location.Z"`, non
+    `"Location.Z_3"`): il suffisso che Unreal appiccica cambia da una creazione
+    all'altra.
+    """
+    sequenza = _mcp_sequence(sequence_path)
+    legame = _mcp_seq_binding(sequenza, binding)
+    pista = _mcp_seq_track(legame, track, track_type)
+
+    sezioni = pista.get_sections()
+    indice = int(section)
+    if not -len(sezioni) <= indice < len(sezioni):
+        raise ValueError(
+            "Indice di sezione %d fuori range: la track ne ha %d." % (indice, len(sezioni))
+        )
+    sezione = sezioni[indice]
+    canale = _mcp_seq_canale(sezione, channel)
+
+    numero = unreal.FrameNumber(int(frame))
+    if isinstance(value, bool):
+        canale.add_key(numero, bool(value))
+    elif isinstance(value, (int, float)):
+        canale.add_key(numero, float(value), interpolation=_mcp_seq_interp(interpolation))
+    else:
+        canale.add_key(numero, value)
+
+    mcp_asset_lib().save_asset(sequence_path)
+    return {
+        "sequence": sequence_path,
+        "binding": str(legame.get_display_name()),
+        "channel": _mcp_seq_nome_canale(canale),
+        "keys": [
+            [int(k.get_time().frame_number.value), k.get_value()] for k in canale.get_keys()
+        ],
+    }
+
+
+def mcp_sequence_set_range(sequence_path, start=None, end=None, fps=None):
+    """Cambia il range di playback e il frame rate della sequenza."""
+    sequenza = _mcp_sequence(sequence_path)
+    if fps is not None:
+        sequenza.set_display_rate(unreal.FrameRate(int(fps), 1))
+    if start is not None:
+        sequenza.set_playback_start(int(start))
+    if end is not None:
+        sequenza.set_playback_end(int(end))
+
+    mcp_asset_lib().save_asset(sequence_path)
+    ritmo = sequenza.get_display_rate()
+    return {
+        "sequence": sequence_path,
+        "playback": [int(sequenza.get_playback_start()), int(sequenza.get_playback_end())],
+        "fps": float(ritmo.numerator) / float(ritmo.denominator),
+    }
+
+
+def mcp_sequence_remove(sequence_path, binding, track=None, track_type=None):
+    """Toglie una track da un binding, o l'intero binding se non si indica track."""
+    sequenza = _mcp_sequence(sequence_path)
+    legame = _mcp_seq_binding(sequenza, binding)
+    nome = str(legame.get_display_name())
+
+    if track is None and track_type is None:
+        legame.remove()
+        mcp_asset_lib().save_asset(sequence_path)
+        return {"sequence": sequence_path, "removed_binding": nome}
+
+    pista = _mcp_seq_track(legame, track, track_type)
+    classe = str(pista.get_class().get_name())
+    legame.remove_track(pista)
+    mcp_asset_lib().save_asset(sequence_path)
+    return {
+        "sequence": sequence_path,
+        "binding": nome,
+        "removed_track": classe,
+        "tracks_left": len(legame.get_tracks()),
+    }
+
+
+def mcp_sequence_open(sequence_path, close=False):
+    """Apre (o chiude) la sequenza nell'editor del Sequencer.
+
+    Serve a vedere quello che si è costruito: i tool scrivono sull'asset, che
+    di per sé non apre nessuna finestra.
+    """
+    if close:
+        unreal.LevelSequenceEditorBlueprintLibrary.close_level_sequence()
+        return {"sequence": sequence_path, "open": False}
+
+    sequenza = _mcp_sequence(sequence_path)
+    unreal.LevelSequenceEditorBlueprintLibrary.open_level_sequence(sequenza)
+    return {"sequence": sequence_path, "open": True}

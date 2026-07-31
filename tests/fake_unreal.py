@@ -36,6 +36,11 @@ class FakeObject:
         a un Behavior Tree); altrimenti un placeholder plausibile."""
         return self._props.get("_path", "/Game/_Fake/%s" % type(self).__name__)
 
+    def get_name(self):
+        """L'ultimo segmento del path, come nel motore — usato dai messaggi di
+        errore e dai nomi di transazione."""
+        return self.get_path_name().rsplit("/", 1)[-1].split(".")[0]
+
 
 class Vector:
     def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -72,6 +77,16 @@ class Guid(str):
 
 
 class Transform(FakeObject):
+    """Come nel motore: costruibile sia vuota (per `static_struct`) sia con
+    la terna posizionale location/rotation/scale, che è la forma usata dal
+    foliage e dal sequencer."""
+
+    def __init__(self, location=None, rotation=None, scale=None, **kwargs):
+        super().__init__(**kwargs)
+        self.translation = location if location is not None else Vector()
+        self.rotation = rotation if rotation is not None else Rotator()
+        self.scale3d = scale if scale is not None else Vector(1.0, 1.0, 1.0)
+
     @staticmethod
     def static_struct():
         return "StructTransform"
@@ -1210,6 +1225,350 @@ class PCGVolume(Actor):
         self._components = [PCGComponent()]
 
 
+# ---------------------------------------------------------------- fase 14a: foliage
+
+
+class StaticMesh(FakeObject):
+    def __init__(self, path="/Engine/BasicShapes/Cube"):
+        super().__init__(_path=path)
+
+
+class FoliageType(FakeObject):
+    """Le proprietà di default sono quelle che il motore mostra su un
+    FoliageType appena creato: `mcp_set_foliage_property` le rilegge dopo aver
+    scritto, e un dict vuoto le farebbe tornare tutte None."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._props.setdefault("mesh", None)
+        self._props.setdefault("density", 100.0)
+        self._props.setdefault("radius", 0.0)
+        self._props.setdefault("random_yaw", True)
+        self._props.setdefault("align_to_normal", True)
+
+
+class FoliageType_InstancedStaticMesh(FoliageType):
+    pass
+
+
+class FoliageType_InstancedStaticMeshFactory(FakeObject):
+    pass
+
+
+class FoliageTypeObject(FakeObject):
+    pass
+
+
+class ProceduralFoliageSpawner(FakeObject):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._props.setdefault("foliage_types", [])
+        self._props.setdefault("tile_size", 10000.0)
+
+
+class ProceduralFoliageSpawnerFactory(FakeObject):
+    pass
+
+
+class FoliageInstancedStaticMeshComponent(ActorComponent):
+    """Il componente che regge davvero le istanze.
+
+    Non è un dettaglio del finto: è la via da cui passano `mcp_foliage_list`,
+    `mcp_foliage_query` e `mcp_foliage_remove`, perché `FoliageStatistics`
+    nell'editor risponde sempre 0 (verificato dal vivo). Qui le istanze sono
+    una lista di Transform e gli indici si comportano come nel motore —
+    `remove_instances` rinumera quelle che restano.
+    """
+
+    def __init__(self, mesh, name="FoliageInstancedStaticMeshComponent_0"):
+        super().__init__(name, "FoliageInstancedStaticMeshComponent")
+        self._props["static_mesh"] = mesh
+        self.istanze = []
+
+    def get_instance_count(self):
+        return len(self.istanze)
+
+    def get_instance_transform(self, index, world_space=False):
+        return self.istanze[int(index)]
+
+    def get_instances_overlapping_sphere(self, center, radius, sphere_in_world_space=True):
+        trovati = []
+        for indice, trasformata in enumerate(self.istanze):
+            posizione = trasformata.translation
+            distanza = (
+                (posizione.x - center.x) ** 2
+                + (posizione.y - center.y) ** 2
+                + (posizione.z - center.z) ** 2
+            ) ** 0.5
+            if distanza <= float(radius):
+                trovati.append(indice)
+        return trovati
+
+    def remove_instances(self, indices):
+        for indice in sorted((int(i) for i in indices), reverse=True):
+            del self.istanze[indice]
+        return True
+
+
+class InstancedFoliageActor(Actor):
+    def __init__(self, label="InstancedFoliageActor0"):
+        super().__init__(class_name="InstancedFoliageActor", label=label)
+        self._components = []
+
+
+class ProceduralFoliageComponent(ActorComponent):
+    def __init__(self, name="ProceduralFoliage"):
+        super().__init__(name, "ProceduralFoliageComponent")
+        self._props["foliage_spawner"] = None
+
+
+class ProceduralFoliageVolume(Actor):
+    def __init__(self, label="ProceduralFoliageVolume"):
+        super().__init__(class_name="ProceduralFoliageVolume", label=label)
+        self._components = [ProceduralFoliageComponent()]
+
+
+class HitResult(FakeObject):
+    """Il risultato di un line trace, chiuso da tutte e due le parti come nel
+    motore: né attributo Python né `get_editor_property`, solo `to_dict()` —
+    ed è la trappola che ha rotto `mcp_foliage_scatter` alla prima stesura."""
+
+    def __init__(self, blocking_hit, location):
+        super().__init__()
+        self._dati = {"blocking_hit": bool(blocking_hit), "location": location}
+
+    def get_editor_property(self, name):
+        raise Exception(
+            "HitResult: Failed to find property '%s' for attribute '%s' on 'HitResult'"
+            % (name, name)
+        )
+
+    def to_dict(self):
+        return dict(self._dati)
+
+
+# --------------------------------------------------------------- fase 14b: sequencer
+
+
+class FrameRate(FakeObject):
+    def __init__(self, numerator=30, denominator=1):
+        super().__init__()
+        self.numerator, self.denominator = int(numerator), int(denominator)
+
+
+class FrameNumber(FakeObject):
+    def __init__(self, value=0):
+        super().__init__()
+        self.value = int(value)
+
+
+class _SeqFrame:
+    def __init__(self, valore):
+        self.frame_number = FrameNumber(valore)
+
+
+class MovieSceneKeyInterpolation:
+    AUTO = "AUTO"
+    USER = "USER"
+    BREAK = "BREAK"
+    LINEAR = "LINEAR"
+    CONSTANT = "CONSTANT"
+
+
+class _SeqKey:
+    def __init__(self, frame, valore, interpolazione=None):
+        self._frame, self._valore, self.interpolazione = frame, valore, interpolazione
+
+    def get_time(self):
+        return _SeqFrame(self._frame)
+
+    def get_value(self):
+        return self._valore
+
+
+class _SeqChannel:
+    """Un canale di una sezione.
+
+    Il suffisso numerico nel nome è deliberato e *variabile*: nel motore vero
+    la stessa sezione ha dato `Location.Z_0` alla prima creazione e
+    `Location.Z_3` alla seconda. Il finto lo riproduce con un contatore
+    globale, così un tool che indirizzasse i canali per nome esatto fallirebbe
+    qui come fallirebbe sull'editor.
+    """
+
+    _contatore = 0
+
+    def __init__(self, nome_base):
+        _SeqChannel._contatore += 1
+        self._nome = "%s_%d" % (nome_base, _SeqChannel._contatore)
+        self.chiavi = []
+
+    def get_name(self):
+        return self._nome
+
+    def get_num_keys(self):
+        return len(self.chiavi)
+
+    def get_keys(self):
+        return list(self.chiavi)
+
+    def add_key(self, time, new_value, sub_frame=0.0, time_unit=None, interpolation=None):
+        chiave = _SeqKey(int(time.value), new_value, interpolation)
+        self.chiavi.append(chiave)
+        self.chiavi.sort(key=lambda k: k._frame)
+        return chiave
+
+
+_SEQ_CANALI = {
+    "MovieScene3DTransformTrack": [
+        "Location.X",
+        "Location.Y",
+        "Location.Z",
+        "Rotation.X",
+        "Rotation.Y",
+        "Rotation.Z",
+        "Scale.X",
+        "Scale.Y",
+        "Scale.Z",
+    ],
+    "MovieSceneVisibilityTrack": ["MovieSceneScriptingBoolChannel"],
+    "MovieSceneAudioTrack": [],
+    "MovieSceneSkeletalAnimationTrack": [],
+}
+
+
+class _SeqSection:
+    def __init__(self, classe_track):
+        self._inizio, self._fine = None, None
+        self._canali = [_SeqChannel(n) for n in _SEQ_CANALI.get(classe_track, [])]
+
+    def set_range(self, start_frame, end_frame):
+        self._inizio, self._fine = int(start_frame), int(end_frame)
+
+    def has_start_frame(self):
+        return self._inizio is not None
+
+    def has_end_frame(self):
+        return self._fine is not None
+
+    def get_start_frame(self):
+        return self._inizio
+
+    def get_end_frame(self):
+        return self._fine
+
+    def get_all_channels(self):
+        return list(self._canali)
+
+
+class _SeqTrack:
+    def __init__(self, classe):
+        self._classe = classe
+        self._sezioni = []
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._classe)
+
+    def get_display_name(self):
+        # Localizzato come nel motore: è il motivo per cui i tool indirizzano
+        # le track per classe o per indice, mai per nome visualizzato.
+        return {"MovieScene3DTransformTrack": "Trasforma"}.get(self._classe, self._classe)
+
+    def add_section(self):
+        sezione = _SeqSection(self._classe)
+        self._sezioni.append(sezione)
+        return sezione
+
+    def get_sections(self):
+        return list(self._sezioni)
+
+
+class _SeqBinding:
+    def __init__(self, sequenza, nome, classe, spawnable=False):
+        self._sequenza, self._nome, self._classe = sequenza, nome, classe
+        self.spawnable = spawnable
+        self._tracks = []
+
+    def is_valid(self):
+        return True
+
+    def get_display_name(self):
+        return self._nome
+
+    def get_id(self):
+        return Guid(self._nome)
+
+    def get_possessed_object_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._classe)
+
+    def add_track(self, track_type):
+        nome = getattr(track_type, "__unreal_name__", getattr(track_type, "__name__", str(track_type)))
+        track = _SeqTrack(nome)
+        self._tracks.append(track)
+        return track
+
+    def get_tracks(self):
+        return list(self._tracks)
+
+    def remove_track(self, track):
+        self._tracks = [t for t in self._tracks if t is not track]
+
+    def remove(self):
+        self._sequenza._bindings = [b for b in self._sequenza._bindings if b is not self]
+
+
+class LevelSequence(FakeObject):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bindings = []
+        self._ritmo = FrameRate(30, 1)
+        self._inizio, self._fine = 0, 0
+
+    def get_bindings(self):
+        return list(self._bindings)
+
+    def add_possessable(self, object_to_possess):
+        legame = _SeqBinding(
+            self,
+            object_to_possess.get_actor_label(),
+            object_to_possess.get_class().get_name(),
+        )
+        self._bindings.append(legame)
+        return legame
+
+    def add_spawnable_from_instance(self, object_to_spawn):
+        legame = _SeqBinding(
+            self,
+            object_to_spawn.get_actor_label(),
+            object_to_spawn.get_class().get_name(),
+            spawnable=True,
+        )
+        self._bindings.append(legame)
+        return legame
+
+    def set_display_rate(self, display_rate):
+        self._ritmo = display_rate
+
+    def get_display_rate(self):
+        return self._ritmo
+
+    def set_playback_start(self, start_frame):
+        self._inizio = int(start_frame)
+
+    def set_playback_end(self, end_frame):
+        self._fine = int(end_frame)
+
+    def get_playback_start(self):
+        return self._inizio
+
+    def get_playback_end(self):
+        return self._fine
+
+
+class LevelSequenceFactoryNew(FakeObject):
+    pass
+
+
 class LandscapePlaceholder(Actor):
     """Quello che il motore spawna davvero se si prova a creare un Landscape
     da script: un attore vuoto, senza nessuno dei metodi di `ALandscape`."""
@@ -1433,6 +1792,13 @@ def build_fake_unreal(tmp_path):
         Vector2D, TextureRenderTarget2D, LandscapeComponent, LandscapeProxy, Landscape,
         LandscapePlaceholder, PCGGraph, PCGGraphFactory, PCGNode, PCGSettings, PCGEdge,
         PCGComponent, PCGVolume, K2Node, K2Pin,
+        StaticMesh, FoliageType, FoliageType_InstancedStaticMesh,
+        FoliageType_InstancedStaticMeshFactory, FoliageTypeObject,
+        FoliageInstancedStaticMeshComponent, InstancedFoliageActor,
+        ProceduralFoliageSpawner, ProceduralFoliageSpawnerFactory,
+        ProceduralFoliageComponent, ProceduralFoliageVolume, HitResult,
+        LevelSequence, LevelSequenceFactoryNew, FrameRate, FrameNumber,
+        MovieSceneKeyInterpolation,
         Widget, PanelWidget, WidgetTree, Margin, UmgSlot,
     ):
         setattr(module, cls.__name__, cls)
@@ -1455,6 +1821,10 @@ def build_fake_unreal(tmp_path):
         # fase 10: in PCG il tipo di un nodo è la sua classe di settings
         "PCGSurfaceSamplerSettings", "PCGStaticMeshSpawnerSettings",
         "PCGCreatePointsGridSettings", "PCGDensityFilterSettings",
+        # fase 14b: le track del sequencer sono risolte per nome di classe
+        "MovieScene3DTransformTrack", "MovieSceneVisibilityTrack", "MovieSceneAudioTrack",
+        "MovieSceneSkeletalAnimationTrack", "MovieSceneCameraCutTrack",
+        "MovieSceneEventTrack", "MovieSceneFadeTrack", "MovieSceneFloatTrack",
     ):
         setattr(module, name, type(name, (FakeObject,), {"__unreal_name__": name}))
 
@@ -1473,6 +1843,14 @@ def build_fake_unreal(tmp_path):
             # Fase 10: un PCGVolume nasce già con il suo PCGComponent dentro.
             if name == "PCGVolume":
                 volume = PCGVolume("PCGVolume_%d" % len(state["actors"]))
+                volume._location, volume._rotation = location, rotation
+                state["actors"].append(volume)
+                return volume
+            # Fase 14a: idem per il volume di foliage procedurale.
+            if name == "ProceduralFoliageVolume":
+                volume = ProceduralFoliageVolume(
+                    "ProceduralFoliageVolume_%d" % len(state["actors"])
+                )
                 volume._location, volume._rotation = location, rotation
                 state["actors"].append(volume)
                 return volume
@@ -2043,9 +2421,86 @@ def build_fake_unreal(tmp_path):
                 handle.write("[0]LogLiveCoding: Display: Starting Live Coding compile.\n")
                 handle.write("[0]LogLiveCoding: Display: Live coding succeeded\n")
 
+    def line_trace_single(
+        world_context_object,
+        start,
+        end,
+        trace_channel,
+        trace_complex,
+        actors_to_ignore,
+        draw_debug_type,
+        ignore_self,
+        trace_color=None,
+        trace_hit_color=None,
+        draw_time=0.0,
+    ):
+        """Un pavimento a z=0 sotto tutto: basta a `mcp_foliage_scatter`.
+
+        Come nel motore, restituisce None quando non colpisce niente — qui
+        quando il segmento non attraversa lo zero.
+        """
+        if start.z >= 0.0 >= end.z:
+            return HitResult(True, Vector(start.x, start.y, 0.0))
+        return None
+
     module.SystemLibrary = types.SimpleNamespace(
         get_engine_version=lambda: "5.8.0-fake+++UE5",
         execute_console_command=execute_console_command,
+        line_trace_single=line_trace_single,
+    )
+    module.TraceTypeQuery = types.SimpleNamespace(TRACE_TYPE_QUERY1="TraceTypeQuery1")
+    module.DrawDebugTrace = types.SimpleNamespace(NONE="None")
+
+    # ---- fase 14a: foliage
+    #
+    # `InstancedFoliageActor.add_instances` è una UFUNCTION *statica* nel
+    # motore: qui è una staticmethod che crea l'attore del livello alla prima
+    # chiamata, come fa Unreal.
+    def _foliage_actor():
+        for attore in state["actors"]:
+            if isinstance(attore, InstancedFoliageActor):
+                return attore
+        attore = InstancedFoliageActor()
+        state["actors"].append(attore)
+        return attore
+
+    def _foliage_component(mesh):
+        attore = _foliage_actor()
+        for componente in attore._components:
+            if componente.get_editor_property("static_mesh") is mesh:
+                return componente
+        componente = FoliageInstancedStaticMeshComponent(
+            mesh, "FoliageInstancedStaticMeshComponent_%d" % len(attore._components)
+        )
+        attore._components.append(componente)
+        return componente
+
+    def _foliage_add_instances(world_context_object, foliage_type, transforms):
+        mesh = foliage_type.get_editor_property("mesh")
+        _foliage_component(mesh).istanze.extend(transforms)
+
+    def _foliage_remove_all(world_context_object, foliage_type):
+        mesh = foliage_type.get_editor_property("mesh")
+        _foliage_component(mesh).istanze = []
+
+    InstancedFoliageActor.add_instances = staticmethod(_foliage_add_instances)
+    InstancedFoliageActor.remove_all_instances = staticmethod(_foliage_remove_all)
+
+    module.ProceduralFoliageEditorLibrary = types.SimpleNamespace(
+        resimulate_procedural_foliage_volumes=lambda volumes: state.setdefault(
+            "foliage_simulated", []
+        ).extend(v.get_actor_label() for v in volumes),
+        clear_procedural_foliage_volumes=lambda volumes: state.setdefault(
+            "foliage_cleared", []
+        ).extend(v.get_actor_label() for v in volumes),
+    )
+
+    # ---- fase 14b: la finestra del Sequencer
+    module.LevelSequenceEditorBlueprintLibrary = types.SimpleNamespace(
+        open_level_sequence=lambda sequence: state.setdefault("sequencer_open", []).append(
+            sequence.get_path_name()
+        ),
+        close_level_sequence=lambda: state.setdefault("sequencer_open", []).append(None),
     )
 
     class UnrealEditorSubsystem:

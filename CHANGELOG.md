@@ -6,6 +6,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-31
+
+**I tre gap del confronto con la concorrenza, chiusi.** 143 tool → 162.
+Foliage, sequencer come authoring e un motore di flow: erano le tre cose che
+db-lyon/ue-mcp aveva e qui mancavano, ed erano già elencate in quest'ordine di
+priorità in fondo a `docs/PARITY_ROADMAP.md`.
+
+### Added — Foliage
+
+- `ue_create_foliage_type`, `ue_set_foliage_property` — la "specie": quale
+  mesh, e con quali regole.
+- `ue_foliage_add_instances` — piazza istanze a trasformate date. Accetta le
+  sole posizioni, che è il caso comune.
+- `ue_foliage_scatter` — sparge N istanze a caso in un cerchio, appoggiando
+  ognuna al terreno con un line trace. Con `seed` il risultato si ripete.
+- `ue_foliage_list`, `ue_foliage_query` — cosa c'è nel livello, e cosa c'è
+  dentro una sfera con le trasformate in world space.
+- `ue_foliage_remove` — tutte le istanze, o solo quelle in una sfera.
+- `ue_create_foliage_spawner`, `ue_foliage_spawn_volume`,
+  `ue_foliage_simulate` — la parte procedurale.
+
+`EditorFoliageLibrary` e `FoliageEditorSubsystem`, che sono i nomi che
+verrebbe da cercare, **non esistono** nella Python API di UE 5.8: verificato
+con `hasattr` prima di scrivere codice. La via vera passa da
+`InstancedFoliageActor.add_instances` e dai
+`FoliageInstancedStaticMeshComponent` del livello.
+
+**Attenzione a `FoliageStatistics`**, la libreria che sembra fatta apposta per
+contare le istanze: nel mondo dell'editor risponde sempre 0. Provata dal vivo
+su un box che ne conteneva cinque, con entrambi i world context plausibili. È
+una libreria di gameplay. Se `ue_foliage_query` fosse passato da lì avrebbe
+risposto "nessuna istanza" su un livello pieno di foliage, senza sollevare
+niente — il tipo peggiore di bug. Passa dai componenti.
+
+### Added — Sequencer authoring
+
+- `ue_create_level_sequence`, `ue_sequence_info` — l'asset, e come guardarci
+  dentro prima di scriverci.
+- `ue_sequence_add_actor` — possessable o spawnable.
+- `ue_sequence_add_track` — con la sua prima sezione già dentro: una track
+  senza sezione non anima niente.
+- `ue_sequence_add_key`, `ue_sequence_set_range`, `ue_sequence_remove`.
+- `ue_sequence_open` — per guardare quello che si è costruito.
+
+Fino alla 0.9.0 il sequencer andava in una direzione sola:
+`ue_render_sequence` renderizza una sequenza che ha costruito qualcun altro.
+
+Nessun muro, contro le aspettative maturate su UMG e Niagara. Ma **due
+trappole**, entrambe gestite dai tool: i nomi dei canali hanno un suffisso
+numerico *instabile* (la stessa sezione ha dato `Location.Z_0` alla prima
+creazione e `Location.Z_3` alla seconda, nella stessa sessione — i canali si
+indicano senza suffisso), e i nomi visualizzati di track e binding sono
+localizzati come la palette dei nodi Blueprint, quindi le track si indirizzano
+per tipo o per indice.
+
+Verificato dal vivo su UE 5.8: sequenza a 30 fps, attore possessato, due
+chiavi su `Rotation.Y`, una track di visibilità, salvata e ritrovata nel
+`.uasset`.
+
+### Added — Flow
+
+- `ue_flow_run` — esegue una lista di chiamate a tool scritta in YAML (o
+  JSON) in una sola chiamata MCP, con variabili, riferimenti fra passi
+  (`${cubo.label}`), condizioni e `dry_run`.
+
+L'unica delle tre novità che non tocca l'editor: vive lato server e chiama i
+tool che già ci sono. Il motivo è il contesto, non la velocità — una scena si
+costruisce quasi sempre con la stessa sequenza di dieci o venti chiamate, e
+farla passare dal modello un passo alla volta gli lascia in memoria diciannove
+risposte JSON che non gli servono più.
+
+Niente cicli e niente espressioni, per scelta: la logica sta in chi genera il
+flow. E niente `eval` da nessuna parte — i riferimenti sono un percorso puntato
+con una regex stretta, le condizioni sono tre forme dichiarative, e la
+risoluzione dei tool filtra sui prefissi `ue_`/`preset_` perché senza quel
+filtro un flow potrebbe chiamare `run` e mandare Python qualunque dentro
+l'editor.
+
+**PyYAML è una dipendenza opzionale**, non aggiunta a quelle obbligatorie: JSON
+è un sottoinsieme di YAML, quindi i flow JSON funzionano con l'installazione
+nuda e quelli YAML dicono come installarlo invece di fallire dentro il parser.
+
 ## [0.9.0] — 2026-07-31
 
 **Il layout UMG si costruisce da Python.** 138 tool → 143. Ed è la seconda
