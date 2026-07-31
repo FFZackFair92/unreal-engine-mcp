@@ -47,8 +47,10 @@ mcp = FastMCP(
         "ue_status capabilities.blueprint_graph_authoring first) — nodes are addressed "
         "by object name, and event nodes by the alias event:ReceiveBeginPlay. On older "
         "engines, put logic in a C++ parent class instead "
-        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). UMG widget trees, "
-        "Niagara emitter stacks and EQS remain unscriptable. Material graphs, Behavior "
+        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). UMG layout is "
+        "scriptable too (ue_umg_add_widget, ue_umg_set_slot), but only under a root "
+        "widget that already exists — an empty tree cannot get its first widget from "
+        "Python. Niagara emitter stacks and EQS remain unscriptable. Material graphs, Behavior "
         "Trees and PCG graphs are fully scriptable "
         "(ue_create_material, ue_bt_add_node, ue_pcg_add_node/ue_pcg_connect). "
         "A landscape cannot be created from Python — it has to exist already "
@@ -1725,14 +1727,12 @@ async def ue_create_widget_blueprint(
 ) -> dict:
     """Crea un asset Widget Blueprint (UMG) vuoto.
 
-    Il layout (aggiungere TextBlock/Button/CanvasPanel, il posizionamento) NON
-    è scriptabile: il `WidgetTree` è una proprietà protetta nella Python API
-    di UE, stesso limite dei grafi Blueprint. Va disegnato a mano nel Widget
-    Designer. Per la logica, la via che funziona è la stessa già in uso per i
-    grafi Blueprint: `ue_cpp_class_create` con proprietà `BindWidget` (nomi
-    che devono combaciare con quelli dati ai widget nel Designer) come parent
-    class di questo Widget Blueprint, poi `ue_reparent_blueprint` se creato
-    dopo.
+    **L'albero nasce senza radice**, e `WidgetTree.RootWidget` non è
+    scrivibile da Python: per costruire un layout con i tool `ue_umg_*` parti
+    invece da `ue_duplicate_asset` di un Widget Blueprint che una radice ce
+    l'ha già, e svuotalo con `ue_umg_remove_widget`. Questo tool va bene
+    quando la radice la metti a mano nel Widget Designer, o quando il Widget
+    Blueprint serve solo come asset da riempire dopo.
 
     Args:
         package_path: es. "/Game/UI".
@@ -1746,6 +1746,112 @@ async def ue_create_widget_blueprint(
     return await run(
         f"result = mcp_create_widget_blueprint({lit(package_path)}, {lit(name)}, "
         f"{lit(parent_class)}, {lit(editor_utility)})"
+    )
+
+
+# ================================================================== UMG layout
+#
+# Il `WidgetTree` è una proprietà protetta, ma l'oggetto che sta dietro è un
+# subobject del Widget Blueprint e si raggiunge per nome: da lì il layout è
+# authorabile davvero (verificato dal vivo su UE 5.8).
+#
+# **Un limite resta**: `RootWidget` non è scrivibile, quindi il primo widget
+# di un albero vuoto non è creabile da qui. La radice dev'esserci già —
+# mettila nel Widget Designer, oppure duplica con `ue_duplicate_asset` un
+# Widget Blueprint che ce l'ha e svuotalo.
+#
+# I widget si indirizzano per nome ("Titolo", "CanvasPanel_0"): sono univoci
+# dentro un albero, e sono gli stessi che si vedono nel pannello Hierarchy.
+
+
+@mcp.tool()
+async def ue_umg_tree_info(widget_blueprint_path: str) -> dict:
+    """La gerarchia dei widget di un Widget Blueprint: nomi, classi, figli e
+    tipo di slot.
+
+    `root: null` vuol dire albero vuoto — lì non si può aggiungere niente
+    finché non c'è una radice.
+    """
+    return await run(f"result = mcp_umg_tree_info({lit(widget_blueprint_path)})")
+
+
+@mcp.tool()
+async def ue_umg_add_widget(
+    widget_blueprint_path: str,
+    widget_class: str,
+    parent: str | None = None,
+    name: str | None = None,
+    slot: dict | None = None,
+) -> dict:
+    """Crea un widget e lo mette sotto un pannello dell'albero.
+
+    Args:
+        widget_blueprint_path: es. "/Game/UI/WBP_MainMenu".
+        widget_class: "TextBlock", "Button", "Image", "VerticalBox",
+            "HorizontalBox", "CanvasPanel", "Overlay", "Border", "ProgressBar"…
+        parent: nome del pannello che lo conterrà; se omesso, la radice.
+            Dev'essere un PanelWidget: un TextBlock non può contenere nulla.
+        name: nome del widget, quello che si vedrà in Hierarchy e che serve
+            per `BindWidget` da C++. Se omesso lo sceglie Unreal.
+        slot: layout dentro il pannello, applicato subito — le stesse chiavi
+            di `ue_umg_set_slot`.
+    """
+    return await run(
+        "result = mcp_umg_add_widget("
+        f"{lit(widget_blueprint_path)}, {lit(widget_class)}, {lit(parent)}, "
+        f"{lit(name)}, {lit(slot)})"
+    )
+
+
+@mcp.tool()
+async def ue_umg_set_widget_property(
+    widget_blueprint_path: str, widget: str, properties: dict
+) -> dict:
+    """Imposta proprietà su un widget: testo, colore, visibilità, immagine.
+
+    Le proprietà di testo sono `FText` nel motore: passa una stringa normale,
+    la conversione è automatica. I dict con x/y/z, pitch/yaw/roll o r/g/b
+    diventano i tipi Unreal corrispondenti, e i path "/Game/..." vengono
+    caricati come asset.
+
+    Restituisce `applied` e `failed` separati: una proprietà sbagliata non fa
+    fallire le altre.
+    """
+    return await run(
+        "result = mcp_umg_set_widget_property("
+        f"{lit(widget_blueprint_path)}, {lit(widget)}, {lit(properties)})"
+    )
+
+
+@mcp.tool()
+async def ue_umg_set_slot(widget_blueprint_path: str, widget: str, properties: dict) -> dict:
+    """Imposta il layout di un widget dentro il suo pannello.
+
+    Le chiavi valide dipendono dal pannello che lo contiene, e
+    `ue_umg_tree_info` riporta `slot_class` per saperlo:
+
+    - `CanvasPanelSlot`: `position` [x, y], `size` [x, y], `z_order`,
+      `alignment`, `auto_size`.
+    - `VerticalBoxSlot` / `HorizontalBoxSlot`: `padding` (numero singolo, o
+      [left, top, right, bottom], o {"left":…}), `horizontal_alignment`,
+      `vertical_alignment`.
+
+    Le liste di 2 numeri diventano `Vector2D`, quelle di 4 un `Margin`.
+    """
+    return await run(
+        f"result = mcp_umg_set_slot({lit(widget_blueprint_path)}, {lit(widget)}, {lit(properties)})"
+    )
+
+
+@mcp.tool()
+async def ue_umg_remove_widget(widget_blueprint_path: str, widget: str) -> dict:
+    """Toglie un widget dall'albero, con tutto quello che contiene.
+
+    La radice non si può togliere (`RootWidget` non è scrivibile): per
+    svuotare un albero, rimuovi i figli della radice.
+    """
+    return await run(
+        f"result = mcp_umg_remove_widget({lit(widget_blueprint_path)}, {lit(widget)})"
     )
 
 

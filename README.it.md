@@ -23,8 +23,8 @@ Il livello locale esiste perché la Remote Control API funziona **solo con un
 editor già aperto**: creare un progetto, avviarlo, compilare e produrre il
 pacchetto sono tutte operazioni a livello di processo.
 
-- **138 tool** e **5 resource** — [riferimento completo](docs/TOOLS.it.md)
-- **417 test**, nessuno dei quali richiede Unreal installato
+- **143 tool** e **5 resource** — [riferimento completo](docs/TOOLS.it.md)
+- **435 test**, nessuno dei quali richiede Unreal installato
 - **[Note sull'automazione di Unreal](docs/UNREAL-NOTES.md)** — le trappole delle API trovate sul campo
 
 ---

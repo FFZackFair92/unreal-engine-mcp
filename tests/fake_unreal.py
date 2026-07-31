@@ -309,6 +309,118 @@ class FakeEventNode:
         return "%s:EventGraph.K2Node_Event_%s" % (self._blueprint.path, self._event_name)
 
 
+# ----------------------------------------------- fase 12: albero dei widget
+#
+# Il WidgetTree è raggiungibile come subobject anche se la proprietà
+# `WidgetTree` è protetta. Il finto riproduce la struttura *e* il limite che
+# resta: `RootWidget` non è scrivibile, quindi un albero creato da zero è
+# vuoto e nessun widget può esserci aggiunto.
+
+#: Quali classi di widget sono pannelli, e con che slot.
+UMG_PANNELLI = {
+    "CanvasPanel": "CanvasPanelSlot",
+    "VerticalBox": "VerticalBoxSlot",
+    "HorizontalBox": "HorizontalBoxSlot",
+    "Overlay": "OverlaySlot",
+    "Border": "BorderSlot",
+}
+
+
+class Margin:
+    def __init__(self, left=0.0, top=0.0, right=0.0, bottom=0.0):
+        self.left, self.top = float(left), float(top)
+        self.right, self.bottom = float(right), float(bottom)
+
+
+class UmgSlot(FakeObject):
+    """Lo slot di un widget dentro il suo pannello.
+
+    I `set_<nome>` sono metodi veri nel motore, non proprietà: il finto li
+    genera via `__getattr__` così `_mcp_umg_applica_slot` prende la stessa
+    strada che prenderebbe sull'editor.
+    """
+
+    def __init__(self, class_name):
+        super().__init__()
+        self._class_name = class_name
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._class_name)
+
+    def __getattr__(self, nome):
+        if not nome.startswith("set_"):
+            raise AttributeError(nome)
+        chiave = nome[4:]
+        # padding vuole un Margin, position/size un Vector2D: se arriva il
+        # tipo sbagliato il motore solleva, e qui pure.
+        def imposta(valore):
+            if chiave == "padding" and not isinstance(valore, Margin):
+                raise TypeError("Cannot nativize %s as Margin" % type(valore).__name__)
+            if chiave in ("position", "size") and not isinstance(valore, Vector2D):
+                raise TypeError("Cannot nativize %s as Vector2D" % type(valore).__name__)
+            self._props[chiave] = valore
+
+        return imposta
+
+
+class Widget(FakeObject):
+    def __init__(self, name, class_name):
+        super().__init__()
+        self._name = name
+        self._class_name = class_name
+        self._parent = None
+        self._figli = []
+        self.slot = None
+
+    def get_name(self):
+        return self._name
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._class_name)
+
+    def get_parent(self):
+        return self._parent
+
+    def get_outer(self):
+        return getattr(self, "_outer", None)
+
+    # --- API dei pannelli (nel motore sta su PanelWidget)
+    def add_child(self, widget):
+        if self._class_name not in UMG_PANNELLI:
+            return None
+        widget._parent = self
+        widget.slot = UmgSlot(UMG_PANNELLI[self._class_name])
+        self._figli.append(widget)
+        return widget.slot
+
+    def get_all_children(self):
+        return list(self._figli)
+
+    def remove_child(self, widget):
+        if widget not in self._figli:
+            return False
+        self._figli.remove(widget)
+        widget._parent = None
+        widget.slot = None
+        return True
+
+    def set_editor_property(self, name, value):
+        # Le proprietà di testo sono FText: una stringa nuda viene rifiutata,
+        # esattamente come nel motore, così il fallback su unreal.Text conta.
+        if name in ("Text", "ToolTipText") and not isinstance(value, Text):
+            raise TypeError("Cannot nativize str as Text")
+        super().set_editor_property(name, value)
+
+
+class PanelWidget(Widget):
+    """Nel motore è la base dei contenitori; qui serve solo per l'isinstance
+    che distingue un pannello da un widget foglia."""
+
+
+class WidgetTree(FakeObject):
+    pass
+
+
 # ------------------------------------------- fase 11: authoring del grafo K2
 #
 # Il grafo Blueprint è scriptabile da UE 5.8 via `BlueprintGraphEditor`, che
@@ -430,7 +542,11 @@ class EditorUtilityWidgetBlueprintFactory(FakeObject):
 
 
 class WidgetBlueprint(FakeObject):
-    pass
+    @property
+    def path(self):
+        """`compile_blueprint` legge `.path` su qualunque Blueprint: un Widget
+        Blueprint non deriva da Blueprint nel finto, ma il path ce l'ha."""
+        return self._props.get("_path", "/Game/_Fake/WidgetBlueprint")
 
 
 class EditorUtilityWidgetBlueprint(FakeObject):
@@ -1229,6 +1345,10 @@ _STRUCT_REGISTRY.register("Transform", "/Script/CoreUObject.Transform")
 
 
 def _find_object(outer, name, type=None, follow_redirectors=True):
+    # Fase 12: il WidgetTree è un subobject del Widget Blueprint, e si prende
+    # per nome — è così che i tool UMG aggirano la proprietà protetta.
+    if name == "WidgetTree" and outer is not None and hasattr(outer, "_props"):
+        return outer._props.setdefault("_widget_tree", WidgetTree())
     return _CLASS_REGISTRY.find(name) or _STRUCT_REGISTRY.find(name)
 
 
@@ -1276,6 +1396,7 @@ def build_fake_unreal(tmp_path):
         "selected": [],
         "referencers": {},  # path -> chi lo referenzia, per il test di delete
         "bp_components": {},  # path del Blueprint -> componenti aggiunti (fase 8)
+        "umg_oggetti": [],             # fase 12: (widget, outer)
         "textures_importate": [],      # fase 9
         "render_targets": [],          # fase 9
         "render_target_esportati": [], # fase 9
@@ -1312,6 +1433,7 @@ def build_fake_unreal(tmp_path):
         Vector2D, TextureRenderTarget2D, LandscapeComponent, LandscapeProxy, Landscape,
         LandscapePlaceholder, PCGGraph, PCGGraphFactory, PCGNode, PCGSettings, PCGEdge,
         PCGComponent, PCGVolume, K2Node, K2Pin,
+        Widget, PanelWidget, WidgetTree, Margin, UmgSlot,
     ):
         setattr(module, cls.__name__, cls)
 
@@ -2009,6 +2131,20 @@ def build_fake_unreal(tmp_path):
     module.StructIterator = StructIterator
     module.CollisionChannel = CollisionChannel
 
+    # ---- fase 12: le classi concrete dei widget, risolte per nome da
+    # mcp_resolve_class. I pannelli derivano da PanelWidget, così l'isinstance
+    # che distingue un contenitore da una foglia dice la verità.
+    def _classe_widget(nome, base):
+        def costruisci(self, name=None):
+            base.__init__(self, name or "%s_0" % nome, nome)
+
+        return type(nome, (base,), {"__init__": costruisci, "__unreal_name__": nome})
+
+    for nome_widget in ("CanvasPanel", "VerticalBox", "HorizontalBox", "Overlay", "Border"):
+        setattr(module, nome_widget, _classe_widget(nome_widget, PanelWidget))
+    for nome_widget in ("TextBlock", "Button", "Image", "ProgressBar", "EditableTextBox"):
+        setattr(module, nome_widget, _classe_widget(nome_widget, Widget))
+
     # ---- fase 9: landscape
     module.TextureRenderTargetFormat = types.SimpleNamespace(
         RTF_R8="RTF_R8",
@@ -2057,9 +2193,30 @@ def build_fake_unreal(tmp_path):
 
     # ---- fase 6: gameplay (fisica/navmesh/blackboard/behavior tree)
     def new_object(cls, outer=None, name=None):
+        # Fase 12: i widget vanno registrati con il loro outer, perché è
+        # scorrendo gli oggetti per outer che `_mcp_umg_widgets` ritrova
+        # l'albero — la proprietà `AllWidgets` è protetta anche nel motore.
+        if isinstance(cls, type) and issubclass(cls, Widget):
+            widget = cls(name) if name else cls()
+            widget._outer = outer
+            state["umg_oggetti"].append((widget, outer))
+            return widget
         return cls() if callable(cls) else FakeObject()
 
     module.new_object = new_object
+
+    class ObjectIterator:
+        """Scorre gli oggetti creati con `new_object`, filtrati per classe."""
+
+        def __init__(self, cls=None):
+            self._cls = cls
+
+        def __iter__(self):
+            for oggetto, _outer in list(state["umg_oggetti"]):
+                if self._cls is None or isinstance(oggetto, self._cls):
+                    yield oggetto
+
+    module.ObjectIterator = ObjectIterator
 
     module.CollisionEnabled = types.SimpleNamespace(
         NO_COLLISION="NoCollision",

@@ -20,7 +20,8 @@ async def test_le_istruzioni_arrivano_al_modello():
     assert "Blueprint node graphs ARE scriptable" in istruzioni
     assert "capabilities.blueprint_graph_authoring" in istruzioni
     # I limiti veri rimasti, che l'agente deve conoscere prima di provarci.
-    assert "UMG widget trees" in istruzioni
+    assert "Niagara emitter stacks and EQS remain unscriptable" in istruzioni
+    assert "root widget that already exists" in istruzioni
     assert "landscape cannot be created from Python" in istruzioni
 
 

@@ -2033,17 +2033,14 @@ def mcp_reflect_enum(enum_name):
 
 # ===================================================================== UMG
 #
-# Verificato dal vivo su UE 5.8 il 2026-07-31: creare l'asset Widget
-# Blueprint funziona, `parent_class` accetta anche una classe C++ del
-# progetto (non solo `UserWidget`/`EditorUtilityWidget`). Popolare il
-# `WidgetTree` (aggiungere TextBlock/Button/CanvasPanel, il layout) NO:
-# `get_editor_property("WidgetTree")` sulla CDO della classe generata
-# risponde "protected and cannot be read" — stesso muro dei grafi Blueprint
-# già documentato per `ue_reparent_blueprint`. Il layout va disegnato a mano
-# nel Widget Designer; per la logica, la stessa via C++ già in uso altrove
-# (`ue_cpp_class_create` con proprietà `BindWidget` -> reparent) funziona
-# perché quelle proprietà sono lette dal compilatore Blueprint al momento
-# della compilazione, non scritte da qui a runtime.
+# **Rettifica del 31/07/2026 (fase 12).** La fase 2 aveva concluso che il
+# `WidgetTree` non fosse popolabile perché `get_editor_property("WidgetTree")`
+# risponde "protected and cannot be read". La proprietà è davvero protetta —
+# ma il `WidgetTree` è un *subobject* del Widget Blueprint, e si raggiunge
+# per nome senza passare da lì: `unreal.find_object(wbp, "WidgetTree")`.
+# Da quel momento il layout è authorabile per davvero: vedi la sezione
+# "UMG layout" più sotto. Resta un limite vero — `RootWidget` non è
+# scrivibile, quindi la radice dev'essere già lì.
 
 
 def mcp_create_widget_blueprint(package_path, name, parent_class="UserWidget", editor_utility=False):
@@ -2069,6 +2066,327 @@ def mcp_create_widget_blueprint(package_path, name, parent_class="UserWidget", e
         "created": True,
         "parent_class": parent_class,
         "editor_utility": bool(editor_utility),
+    }
+
+
+# ============================================================== UMG layout
+#
+# Fase 12, verificata dal vivo su UE 5.8 il 2026-07-31. La chiave è la stessa
+# della fase 11 applicata a un oggetto invece che a un grafo: la proprietà
+# `WidgetTree` è protetta, ma l'oggetto che contiene *esiste* ed è un
+# subobject del Widget Blueprint — `unreal.find_object(wbp, "WidgetTree")` lo
+# restituisce senza chiedere permesso a nessuna proprietà.
+#
+# Da lì in poi si usa l'API pubblica dei widget, che è sempre stata esposta e
+# non era mai stata provata su un template di editor: `PanelWidget.add_child`
+# e i suoi `add_child_to_*` sono UFUNCTION vere, e funzionano anche fuori dal
+# gioco. Verificato aggiungendo un TextBlock a un CanvasPanel dentro un
+# Widget Blueprint, con testo, colore e slot impostati, salvando e
+# rileggendo: gerarchia e valori c'erano ancora, e il nome del widget compare
+# nel .uasset.
+#
+# **Il limite che resta è uno solo**: `WidgetTree.RootWidget` è protetta anche
+# in scrittura, e non esiste nessuna UFUNCTION che la imposti (cercata in
+# tutte le classi esposte). Quindi il primo widget di un albero vuoto non si
+# può creare da Python: la radice dev'essere già lì. Un Widget Blueprint
+# creato dal Widget Designer ce l'ha; uno creato da
+# `mcp_create_widget_blueprint` no. La via pratica è duplicare con
+# `ue_duplicate_asset` un Widget Blueprint che una radice ce l'ha già, e
+# svuotarlo con `mcp_umg_remove_widget`.
+#
+# I widget non si indirizzano per path ma per nome (`TitoloMCP`,
+# `CanvasPanel_0`): sono univoci dentro un albero, ed è il nome che si vede
+# nel pannello Hierarchy.
+
+
+def _mcp_umg_albero(widget_blueprint_path):
+    """Il Widget Blueprint e il suo WidgetTree, raggiunto come subobject."""
+    wbp = mcp_asset_lib().load_asset(widget_blueprint_path)
+    if wbp is None:
+        raise ValueError("Widget Blueprint '%s' non trovato." % widget_blueprint_path)
+    if not isinstance(wbp, unreal.WidgetBlueprint):
+        raise ValueError(
+            "'%s' è un %s, non un Widget Blueprint."
+            % (widget_blueprint_path, wbp.get_class().get_name())
+        )
+    albero = unreal.find_object(wbp, "WidgetTree")
+    if albero is None:
+        raise RuntimeError(
+            "Il Widget Blueprint '%s' non ha un WidgetTree raggiungibile."
+            % widget_blueprint_path
+        )
+    return wbp, albero
+
+
+def _mcp_umg_widgets(albero):
+    """Tutti i widget dell'albero.
+
+    `WidgetTree.AllWidgets` è protetta: si arriva agli stessi oggetti
+    scorrendo quelli che hanno l'albero come outer.
+    """
+    trovati = []
+    for oggetto in unreal.ObjectIterator(unreal.Widget):
+        try:
+            if oggetto.get_outer() == albero:
+                trovati.append(oggetto)
+        except Exception:  # noqa: BLE001, S112
+            continue
+    return trovati
+
+
+def _mcp_umg_radice(albero):
+    """La radice dell'albero: l'unico widget senza genitore.
+
+    `RootWidget` è protetta, ma la stessa informazione si ricava da
+    `get_parent()`, che è una UFUNCTION pubblica.
+    """
+    for widget in _mcp_umg_widgets(albero):
+        if widget.get_parent() is None:
+            return widget
+    return None
+
+
+def _mcp_umg_widget(albero, nome):
+    for widget in _mcp_umg_widgets(albero):
+        if str(widget.get_name()) == str(nome):
+            return widget
+    presenti = [str(w.get_name()) for w in _mcp_umg_widgets(albero)]
+    raise ValueError(
+        "Widget '%s' non trovato nell'albero. Presenti: %s"
+        % (nome, ", ".join(presenti) or "nessuno (albero vuoto)")
+    )
+
+
+def _mcp_umg_descrivi(widget, con_slot=True):
+    info = {
+        "name": str(widget.get_name()),
+        "class": str(widget.get_class().get_name()),
+        "children": [],
+    }
+    if con_slot and getattr(widget, "slot", None) is not None:
+        info["slot_class"] = str(widget.slot.get_class().get_name())
+    if isinstance(widget, unreal.PanelWidget):
+        info["children"] = [_mcp_umg_descrivi(c) for c in widget.get_all_children()]
+    return info
+
+
+def mcp_umg_tree_info(widget_blueprint_path):
+    """La gerarchia dei widget di un Widget Blueprint.
+
+    `root` è None su un albero vuoto: in quel caso non si può aggiungere
+    niente, perché `RootWidget` non è scrivibile da Python.
+    """
+    _wbp, albero = _mcp_umg_albero(widget_blueprint_path)
+    radice = _mcp_umg_radice(albero)
+    return {
+        "widget_blueprint": widget_blueprint_path,
+        "root": _mcp_umg_descrivi(radice) if radice is not None else None,
+        "widget_count": len(_mcp_umg_widgets(albero)),
+        "orphans": [
+            str(w.get_name())
+            for w in _mcp_umg_widgets(albero)
+            if w.get_parent() is None and w is not radice
+        ],
+    }
+
+
+def _mcp_umg_salva(wbp, widget_blueprint_path):
+    unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+    mcp_asset_lib().save_asset(widget_blueprint_path)
+
+
+def mcp_umg_add_widget(widget_blueprint_path, widget_class, parent=None, name=None, slot=None):
+    """Crea un widget e lo appende sotto un pannello dell'albero.
+
+    `parent` di default è la radice. Se l'albero è vuoto il tool si ferma
+    spiegando perché: il primo widget non è creabile da Python.
+    """
+    wbp, albero = _mcp_umg_albero(widget_blueprint_path)
+    radice = _mcp_umg_radice(albero)
+    if radice is None:
+        raise RuntimeError(
+            "L'albero di '%s' è vuoto e `WidgetTree.RootWidget` non è scrivibile "
+            "dalla Python API di UE: il primo widget va messo a mano nel Widget "
+            "Designer, oppure duplica con `ue_duplicate_asset` un Widget Blueprint "
+            "che una radice ce l'ha già." % widget_blueprint_path
+        )
+
+    genitore = radice if parent is None else _mcp_umg_widget(albero, parent)
+    if not isinstance(genitore, unreal.PanelWidget):
+        raise ValueError(
+            "'%s' è un %s: solo i PanelWidget (CanvasPanel, VerticalBox, "
+            "HorizontalBox, Overlay, Border…) possono contenere altri widget."
+            % (genitore.get_name(), genitore.get_class().get_name())
+        )
+
+    cls = mcp_resolve_class(widget_class)
+    if name:
+        for esistente in _mcp_umg_widgets(albero):
+            if str(esistente.get_name()) == str(name):
+                raise ValueError(
+                    "Nell'albero c'è già un widget di nome '%s': i nomi sono univoci."
+                    % name
+                )
+
+    with mcp_transaction("MCP: aggiungi %s a %s" % (widget_class, widget_blueprint_path)):
+        widget = (
+            unreal.new_object(cls, outer=albero, name=name)
+            if name
+            else unreal.new_object(cls, outer=albero)
+        )
+        if genitore.add_child(widget) is None:
+            raise RuntimeError(
+                "'%s' non ha accettato il figlio: alcuni pannelli (Border, SizeBox, "
+                "ScaleBox…) ne ammettono uno solo." % genitore.get_name()
+            )
+        if slot:
+            _mcp_umg_applica_slot(widget, slot)
+
+    _mcp_umg_salva(wbp, widget_blueprint_path)
+    return {
+        "widget_blueprint": widget_blueprint_path,
+        "widget": str(widget.get_name()),
+        "class": str(widget.get_class().get_name()),
+        "parent": str(genitore.get_name()),
+        "slot_class": str(widget.slot.get_class().get_name()) if widget.slot else None,
+    }
+
+
+def _mcp_umg_valore_widget(bersaglio, chiave, valore):
+    """Scrive una proprietà, riprovando come `Text` se il tipo lo richiede.
+
+    Le proprietà di testo dei widget sono `FText`, e dal ponte MCP arriva una
+    stringa: senza questo secondo tentativo impostare il testo di un
+    TextBlock fallirebbe con un errore di tipo poco leggibile.
+    """
+    try:
+        bersaglio.set_editor_property(chiave, mcp_coerce_value(valore))
+        return
+    except Exception:
+        if not isinstance(valore, str):
+            raise
+    bersaglio.set_editor_property(chiave, unreal.Text(valore))
+
+
+def mcp_umg_set_widget_property(widget_blueprint_path, widget, properties):
+    """Imposta proprietà su un widget dell'albero (testo, colore, visibilità…)."""
+    wbp, albero = _mcp_umg_albero(widget_blueprint_path)
+    bersaglio = _mcp_umg_widget(albero, widget)
+
+    applicate = {}
+    fallite = {}
+    with mcp_transaction("MCP: proprietà di %s" % widget):
+        for chiave, valore in (properties or {}).items():
+            try:
+                _mcp_umg_valore_widget(bersaglio, chiave, valore)
+                applicate[chiave] = valore
+            except Exception as exc:  # noqa: BLE001
+                fallite[chiave] = "%s: %s" % (type(exc).__name__, exc)
+
+    _mcp_umg_salva(wbp, widget_blueprint_path)
+    return {
+        "widget_blueprint": widget_blueprint_path,
+        "widget": str(bersaglio.get_name()),
+        "applied": applicate,
+        "failed": fallite,
+    }
+
+
+def _mcp_umg_applica_slot(widget, properties):
+    """Scrive sullo slot di un widget.
+
+    `position` e `size` passano dai metodi dedicati dello slot invece che da
+    `set_editor_property`: nei CanvasPanelSlot finiscono dentro `LayoutData`,
+    che è uno struct annidato, e scriverli a mano vorrebbe dire ricostruirlo.
+    """
+    slot = widget.slot
+    if slot is None:
+        raise RuntimeError(
+            "'%s' non ha uno slot: è la radice dell'albero, o non è ancora stato "
+            "aggiunto a un pannello." % widget.get_name()
+        )
+
+    applicate = {}
+    fallite = {}
+    for chiave, valore in (properties or {}).items():
+        metodo = getattr(slot, "set_%s" % str(chiave).lower(), None)
+        try:
+            if metodo is not None:
+                metodo(_mcp_umg_arg_slot(valore))
+            else:
+                slot.set_editor_property(chiave, mcp_coerce_value(valore))
+            applicate[chiave] = valore
+        except Exception as exc:  # noqa: BLE001
+            fallite[chiave] = "%s: %s" % (type(exc).__name__, exc)
+    return applicate, fallite
+
+
+def _mcp_umg_arg_slot(valore):
+    """Il tipo Unreal giusto per un parametro di slot, dedotto dalla forma.
+
+    Gli slot UMG vogliono tipi diversi per cose che dal ponte MCP arrivano
+    tutte come dict: `position`/`size` sono `Vector2D`, `padding` è un
+    `Margin` con quattro lati. Distinguerli dalle chiavi evita di chiedere a
+    chi chiama di sapere quale struct si aspetta ogni singolo slot.
+    """
+    if isinstance(valore, dict):
+        chiavi = {k.lower() for k in valore}
+        if chiavi & {"left", "top", "right", "bottom"}:
+            return unreal.Margin(
+                float(valore.get("left", 0.0)),
+                float(valore.get("top", 0.0)),
+                float(valore.get("right", 0.0)),
+                float(valore.get("bottom", 0.0)),
+            )
+        return unreal.Vector2D(float(valore.get("x", 0.0)), float(valore.get("y", 0.0)))
+    if isinstance(valore, (list, tuple)):
+        if len(valore) == 4:
+            return unreal.Margin(*[float(v) for v in valore])
+        return unreal.Vector2D(float(valore[0]), float(valore[1]))
+    return valore
+
+
+def mcp_umg_set_slot(widget_blueprint_path, widget, properties):
+    """Imposta il layout di un widget dentro il suo pannello.
+
+    Quali chiavi valgono dipende dal pannello: `position`/`size`/`z_order`
+    per un CanvasPanelSlot, `padding`/`size`/`horizontal_alignment` per un
+    VerticalBoxSlot, e così via. `ue_umg_tree_info` riporta `slot_class`.
+    """
+    wbp, albero = _mcp_umg_albero(widget_blueprint_path)
+    bersaglio = _mcp_umg_widget(albero, widget)
+    with mcp_transaction("MCP: slot di %s" % widget):
+        applicate, fallite = _mcp_umg_applica_slot(bersaglio, properties)
+    _mcp_umg_salva(wbp, widget_blueprint_path)
+    return {
+        "widget_blueprint": widget_blueprint_path,
+        "widget": str(bersaglio.get_name()),
+        "slot_class": str(bersaglio.slot.get_class().get_name()),
+        "applied": applicate,
+        "failed": fallite,
+    }
+
+
+def mcp_umg_remove_widget(widget_blueprint_path, widget):
+    """Toglie un widget dall'albero, con tutto quello che contiene."""
+    wbp, albero = _mcp_umg_albero(widget_blueprint_path)
+    bersaglio = _mcp_umg_widget(albero, widget)
+    genitore = bersaglio.get_parent()
+    if genitore is None:
+        raise ValueError(
+            "'%s' è la radice dell'albero: non si può togliere, perché "
+            "`RootWidget` non è scrivibile da Python. Svuotala invece, "
+            "rimuovendo i suoi figli." % widget
+        )
+    nome = str(bersaglio.get_name())
+    with mcp_transaction("MCP: rimuovi %s" % nome):
+        rimosso = bool(genitore.remove_child(bersaglio))
+    _mcp_umg_salva(wbp, widget_blueprint_path)
+    return {
+        "widget_blueprint": widget_blueprint_path,
+        "removed": nome,
+        "was_child_of": str(genitore.get_name()),
+        "ok": rimosso,
     }
 
 

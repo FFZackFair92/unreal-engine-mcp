@@ -45,7 +45,8 @@ con `fake_unreal` + riga in `docs/TOOLS.md` + voce in `CHANGELOG.md`.
    proprietà/funzioni: non esiste nella Python API di UE (verificato dal
    vivo), solo attraversamento di gerarchia classi/struct + valori enum
    nativi.
-2. **UI / UMG** — ✅ fatta il 31/07/2026, ma ridimensionata: `ue_create_widget_blueprint`
+2. **UI / UMG** — ⚠️ **conclusione superata dalla fase 12, vedi sotto.**
+   `ue_create_widget_blueprint`
    crea l'asset (anche Editor Utility Widget), non il layout. Il `WidgetTree`
    è una proprietà protetta nella Python API — stesso muro del punto 3 sotto,
    scoperto verificando dal vivo prima di scrivere codice. Layout a mano nel
@@ -191,7 +192,35 @@ progetto non c'è niente su cui provare l'ultima chiamata.
     UMG, Niagara ed EQS sono stati riverificati nella stessa occasione: lì il
     muro è ancora al suo posto.
 
-## Stato finale (11 fasi su 11, 138 tool)
+12. **UMG, davvero (in parte)** — ✅ fatta il 31/07/2026 riaprendo il fronte
+    chiuso dalla fase 2, con lo stesso movimento della fase 11.
+    `ue_umg_tree_info`, `ue_umg_add_widget`, `ue_umg_set_widget_property`,
+    `ue_umg_set_slot`, `ue_umg_remove_widget`.
+
+    `WidgetTree` è protetta, e la fase 2 lo aveva verificato bene. Ma
+    l'oggetto dietro la proprietà è un *subobject* del Widget Blueprint:
+    `unreal.find_object(wbp, "WidgetTree")` lo restituisce senza passare da
+    nessuna proprietà. Poi il layout si costruisce con l'API pubblica dei
+    widget, che è sempre stata esposta e nessuno aveva provato su un template
+    di editor.
+
+    Verificato dal vivo su UE 5.8: CanvasPanel → VerticalBox → TextBlock +
+    Button, con testo, colore, padding e posizione, salvato e riletto da zero.
+    **Un limite resta**: `RootWidget` non è scrivibile e nessuna UFUNCTION la
+    imposta, quindi il primo widget di un albero vuoto non è creabile da
+    Python — la radice va messa nel Designer o duplicata da un altro asset.
+
+13. **Niagara ed EQS** — ❌ riverificati il 31/07/2026 con lo stesso metodo, e
+    stavolta il muro ha retto. `NiagaraSystem.EmitterHandles` ed
+    `EnvQuery.Options` sono protette; gli oggetti che ci andrebbero dentro si
+    creano davvero (`unreal.new_object` accetta una UClass presa con
+    `find_object("/Script/AIModule.EnvQueryOption")`, anche per classi non
+    esposte come tipo Python), ma non c'è modo di attaccarli e nessuna classe
+    del motore fa quel lavoro. Il trucco del subobject non si applica: lì il
+    contenitore è un array dentro una proprietà, non un oggetto raggiungibile
+    per nome.
+
+## Stato finale (12 fasi su 13, 143 tool)
 
 Le 21 categorie di db-lyon sono coperte, con tre tipi di esito diversi e
 tutti dichiarati:
@@ -199,20 +228,29 @@ tutti dichiarati:
 | Copertura | Categorie |
 |---|---|
 | Piena, verificata dal vivo | Levels/Actors, **Grafo Blueprint** (UE 5.8+), Blueprint (dati), Materiali, Asset, Audio, Editor/viewport/PIE/render, Build/package, Reflection, Animazione (dati), Gameplay (fisica, navmesh, Blackboard, Behavior Tree), GAS, Networking, PCG |
-| Parziale per un limite reale della Python API di UE | UMG, Niagara, EQS — creabili come asset, non authorabili nel grafo/albero |
+| Piena tranne un passaggio | **UMG** — layout authorabile, ma la radice dell'albero dev'essere già lì |
 | Parziale per impossibilità di creazione | Landscape — guidabile ma non creabile da Python |
+| Chiusa, riverificata due volte | Niagara (`EmitterHandles`), EQS (`Options`) |
 
-Quello che resta fuori non è un pezzo di roadmap non fatto: è il muro di
-`WidgetTree`, `EmitterHandles` ed `EnvQuery.Options`, tutte proprietà
-protette, verificato caso per caso e non assunto.
+**Come si è arrivati qui.** Tre fronti dichiarati chiusi sono stati riaperti
+e due sono caduti — grafo Blueprint (fase 11) e UMG (fase 12) — con lo stesso
+movimento: smettere di chiedersi "come leggo questa proprietà protetta?" e
+chiedersi "chi, nel motore, fa questo lavoro?". Le risposte sono state due,
+ed è utile tenerle distinte perché sono due tecniche diverse:
 
-**Ma la fase 11 insegna a diffidare anche di questo elenco.** "La proprietà è
-protetta" descrive un metodo che non funziona, non una capacità che manca:
-per il grafo Blueprint la capacità c'era eccome, esposta da un'altra classe
-che nessuno aveva pensato di cercare. Prima di dichiarare chiuso un fronte
-conviene chiedersi non solo "come leggo questa proprietà?" ma anche "chi, nel
-motore, fa questo lavoro?" — e cercare *quello* fra le classi esposte. UMG,
-Niagara ed EQS meritano lo stesso trattamento a ogni major del motore.
+1. **Un'altra classe fa il lavoro.** `BlueprintGraphEditor` modifica un grafo
+   senza toccare `EdGraph.Nodes`. Si trova cercando fra le classi esposte i
+   *verbi* che servono (`add_..._node`, `connect`), non i sostantivi.
+2. **L'oggetto dietro la proprietà è raggiungibile per altra via.** Il
+   `WidgetTree` è un subobject del Widget Blueprint e si prende con
+   `find_object(wbp, "WidgetTree")`. Vale ogni volta che la proprietà
+   protetta punta a un `UObject` con un nome, e non a un array di valori.
+
+Ed è per questo che Niagara ed EQS sono ancora chiusi: lì la proprietà
+protetta *è* il contenitore (un `TArray`), non un oggetto con un nome, e
+nessuna classe del motore espone il verbo che servirebbe. Non è una
+differenza di fortuna, è una differenza di forma — ed è la cosa da guardare
+per prima la prossima volta che esce una major.
 
 ## Nota architetturale: perché il node graph blueprint è stato evitato finora
 

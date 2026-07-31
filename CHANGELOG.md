@@ -6,6 +6,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-31
+
+**Il layout UMG si costruisce da Python.** 138 tool → 143. Ed è la seconda
+conclusione sbagliata corretta in due release, con lo stesso movimento: la
+proprietà protetta non era la porta, era solo *una* porta.
+
+`WidgetTree` è protetta — la fase 2 lo aveva verificato bene. Ma l'oggetto
+che c'è dietro è un *subobject* del Widget Blueprint, e si prende per nome
+con `unreal.find_object(wbp, "WidgetTree")` senza chiedere permesso a
+nessuna proprietà. Da lì il layout si costruisce con l'API pubblica dei
+widget — `PanelWidget.add_child` e i suoi fratelli sono UFUNCTION vere, e
+nessuno le aveva mai provate su un template di editor invece che su un widget
+a runtime.
+
+### Added
+
+- `ue_umg_tree_info` — la gerarchia dei widget: nomi, classi, figli, classe
+  dello slot. `root: null` segnala l'albero vuoto, l'unico caso in cui non si
+  può fare niente.
+- `ue_umg_add_widget` — crea un widget e lo mette sotto un pannello, con lo
+  slot applicato subito se serve.
+- `ue_umg_set_widget_property` — testo, colore, visibilità. Le stringhe
+  diventano `FText` dove il motore lo pretende, che è la ragione per cui
+  impostare un titolo falliva sempre nei tentativi ingenui.
+- `ue_umg_set_slot` — il layout dentro il pannello.
+- `ue_umg_remove_widget` — toglie un widget e tutto quello che contiene.
+
+Verificato dal vivo su UE 5.8: CanvasPanel → VerticalBox → TextBlock +
+Button, con testo, colore, padding e posizione, salvato e riletto da zero —
+gerarchia e valori intatti, nomi dei widget presenti nel `.uasset`.
+
+**Il limite che resta è uno e dichiarato**: `WidgetTree.RootWidget` è
+protetta anche in scrittura, e nessuna UFUNCTION la imposta — cercata in
+tutte le classi esposte, compresi factory e settings del Widget Designer.
+Quindi il *primo* widget di un albero vuoto non è creabile da Python: la
+radice dev'esserci già. Un Widget Blueprint fatto nel Designer ce l'ha, uno
+fatto da `ue_create_widget_blueprint` no; la via pratica è
+`ue_duplicate_asset` di uno che ce l'ha, svuotato con `ue_umg_remove_widget`.
+
+**Niagara ed EQS invece restano chiusi**, e stavolta con una ricerca fatta
+per bene: `NiagaraSystem.EmitterHandles` ed `EnvQuery.Options` sono protette,
+gli oggetti che ci andrebbero dentro si creano (`new_object` sulla UClass
+funziona anche per classi non esposte come tipo Python, presa con
+`find_object("/Script/AIModule.EnvQueryOption")`), ma non esiste nessun modo
+di attaccarli, e nessuna classe del motore fa quel lavoro al posto nostro. Il
+trucco del subobject non si applica: lì l'array è il contenitore, non un
+oggetto raggiungibile per nome.
+
+### Fixed
+
+- Le istruzioni del server dicevano ancora che i grafi Blueprint non sono
+  scriptabili sui motori dove invece lo sono; ora distinguono i tre casi
+  (scriptabile, scriptabile con una radice preesistente, non scriptabile) e
+  `test_server_surface` verifica tutti e tre. Un'istruzione obsoleta fa
+  rinunciare l'agente a un tool che funziona.
+
 ## [0.8.0] — 2026-07-31
 
 **Il muro più grosso della roadmap è caduto: i grafi Blueprint sono

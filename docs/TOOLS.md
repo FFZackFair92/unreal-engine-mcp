@@ -1,6 +1,6 @@
 # Tool reference
 
-138 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+143 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -198,17 +198,66 @@ native enum values.
 
 ## UMG (editor)
 
-Same wall as Blueprint node graphs: creating the Widget Blueprint *asset*
-works, but its `WidgetTree` (the actual layout — TextBlock, Button,
-CanvasPanel, positioning) is a protected property in UE's Python API and
-can't be read or written generically. Design the layout by hand in the
-Widget Designer; for logic, the same C++ workaround used elsewhere applies —
-give the widget a C++ parent class with `BindWidget` properties
-(`ue_cpp_class_create` → `ue_reparent_blueprint`).
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_create_widget_blueprint` | `package_path`, `name`, `parent_class`, `editor_utility` | Empty Widget Blueprint asset (or Editor Utility Widget with `editor_utility=True`). `parent_class` accepts a project C++ class, for the BindWidget path. **The tree it creates has no root** — see below. |
+
+For logic, the C++ workaround still applies: give the widget a C++ parent
+class with `BindWidget` properties (`ue_cpp_class_create` →
+`ue_reparent_blueprint`), where the property names match the widget names.
+
+## UMG layout (editor)
+
+This section corrects an earlier claim too. `WidgetTree` *is* a protected
+property — but the object behind it is a subobject of the Widget Blueprint,
+and you get it by name: `find_object(wbp, "WidgetTree")`. From there the
+layout is authored with the widgets' own public API (`PanelWidget.add_child`
+and friends are real UFUNCTIONs, and they work on editor templates, which
+nobody had tried). Verified live on UE 5.8: CanvasPanel → VerticalBox →
+TextBlock + Button, with text, colour, padding and position, saved and
+re-read from scratch — hierarchy and values intact, widget names present in
+the `.uasset`.
+
+**One limit is real and remains.** `WidgetTree.RootWidget` is protected for
+writing too, and no UFUNCTION anywhere sets it (searched across every exposed
+class). So the *first* widget of an empty tree cannot be created from Python.
+A Widget Blueprint made in the Widget Designer has a root; one made by
+`ue_create_widget_blueprint` does not. The practical route is
+`ue_duplicate_asset` on a Widget Blueprint that already has a root, then
+emptying it with `ue_umg_remove_widget`.
+
+Widgets are addressed by name (`Titolo`, `CanvasPanel_0`) — unique within a
+tree, and the same names shown in the Hierarchy panel.
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `ue_create_widget_blueprint` | `package_path`, `name`, `parent_class`, `editor_utility` | Empty Widget Blueprint asset (or Editor Utility Widget with `editor_utility=True`). `parent_class` accepts a project C++ class, for the BindWidget path. |
+| `ue_umg_tree_info` | `widget_blueprint_path` | The widget hierarchy: names, classes, children, slot class. `root: null` means an empty tree. |
+| `ue_umg_add_widget` | `widget_blueprint_path`, `widget_class`, `parent?`, `name?`, `slot?` | Creates a widget and parents it under a panel (the root by default). |
+| `ue_umg_set_widget_property` | `widget_blueprint_path`, `widget`, `properties` | Text, colour, visibility, brush… Strings are converted to `FText` where the property needs one. Returns `applied` and `failed` separately. |
+| `ue_umg_set_slot` | `widget_blueprint_path`, `widget`, `properties` | Layout inside the parent panel. |
+| `ue_umg_remove_widget` | `widget_blueprint_path`, `widget` | Removes a widget and everything under it. |
+
+**Slot keys depend on the parent panel**, and `ue_umg_tree_info` reports
+`slot_class` so you know which you're dealing with:
+
+- `CanvasPanelSlot` — `position` `[x, y]`, `size` `[x, y]`, `z_order`,
+  `alignment`, `auto_size`.
+- `VerticalBoxSlot` / `HorizontalBoxSlot` — `padding`, `horizontal_alignment`,
+  `vertical_alignment`.
+
+`padding` and `position` both arrive as lists over MCP but the engine wants
+two different structs: a 2-element list becomes a `Vector2D`, a 4-element one
+(or a dict with `left`/`top`/`right`/`bottom`) becomes a `Margin`.
+
+```
+ue_duplicate_asset("/Engine/Sequencer/DefaultBurnIn", "/Game/UI/WBP_Menu")
+ue_umg_tree_info("/Game/UI/WBP_Menu")            # find the root, empty it
+ue_umg_add_widget("/Game/UI/WBP_Menu", "VerticalBox", name="Column",
+                  slot={"position": [80, 80], "size": [500, 300]})
+ue_umg_add_widget("/Game/UI/WBP_Menu", "TextBlock", parent="Column", name="Title")
+ue_umg_set_widget_property("/Game/UI/WBP_Menu", "Title", {"Text": "Main menu"})
+ue_umg_set_slot("/Game/UI/WBP_Menu", "Title", {"padding": [8, 8, 8, 12]})
+```
 
 ## Blueprint graph (editor)
 
