@@ -6,6 +6,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-31
+
+**Il muro più grosso della roadmap è caduto: i grafi Blueprint sono
+scriptabili.** 127 tool → 138.
+
+La fase 3 aveva concluso che non lo fossero, e quella conclusione era
+sbagliata — non nei fatti che riportava, ma in quello che ne deduceva.
+`EdGraph.Nodes` è davvero una proprietà protetta, e lo è tutt'ora; l'errore
+era assumere che passare da lì fosse l'unica via. UE 5.8 espone
+`unreal.BlueprintGraphEditor`, una classe che manipola il grafo dall'esterno
+come fa l'editor stesso, senza mai toccare `Nodes`. Non l'avevo trovata
+perché stavo cercando come *leggere una proprietà*, non chi *modifica un
+grafo*.
+
+### Added
+
+- `ue_bp_graph_info` — nodi, pin, connessioni ed errori di compilazione di un
+  grafo. È il punto di partenza: restituisce i nomi oggetto dei nodi, che
+  sono la chiave usata da tutti gli altri tool.
+- `ue_bp_add_call_function`, `ue_bp_add_branch`, `ue_bp_add_custom_event`,
+  `ue_bp_add_variable_node` — i nodi che servono davvero, con i pin
+  restituiti al momento della creazione.
+- `ue_bp_add_node_by_name` + `ue_bp_list_palette` — un nodo qualunque della
+  palette, e il modo di trovarne il nome esatto.
+- `ue_bp_connect`, `ue_bp_break_pin`, `ue_bp_set_pin_value`,
+  `ue_bp_remove_node` — fili e letterali.
+- `ue_status` riporta `capabilities.blueprint_graph_authoring`: sui motori
+  senza questa API i tool falliscono spiegando che la via è la classe C++
+  padre, invece di un `AttributeError`.
+
+Verificato dal vivo su UE 5.8: costruito BeginPlay → PrintString → Branch con
+una variabile booleana che alimenta `Condition`, Blueprint compilato
+`BS_UP_TO_DATE` senza errori né warning, salvato e riletto da zero con le
+connessioni al loro posto (`PrintString` e `InString` presenti anche nel
+`.uasset`).
+
+**Due trappole trovate dal vivo, entrambe gestite dai tool.** La palette è
+localizzata: su un editor italiano il Branch è
+`Utilità|ControlloDiFlusso|Ramo` e il nome inglese non risolve niente — per
+questo i tool tipizzati sono la via principale e `ue_bp_list_palette` esiste.
+E `set_pin_value` di Unreal **non valida**: scrivere `"non_un_bool"` su un
+pin booleano viene accettato e memorizzato così com'è, quindi
+`ue_bp_set_pin_value` rilegge sempre il pin e restituisce il valore vero.
+
+Restano non scriptabili UMG (`WidgetTree`), gli emitter Niagara
+(`EmitterHandles`) ed EQS (`Options`): quelli sono stati riverificati e il
+muro è ancora lì. La morale della fase, scritta anche in
+`docs/PARITY_ROADMAP.md`: "la proprietà è protetta" descrive un metodo che non
+funziona, non una capacità che manca — vale la pena cercare chi fa quel
+lavoro da un'altra parte prima di dichiarare chiuso un fronte.
+
 ## [0.7.0] — 2026-07-31
 
 Le 10 fasi della roadmap di parità con

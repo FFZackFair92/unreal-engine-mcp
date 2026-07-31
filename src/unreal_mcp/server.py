@@ -42,10 +42,14 @@ mcp = FastMCP(
         "Asset paths follow the Unreal convention (/Game/...); positions are in centimetres "
         "(1 unit = 1 cm) with Z up. Compiling C++ needs the editor closed (ue_build_start), "
         "unless the change only touches function bodies (ue_live_compile). "
-        "Blueprint node graphs cannot be scripted: put logic in a C++ parent class "
-        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). Same wall for UMG "
-        "widget trees, Niagara emitter stacks and EQS. Material graphs, Behavior Trees "
-        "and PCG graphs, on the other hand, are fully scriptable "
+        "Blueprint node graphs ARE scriptable on UE 5.8+ (ue_bp_add_call_function, "
+        "ue_bp_connect, ue_bp_set_pin_value, ue_bp_graph_info; check "
+        "ue_status capabilities.blueprint_graph_authoring first) — nodes are addressed "
+        "by object name, and event nodes by the alias event:ReceiveBeginPlay. On older "
+        "engines, put logic in a C++ parent class instead "
+        "(ue_cpp_class_create -> build -> ue_reparent_blueprint). UMG widget trees, "
+        "Niagara emitter stacks and EQS remain unscriptable. Material graphs, Behavior "
+        "Trees and PCG graphs are fully scriptable "
         "(ue_create_material, ue_bt_add_node, ue_pcg_add_node/ue_pcg_connect). "
         "A landscape cannot be created from Python — it has to exist already "
         "(Landscape Mode in the editor); ue_landscape_* then drives it. "
@@ -1747,21 +1751,10 @@ async def ue_create_widget_blueprint(
 
 # ============================================================ blueprint graph
 #
-# Copertura parziale, verificata dal vivo: si possono aggiungere nodi evento
-# per eventi ereditati overridabili e grafi funzione vuoti, e leggere i pin
-# di un nodo di cui si ha il riferimento. NON si possono elencare i nodi di
-# un grafo qualunque né creare nodi arbitrari (Print String, Branch, chiamate
-# a funzione libere...): la proprietà `Nodes` di `EdGraph` è protetta nella
-# Python API di UE, stesso limite del `WidgetTree` in UMG. Un tool per
-# collegare due pin (`try_create_connection`) esiste ed è stato verificato
-# funzionante, ma è stato scartato: gli unici nodi raggiungibili da qui sono
-# nodi evento (`K2Node_Event`), e un nodo evento ha *solo* pin di output —
-# verificato su un evento con 8 parametri (ReceiveHit), zero input. Senza un
-# nodo con almeno un pin di input non c'è nessuna connessione valida da fare,
-# quindi il tool sarebbe stato inutile nella pratica, non solo limitato. Per
-# logica vera resta la via C++ (ue_cpp_class_create -> ue_reparent_blueprint);
-# questi tool predispongono l'aggancio (l'evento esiste, il suo grafo pure),
-# non scrivono la logica.
+# Tre scorciatoie per compiti specifici: elencare i grafi, elencare gli
+# eventi, aggiungere un override di evento o un grafo funzione. L'authoring
+# vero dei nodi sta nella sezione "blueprint graph authoring" più sotto —
+# quella che la fase 3 aveva dichiarato impossibile e la fase 11 ha smentito.
 
 
 @mcp.tool()
@@ -1823,6 +1816,226 @@ async def ue_bp_add_function_graph(blueprint_path: str, func_name: str) -> dict:
     """
     return await run(
         f"result = mcp_bp_add_function_graph({lit(blueprint_path)}, {lit(func_name)})"
+    )
+
+
+# ================================================== blueprint graph authoring
+#
+# **UE 5.8+.** `ue_status` lo riporta in `capabilities.blueprint_graph_authoring`;
+# sui motori che non ce l'hanno questi tool falliscono con un messaggio
+# esplicito, e la via resta la classe C++ padre.
+#
+# Un nodo si indirizza col suo *nome oggetto* (`K2Node_CallFunction_0`), che
+# ogni tool restituisce quando crea il nodo. I *titoli* invece seguono la
+# lingua dell'editor ("Ramo" per Branch) e non vanno usati come chiave. Per i
+# nodi evento, che esistono già nel grafo, c'è l'alias `event:<NomeMembro>`
+# (es. `event:ReceiveBeginPlay`).
+#
+# Flusso tipico: `ue_bp_add_call_function` -> `ue_bp_connect` dal pin `then`
+# dell'evento al pin `execute` del nodo -> `ue_bp_set_pin_value` per i
+# letterali -> `ue_bp_graph_info` per rileggere e controllare `errors`.
+
+
+@mcp.tool()
+async def ue_bp_graph_info(blueprint_path: str, graph_name: str = "EventGraph") -> dict:
+    """Nodi, pin, connessioni ed errori di compilazione di un grafo Blueprint.
+
+    È il punto di partenza: dà i nomi oggetto dei nodi da usare in tutti gli
+    altri tool, e `errors`/`warnings` dicono se il grafo compila.
+
+    Args:
+        blueprint_path: es. "/Game/MyGame/BP_Player".
+        graph_name: nome oggetto del grafo ("EventGraph",
+            "UserConstructionScript", o il nome di una funzione), non il
+            titolo tradotto. `ue_bp_list_graphs` li elenca.
+    """
+    return await run(f"result = mcp_bp_graph_info({lit(blueprint_path)}, {lit(graph_name)})")
+
+
+@mcp.tool()
+async def ue_bp_add_call_function(
+    blueprint_path: str,
+    function_path: str,
+    graph_name: str = "EventGraph",
+    position: dict | list | None = None,
+) -> dict:
+    """Aggiunge un nodo di chiamata a funzione e restituisce i suoi pin.
+
+    Args:
+        blueprint_path: Blueprint da modificare.
+        function_path: "/Script/<Modulo>.<Classe>:<Funzione>", per esempio
+            "/Script/Engine.KismetSystemLibrary:PrintString" o
+            "/Script/Engine.GameplayStatics:GetPlayerPawn".
+        graph_name: grafo di destinazione.
+        position: {"x": .., "y": ..} o [x, y], solo estetica.
+    """
+    return await run(
+        "result = mcp_bp_add_call_function("
+        f"{lit(blueprint_path)}, {lit(function_path)}, {lit(graph_name)}, {lit(position)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_add_branch(
+    blueprint_path: str, graph_name: str = "EventGraph", position: dict | list | None = None
+) -> dict:
+    """Aggiunge un nodo Branch (if/then/else): pin `Condition` in ingresso,
+    `then` e `else` in uscita."""
+    return await run(
+        f"result = mcp_bp_add_branch({lit(blueprint_path)}, {lit(graph_name)}, {lit(position)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_add_custom_event(
+    blueprint_path: str,
+    event_name: str,
+    graph_name: str = "EventGraph",
+    position: dict | list | None = None,
+) -> dict:
+    """Aggiunge un Custom Event. Solo nei grafi evento: una funzione non può
+    contenerne."""
+    return await run(
+        "result = mcp_bp_add_custom_event("
+        f"{lit(blueprint_path)}, {lit(event_name)}, {lit(graph_name)}, {lit(position)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_add_variable_node(
+    blueprint_path: str,
+    variable_name: str,
+    mode: str = "get",
+    graph_name: str = "EventGraph",
+    position: dict | list | None = None,
+    class_path: str = "",
+) -> dict:
+    """Aggiunge un nodo Get o Set per una variabile membro.
+
+    La variabile dev'essere già stata creata con `ue_add_variable`.
+
+    Args:
+        blueprint_path: Blueprint da modificare.
+        variable_name: nome della variabile.
+        mode: "get" o "set".
+        graph_name: grafo di destinazione.
+        position: {"x": .., "y": ..} o [x, y].
+        class_path: per leggere una variabile di un'altra classe; vuoto = questo Blueprint.
+    """
+    return await run(
+        "result = mcp_bp_add_variable_node("
+        f"{lit(blueprint_path)}, {lit(variable_name)}, {lit(mode)}, {lit(graph_name)}, "
+        f"{lit(position)}, {lit(class_path)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_add_node_by_name(
+    blueprint_path: str,
+    node_name: str,
+    graph_name: str = "EventGraph",
+    position: dict | list | None = None,
+) -> dict:
+    """Aggiunge un nodo qualunque dalla palette, per "Categoria|Nome".
+
+    Ultima spiaggia per i nodi che non hanno un tool dedicato. **I nomi sono
+    localizzati come l'editor**: su un editor italiano il Branch è
+    "Utilità|ControlloDiFlusso|Ramo", non "Utilities|FlowControl|Branch".
+    Cerca la stringa esatta con `ue_bp_list_palette` prima di chiamare questo,
+    o usa i tool tipizzati che non hanno il problema.
+    """
+    return await run(
+        "result = mcp_bp_add_node_by_name("
+        f"{lit(blueprint_path)}, {lit(node_name)}, {lit(graph_name)}, {lit(position)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_list_palette(
+    blueprint_path: str, graph_name: str = "EventGraph", contains: str | None = None, limit: int = 60
+) -> dict:
+    """Cerca fra i nodi aggiungibili a un grafo, filtrando per sottostringa.
+
+    La palette completa ha migliaia di voci e segue la lingua dell'editor:
+    filtrare è l'unico modo pratico di trovare il nome esatto da passare a
+    `ue_bp_add_node_by_name`.
+
+    Args:
+        blueprint_path: Blueprint di riferimento.
+        graph_name: grafo di cui si vuole la palette.
+        contains: sottostringa da cercare, senza distinzione di maiuscole.
+        limit: quante corrispondenze restituire.
+    """
+    return await run(
+        "result = mcp_bp_list_palette("
+        f"{lit(blueprint_path)}, {lit(graph_name)}, {lit(contains)}, {int(limit)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_connect(
+    blueprint_path: str,
+    from_node: str,
+    from_pin: str,
+    to_node: str,
+    to_pin: str,
+    graph_name: str = "EventGraph",
+) -> dict:
+    """Collega un pin di uscita di un nodo a un pin di ingresso di un altro.
+
+    Args:
+        blueprint_path: Blueprint da modificare.
+        from_node: nome oggetto del nodo di partenza, o `event:<NomeMembro>`
+            (es. "event:ReceiveBeginPlay") per un nodo evento.
+        from_pin: pin di uscita, es. "then" per il filo di esecuzione.
+        to_node: nome oggetto del nodo di arrivo.
+        to_pin: pin di ingresso, es. "execute".
+        graph_name: grafo su cui lavorare.
+
+    Se i tipi non sono compatibili il tool lo dice, riportando i due tipi
+    invece di fallire in silenzio.
+    """
+    return await run(
+        "result = mcp_bp_connect("
+        f"{lit(blueprint_path)}, {lit(from_node)}, {lit(from_pin)}, {lit(to_node)}, "
+        f"{lit(to_pin)}, {lit(graph_name)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_break_pin(
+    blueprint_path: str, node: str, pin: str, graph_name: str = "EventGraph"
+) -> dict:
+    """Stacca tutti i collegamenti di un pin, e riporta quanti erano."""
+    return await run(
+        f"result = mcp_bp_break_pin({lit(blueprint_path)}, {lit(node)}, {lit(pin)}, {lit(graph_name)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_set_pin_value(
+    blueprint_path: str, node: str, pin: str, value: object, graph_name: str = "EventGraph"
+) -> dict:
+    """Scrive il valore letterale di un pin di ingresso non collegato.
+
+    **Unreal non valida il valore**: verificato dal vivo che scrivere
+    "non_un_bool" su un pin booleano viene accettato e memorizzato così com'è.
+    Per questo il tool rilegge sempre il pin dopo la scrittura e restituisce
+    il valore vero — controllalo, invece di fidarti del successo.
+    """
+    return await run(
+        "result = mcp_bp_set_pin_value("
+        f"{lit(blueprint_path)}, {lit(node)}, {lit(pin)}, {lit(value)}, {lit(graph_name)})"
+    )
+
+
+@mcp.tool()
+async def ue_bp_remove_node(
+    blueprint_path: str, node: str, graph_name: str = "EventGraph"
+) -> dict:
+    """Cancella un nodo dal grafo, con tutti i suoi collegamenti."""
+    return await run(
+        f"result = mcp_bp_remove_node({lit(blueprint_path)}, {lit(node)}, {lit(graph_name)})"
     )
 
 

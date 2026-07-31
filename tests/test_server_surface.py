@@ -12,9 +12,16 @@ async def test_le_istruzioni_arrivano_al_modello():
     istruzioni = mcp_server.mcp.instructions or ""
 
     assert "Unreal Engine 5" in istruzioni
-    # I due limiti che l'agente deve conoscere prima di provarci.
+    # La via C++, che resta l'unica sui motori precedenti a 5.8.
     assert "ue_cpp_class_create" in istruzioni
-    assert "Blueprint node graphs cannot be scripted" in istruzioni
+    # Fase 11: le istruzioni dicevano "Blueprint node graphs cannot be
+    # scripted", ed era diventato falso su 5.8. Un'istruzione obsoleta è
+    # peggio di nessuna: l'agente rinuncia a un tool che funziona.
+    assert "Blueprint node graphs ARE scriptable" in istruzioni
+    assert "capabilities.blueprint_graph_authoring" in istruzioni
+    # I limiti veri rimasti, che l'agente deve conoscere prima di provarci.
+    assert "UMG widget trees" in istruzioni
+    assert "landscape cannot be created from Python" in istruzioni
 
 
 async def test_il_nome_del_server_e_esplicito():

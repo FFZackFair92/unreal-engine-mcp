@@ -1,6 +1,6 @@
 # Tool reference
 
-127 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+138 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -212,25 +212,77 @@ give the widget a C++ parent class with `BindWidget` properties
 
 ## Blueprint graph (editor)
 
-Partial, verified coverage: you can add event nodes for inherited overridable
-events and empty function graphs, and read the pins of a node you already
-have a reference to. You *cannot* list the nodes of an arbitrary graph or
-create arbitrary nodes (Print String, Branch, free function calls...) — `EdGraph`'s
-`Nodes` property is protected in UE's Python API, same wall as UMG's
-`WidgetTree`. A pin-connection primitive exists and was confirmed working,
-but isn't exposed as a tool: the only nodes reachable here are event nodes,
-and an event node has *only* output pins (checked on an 8-parameter event,
-`ReceiveHit`) — with no node exposing an input pin, there is no valid
-connection to make. Real logic still goes through the C++ path
-(`ue_cpp_class_create` → `ue_reparent_blueprint`); these tools set up the
-hook (the event exists, its graph too), not the logic.
+Three shortcuts for specific jobs. Authoring the nodes themselves lives in
+[the next section](#blueprint-graph-authoring-editor).
 
 | Tool | Parameters | What it does |
 |---|---|---|
 | `ue_bp_list_graphs` | `blueprint_path` | Names of a Blueprint's graphs (EventGraph, UserConstructionScript, functions...). |
 | `ue_bp_list_events` | `blueprint_path` | Events visible on a Blueprint (custom, inherited overridable, interface), each with `is_implemented`. |
 | `ue_bp_add_event_override` | `blueprint_path`, `event_name`, `x`, `y` | Adds (or finds) the node for an inherited overridable event; returns its path and pins. |
-| `ue_bp_add_function_graph` | `blueprint_path`, `func_name` | Empty function graph with default Entry/Return nodes — internals not reachable from Python; body written by hand in the Blueprint Editor. |
+| `ue_bp_add_function_graph` | `blueprint_path`, `func_name` | Empty function graph with default Entry/Return nodes. |
+
+## Blueprint graph authoring (editor)
+
+**UE 5.8+.** `ue_status` reports it as `capabilities.blueprint_graph_authoring`;
+on engines without it these tools fail with an explanation, and the answer is
+still a C++ parent class.
+
+This section corrects an earlier claim in this file. The wall was real —
+`EdGraph.Nodes` is a protected property, and still is — but the conclusion
+drawn from it was wrong: you never need to touch `Nodes`, because
+`unreal.BlueprintGraphEditor` manipulates the graph from the outside, the way
+the editor itself does. Verified live on UE 5.8: BeginPlay → PrintString →
+Branch with a bool variable driving `Condition`, exec wires connected, string
+literal written on `InString`, Blueprint compiling `BS_UP_TO_DATE` with no
+errors or warnings, saved and re-read from scratch with the connections still
+in place.
+
+A node is addressed by its **object name** (`K2Node_CallFunction_0`), which
+every tool returns when it creates one. Node *titles* follow the editor's
+language ("Ramo" for Branch) and must not be used as keys. Event nodes, which
+already exist in the graph, have the alias `event:<MemberName>` — e.g.
+`event:ReceiveBeginPlay`.
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_bp_graph_info` | `blueprint_path`, `graph_name?` | Nodes, pins, connections and compile errors. The starting point: it gives you the object names everything else needs. |
+| `ue_bp_add_call_function` | `blueprint_path`, `function_path`, `graph_name?`, `position?` | Function call node. `function_path` is `/Script/<Module>.<Class>:<Function>`, e.g. `/Script/Engine.KismetSystemLibrary:PrintString`. |
+| `ue_bp_add_branch` | `blueprint_path`, `graph_name?`, `position?` | Branch node — `Condition` in, `then`/`else` out. |
+| `ue_bp_add_custom_event` | `blueprint_path`, `event_name`, `graph_name?`, `position?` | Custom Event. Event graphs only; a function can't hold one. |
+| `ue_bp_add_variable_node` | `blueprint_path`, `variable_name`, `mode`, `graph_name?`, `position?`, `class_path?` | Get or Set node for a member variable (create it first with `ue_add_variable`). |
+| `ue_bp_add_node_by_name` | `blueprint_path`, `node_name`, `graph_name?`, `position?` | Any palette node by `Category\|Name`. Last resort — see the localisation trap below. |
+| `ue_bp_list_palette` | `blueprint_path`, `graph_name?`, `contains?`, `limit?` | Searches the addable-node palette by substring. |
+| `ue_bp_connect` | `blueprint_path`, `from_node`, `from_pin`, `to_node`, `to_pin`, `graph_name?` | Wires an output pin to an input pin. Incompatible types are reported with both type names. |
+| `ue_bp_break_pin` | `blueprint_path`, `node`, `pin`, `graph_name?` | Breaks every link on a pin, and says how many there were. |
+| `ue_bp_set_pin_value` | `blueprint_path`, `node`, `pin`, `value`, `graph_name?` | Literal value of an unconnected input pin. |
+| `ue_bp_remove_node` | `blueprint_path`, `node`, `graph_name?` | Deletes a node and its links. |
+
+**Two traps, both found live.**
+
+*The palette is localised.* On an Italian editor, Branch is
+`Utilità|ControlloDiFlusso|Ramo` — passing `Utilities|FlowControl|Branch`
+returns nothing. That's why the typed tools (`ue_bp_add_branch`,
+`ue_bp_add_call_function`, `ue_bp_add_variable_node`) are the main road and
+`ue_bp_add_node_by_name` is the escape hatch; when you do need it, find the
+exact string with `ue_bp_list_palette` first.
+
+*Unreal does not validate pin values.* Writing `"non_un_bool"` onto a boolean
+pin is accepted and stored verbatim. `ue_bp_set_pin_value` therefore always
+reads the pin back and returns what's actually there — check that, rather than
+trusting the call succeeded.
+
+A worked example, from nothing to a working graph:
+
+```
+ue_create_blueprint("/Game/MyGame", "BP_Door", "Actor")
+ue_add_variable("/Game/MyGame/BP_Door", "IsOpen", "bool")
+n = ue_bp_add_call_function("/Game/MyGame/BP_Door",
+                            "/Script/Engine.KismetSystemLibrary:PrintString")
+ue_bp_connect("/Game/MyGame/BP_Door", "event:ReceiveBeginPlay", "then", n.node, "execute")
+ue_bp_set_pin_value("/Game/MyGame/BP_Door", n.node, "InString", "Door ready")
+ue_bp_graph_info("/Game/MyGame/BP_Door")     # check errors == []
+```
 
 ## Animation (editor)
 

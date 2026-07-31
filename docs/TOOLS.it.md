@@ -1,6 +1,6 @@
 # Riferimento dei tool
 
-127 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
+138 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
 
 **Livello locale** — gira come processo sulla tua macchina. Trova i motori, crea
 progetti, apre e chiude l'editor, compila il C++, produce il pacchetto, scarica
@@ -181,26 +181,78 @@ dare al widget una classe C++ parent con proprietà `BindWidget`
 
 ## Grafo Blueprint (editor)
 
-Copertura parziale, verificata dal vivo: si possono aggiungere nodi evento
-per eventi ereditati overridabili e grafi funzione vuoti, e leggere i pin di
-un nodo di cui si ha già il riferimento. NON si possono elencare i nodi di un
-grafo qualunque né creare nodi arbitrari (Print String, Branch, chiamate a
-funzione libere...): la proprietà `Nodes` di `EdGraph` è protetta nella
-Python API di UE, stesso muro del `WidgetTree` in UMG. Un primitivo per
-collegare due pin esiste ed è stato verificato funzionante, ma non è esposto
-come tool: gli unici nodi raggiungibili da qui sono nodi evento, e un nodo
-evento ha *solo* pin di output (verificato su un evento con 8 parametri,
-`ReceiveHit`) — senza un nodo con un pin di input non c'è nessuna
-connessione valida da fare. Per logica vera resta la via C++
-(`ue_cpp_class_create` → `ue_reparent_blueprint`); questi tool predispongono
-l'aggancio (l'evento esiste, il suo grafo pure), non scrivono la logica.
+Tre scorciatoie per compiti specifici. L'authoring dei nodi sta nella
+[sezione successiva](#authoring-del-grafo-blueprint-editor).
 
 | Tool | Parametri | Cosa fa |
 |---|---|---|
 | `ue_bp_list_graphs` | `blueprint_path` | Nomi dei grafi di un Blueprint (EventGraph, UserConstructionScript, funzioni...). |
 | `ue_bp_list_events` | `blueprint_path` | Eventi visibili su un Blueprint (custom, ereditati overridabili, di interfaccia), ciascuno con `is_implemented`. |
 | `ue_bp_add_event_override` | `blueprint_path`, `event_name`, `x`, `y` | Aggiunge (o ritrova) il nodo di un evento ereditato overridabile; restituisce path e pin. |
-| `ue_bp_add_function_graph` | `blueprint_path`, `func_name` | Grafo funzione vuoto con nodi Entry/Return di default — interni non raggiungibili da Python; corpo scritto a mano nel Blueprint Editor. |
+| `ue_bp_add_function_graph` | `blueprint_path`, `func_name` | Grafo funzione vuoto con nodi Entry/Return di default. |
+
+## Authoring del grafo Blueprint (editor)
+
+**UE 5.8+.** `ue_status` lo riporta come `capabilities.blueprint_graph_authoring`;
+sui motori che non ce l'hanno questi tool falliscono con una spiegazione, e la
+risposta resta la classe C++ padre.
+
+Questa sezione corregge quello che c'era scritto qui prima. Il muro era vero —
+`EdGraph.Nodes` è una proprietà protetta, e lo è tutt'ora — ma la conclusione
+che se ne era tratta era sbagliata: `Nodes` non serve toccarla, perché
+`unreal.BlueprintGraphEditor` manipola il grafo dall'esterno, come fa
+l'editor stesso. Verificato dal vivo su UE 5.8: BeginPlay → PrintString →
+Branch con una variabile booleana che alimenta `Condition`, fili exec
+collegati, letterale scritto su `InString`, Blueprint compilato
+`BS_UP_TO_DATE` senza errori né warning, salvato e riletto da zero con le
+connessioni al loro posto.
+
+Un nodo si indirizza col suo **nome oggetto** (`K2Node_CallFunction_0`), che
+ogni tool restituisce quando lo crea. I *titoli* seguono la lingua
+dell'editor ("Ramo" per Branch) e non vanno usati come chiave. I nodi evento,
+che esistono già nel grafo, hanno l'alias `event:<NomeMembro>` — es.
+`event:ReceiveBeginPlay`.
+
+| Tool | Parametri | Cosa fa |
+|---|---|---|
+| `ue_bp_graph_info` | `blueprint_path`, `graph_name?` | Nodi, pin, connessioni ed errori di compilazione. Il punto di partenza: dà i nomi oggetto che servono a tutto il resto. |
+| `ue_bp_add_call_function` | `blueprint_path`, `function_path`, `graph_name?`, `position?` | Nodo di chiamata a funzione. `function_path` è `/Script/<Modulo>.<Classe>:<Funzione>`, es. `/Script/Engine.KismetSystemLibrary:PrintString`. |
+| `ue_bp_add_branch` | `blueprint_path`, `graph_name?`, `position?` | Nodo Branch — `Condition` in ingresso, `then`/`else` in uscita. |
+| `ue_bp_add_custom_event` | `blueprint_path`, `event_name`, `graph_name?`, `position?` | Custom Event. Solo nei grafi evento: una funzione non può contenerne. |
+| `ue_bp_add_variable_node` | `blueprint_path`, `variable_name`, `mode`, `graph_name?`, `position?`, `class_path?` | Nodo Get o Set di una variabile membro (creala prima con `ue_add_variable`). |
+| `ue_bp_add_node_by_name` | `blueprint_path`, `node_name`, `graph_name?`, `position?` | Un nodo qualunque della palette, per `Categoria\|Nome`. Ultima spiaggia — vedi la trappola della localizzazione. |
+| `ue_bp_list_palette` | `blueprint_path`, `graph_name?`, `contains?`, `limit?` | Cerca per sottostringa fra i nodi aggiungibili. |
+| `ue_bp_connect` | `blueprint_path`, `from_node`, `from_pin`, `to_node`, `to_pin`, `graph_name?` | Collega un pin di uscita a uno di ingresso. I tipi incompatibili vengono riportati entrambi. |
+| `ue_bp_break_pin` | `blueprint_path`, `node`, `pin`, `graph_name?` | Stacca tutti i fili di un pin, e dice quanti erano. |
+| `ue_bp_set_pin_value` | `blueprint_path`, `node`, `pin`, `value`, `graph_name?` | Valore letterale di un pin di ingresso non collegato. |
+| `ue_bp_remove_node` | `blueprint_path`, `node`, `graph_name?` | Cancella un nodo e i suoi fili. |
+
+**Due trappole, trovate entrambe dal vivo.**
+
+*La palette è localizzata.* Su un editor italiano il Branch è
+`Utilità|ControlloDiFlusso|Ramo` — passare `Utilities|FlowControl|Branch` non
+restituisce niente. Per questo i tool tipizzati (`ue_bp_add_branch`,
+`ue_bp_add_call_function`, `ue_bp_add_variable_node`) sono la via principale e
+`ue_bp_add_node_by_name` è l'uscita di sicurezza; quando serve, trova la
+stringa esatta con `ue_bp_list_palette`.
+
+*Unreal non valida i valori dei pin.* Scrivere `"non_un_bool"` su un pin
+booleano viene accettato e memorizzato così com'è. Per questo
+`ue_bp_set_pin_value` rilegge sempre il pin e restituisce quello che c'è
+davvero — guarda quello, invece di fidarti che la chiamata sia andata a buon
+fine.
+
+Un esempio completo, da zero a grafo funzionante:
+
+```
+ue_create_blueprint("/Game/MyGame", "BP_Porta", "Actor")
+ue_add_variable("/Game/MyGame/BP_Porta", "Aperta", "bool")
+n = ue_bp_add_call_function("/Game/MyGame/BP_Porta",
+                            "/Script/Engine.KismetSystemLibrary:PrintString")
+ue_bp_connect("/Game/MyGame/BP_Porta", "event:ReceiveBeginPlay", "then", n.node, "execute")
+ue_bp_set_pin_value("/Game/MyGame/BP_Porta", n.node, "InString", "Porta pronta")
+ue_bp_graph_info("/Game/MyGame/BP_Porta")     # controlla errors == []
+```
 
 ## Animazione (editor)
 

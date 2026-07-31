@@ -85,6 +85,10 @@ def mcp_capabilities():
         "metasounds": any(
             hasattr(unreal, c) for c in ("MetaSoundSourceFactory", "MetasoundSourceFactory")
         ),
+        # BlueprintGraphEditor è l'API di authoring dei nodi K2 (fase 11):
+        # su un motore che non ce l'ha, i tool ue_bp_add_*/ue_bp_connect
+        # falliscono con un messaggio esplicito invece di un AttributeError.
+        "blueprint_graph_authoring": hasattr(unreal, "BlueprintGraphEditor"),
     }
 
 
@@ -2070,24 +2074,17 @@ def mcp_create_widget_blueprint(package_path, name, parent_class="UserWidget", e
 
 # ============================================================ blueprint graph
 #
-# Verificato dal vivo su UE 5.8 il 2026-07-31. Le istruzioni del server
-# dicono "i grafi Blueprint non sono scriptabili" — vero solo in parte:
-# `unreal.BlueprintEditorLibrary` espone un sottoinsieme reale di editing
-# (aggiungere nodi evento per eventi ereditati overridabili, aggiungere grafi
-# funzione vuoti, leggere i pin di un nodo di cui si ha già il riferimento),
-# ma la proprietà `Nodes` di `EdGraph` è protetta esattamente come
-# `WidgetTree` in UMG (fase 2): niente elenco dei nodi di un grafo qualunque,
-# niente creazione di nodi arbitrari (Print String, Branch, chiamate a
-# funzione libere, nodi matematici...). C'è anche un modo per collegare due
-# pin (`BlueprintGraphPin.try_create_connection`, verificato funzionante),
-# ma non è esposto come tool: gli unici nodi raggiungibili da qui sono nodi
-# evento, e un nodo evento ha *solo* pin di output (verificato anche su un
-# evento con 8 parametri, ReceiveHit) — senza un nodo con un pin di input non
-# c'è nessuna connessione valida da fare, quindi sarebbe stato un tool
-# funzionante ma inutile nella pratica. Per logica vera resta la via C++ già
-# in uso altrove (`ue_cpp_class_create` -> `ue_reparent_blueprint`); questi
-# tool servono a predisporre l'aggancio (l'evento esiste, il suo grafo pure),
-# non a scrivere la logica.
+# **Rettifica del 31/07/2026 (fase 11).** La fase 3 aveva concluso che i
+# grafi Blueprint non fossero scriptabili. La conclusione era giusta sul
+# metodo — `Nodes` di `EdGraph` è protetta, e lo è tutt'ora — e sbagliata sul
+# risultato: guardava dal lato sbagliato. Non serve toccare `Nodes`, perché
+# UE 5.8 espone `unreal.BlueprintGraphEditor`, una classe che manipola il
+# grafo dall'esterno: crea nodi, li collega, scrive i valori dei pin, li
+# elenca. Vedi la sezione "blueprint graph authoring" più sotto.
+#
+# I tool di questa sezione restano validi e utili (elencare grafi ed eventi,
+# aggiungere un override di evento o un grafo funzione) e sono più diretti
+# per quei tre compiti specifici; l'authoring vero sta nella sezione nuova.
 
 
 def mcp_bp_list_graphs(blueprint_path):
@@ -2160,6 +2157,412 @@ def mcp_bp_add_function_graph(blueprint_path, func_name):
         raise ValueError("Impossibile creare la funzione '%s'." % func_name)
     mcp_asset_lib().save_asset(blueprint_path)
     return {"graph_name": graph.get_name()}
+
+
+# ================================================== blueprint graph authoring
+#
+# Fase 11, verificata dal vivo su UE 5.8 il 2026-07-31: il muro della fase 3
+# è caduto. `unreal.BlueprintGraphEditor` non tocca la proprietà protetta
+# `EdGraph.Nodes` — la aggira lavorando sul grafo dall'esterno, come fa
+# l'editor stesso. Costruito e verificato end-to-end un grafo vero:
+# BeginPlay -> PrintString con il filo exec collegato
+# (`try_create_connection`) e il letterale scritto sul pin `InString`
+# (`set_pin_value`), Blueprint compilato `BS_UP_TO_DATE` senza errori né
+# warning, salvato, e riletto da zero con la connessione ancora al suo posto
+# (`PrintString`/`InString` presenti anche nel .uasset).
+#
+# Due trappole trovate subito, entrambe gestite qui dentro:
+#
+# 1. `create_node_from_name` vuole "Categoria|Nome" **localizzati**: su un
+#    editor in italiano "Utilities|FlowControl|Branch" restituisce None e
+#    `list_available_nodes` risponde "Utilità|Casting|CastToObject". Per
+#    questo `mcp_bp_add_node_by_name` è l'ultima spiaggia e i metodi
+#    tipizzati (branch, evento, variabile, chiamata a funzione) sono la via
+#    principale: quelli non passano per la localizzazione.
+# 2. I *titoli* dei nodi sono localizzati ("Ramo" per Branch), i loro *nomi
+#    oggetto* no (`K2Node_IfThenElse_0`). Tutti i riferimenti a un nodo in
+#    questi helper usano il nome oggetto, che è anche stabile fra sessioni.
+#
+# Su motori senza questa classe (probabilmente tutto ciò che precede 5.6) i
+# tool falliscono con un messaggio esplicito: vedi `mcp_capabilities()`,
+# chiave `blueprint_graph_authoring`.
+
+
+def _mcp_bpg_richiedi_api():
+    if not hasattr(unreal, "BlueprintGraphEditor"):
+        raise RuntimeError(
+            "Questo motore non espone `BlueprintGraphEditor`: l'authoring dei nodi "
+            "Blueprint da Python non è disponibile (serve UE 5.8 o simile — "
+            "`ue_status` lo riporta in capabilities.blueprint_graph_authoring). "
+            "Su motori più vecchi la logica va messa in una classe C++ padre: "
+            "ue_cpp_class_create -> build -> ue_reparent_blueprint."
+        )
+
+
+def _mcp_bpg_editor(blueprint_path, graph_name="EventGraph"):
+    """Blueprint + editor del grafo indicato.
+
+    `graph_name` è il nome *oggetto* del grafo ("EventGraph",
+    "ConstructionScript", o il nome dato a una funzione), non il titolo
+    tradotto che si vede nell'editor.
+    """
+    _mcp_bpg_richiedi_api()
+    blueprint = mcp_load_blueprint(blueprint_path)
+    editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(
+        blueprint, unreal.Name(str(graph_name))
+    )
+    if editor is None or editor.get_graph() is None:
+        disponibili = [g.get_name() for g in unreal.BlueprintEditorLibrary.list_graphs(blueprint)]
+        raise ValueError(
+            "Grafo '%s' non trovato su '%s'. Presenti: %s"
+            % (graph_name, blueprint_path, ", ".join(disponibili) or "nessuno")
+        )
+    return blueprint, editor
+
+
+def _mcp_bpg_pin_dict(pin):
+    biblioteca = unreal.BlueprintGraphPinLibrary
+    proprietario = biblioteca.get_owning_node(pin)
+    return {
+        "node": str(proprietario.get_name()) if proprietario else None,
+        "name": str(biblioteca.get_pin_name(pin)),
+        "direction": "input"
+        if biblioteca.get_pin_direction(pin) == unreal.EdGraphPinDirection.EGPD_INPUT
+        else "output",
+        "type": str(biblioteca.get_pin_type_display_string(pin)),
+        "value": str(biblioteca.get_pin_value(pin)),
+    }
+
+
+def _mcp_bpg_node_dict(node, con_pin=True):
+    posizione = node.get_node_pos()
+    info = {
+        "node": str(node.get_name()),
+        # Il titolo è localizzato: utile a chi legge, inutile come chiave.
+        "title": str(node.get_node_title()),
+        "class": str(node.get_class().get_name()),
+        "position": {"x": int(posizione.x), "y": int(posizione.y)},
+    }
+    if con_pin:
+        info["pins"] = [_mcp_bpg_pin_dict(p) for p in node.list_all_pins()]
+    return info
+
+
+def _mcp_bpg_node(editor, riferimento):
+    """Un nodo del grafo, dato il suo nome oggetto.
+
+    Accetta anche `event:<NomeMembro>` come alias, perché i nodi evento
+    esistono già nel grafo e chi chiama non ha modo di indovinare che
+    BeginPlay si chiama `K2Node_Event_0`. Il nome membro è quello vero
+    (`ReceiveBeginPlay`), non il titolo visibile.
+    """
+    testo = str(riferimento).strip()
+    if testo.lower().startswith("event:"):
+        nome_evento = testo.split(":", 1)[1].strip()
+        nodo = editor.find_event_node(unreal.Name(nome_evento))
+        if nodo is None:
+            eventi = [
+                str(n.get_name())
+                for n in editor.list_all_nodes()
+                if "Event" in n.get_class().get_name()
+            ]
+            raise ValueError(
+                "Nessun nodo evento '%s' nel grafo. Usa il nome membro "
+                "(ReceiveBeginPlay, ReceiveTick...), non il titolo visibile. "
+                "Nodi evento presenti: %s" % (nome_evento, ", ".join(eventi) or "nessuno")
+            )
+        return nodo
+
+    nodi = list(editor.list_all_nodes())
+    for nodo in nodi:
+        if str(nodo.get_name()) == testo:
+            return nodo
+    raise ValueError(
+        "Nodo '%s' non trovato nel grafo. Presenti: %s"
+        % (riferimento, ", ".join(str(n.get_name()) for n in nodi) or "nessuno")
+    )
+
+
+def _mcp_bpg_pin(nodo, nome_pin, direzione=None):
+    """Un pin del nodo per nome, con l'elenco di quelli veri se sbagliato."""
+    biblioteca = unreal.BlueprintGraphPinLibrary
+    atteso = str(nome_pin)
+    candidati = list(nodo.list_all_pins())
+    if direzione == "input":
+        candidati = list(nodo.list_input_pins())
+    elif direzione == "output":
+        candidati = list(nodo.list_output_pins())
+
+    for pin in candidati:
+        if str(biblioteca.get_pin_name(pin)) == atteso:
+            return pin
+    disponibili = [str(biblioteca.get_pin_name(p)) for p in candidati]
+    raise ValueError(
+        "Il nodo '%s' non ha un pin %s'%s'. Disponibili: %s"
+        % (
+            nodo.get_name(),
+            ("di %s " % direzione) if direzione else "",
+            nome_pin,
+            ", ".join(disponibili) or "nessuno",
+        )
+    )
+
+
+def _mcp_bpg_posiziona(nodo, position):
+    if position is None or nodo is None:
+        return
+    x, y = (position.get("x", 0), position.get("y", 0)) if isinstance(position, dict) else position
+    nodo.set_node_pos(unreal.IntPoint(int(x), int(y)))
+
+
+def _mcp_bpg_chiudi(blueprint, blueprint_path, nodo=None):
+    """Compila, salva e restituisce la descrizione del nodo appena creato."""
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return _mcp_bpg_node_dict(nodo) if nodo is not None else None
+
+
+def mcp_bp_graph_info(blueprint_path, graph_name="EventGraph"):
+    """Nodi, pin, connessioni ed errori di compilazione di un grafo Blueprint."""
+    _blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    biblioteca = unreal.BlueprintGraphPinLibrary
+
+    nodi = []
+    connessioni = []
+    for nodo in editor.list_all_nodes():
+        nodi.append(_mcp_bpg_node_dict(nodo))
+        for pin in nodo.list_output_pins():
+            for collegato in biblioteca.list_connected_pins(pin):
+                destinazione = biblioteca.get_owning_node(collegato)
+                connessioni.append(
+                    {
+                        "from": str(nodo.get_name()),
+                        "from_pin": str(biblioteca.get_pin_name(pin)),
+                        "to": str(destinazione.get_name()) if destinazione else None,
+                        "to_pin": str(biblioteca.get_pin_name(collegato)),
+                    }
+                )
+
+    return {
+        "blueprint": blueprint_path,
+        "graph": str(graph_name),
+        "nodes": nodi,
+        "connections": connessioni,
+        "errors": [str(n.get_name()) for n in editor.list_nodes_with_errors()],
+        "warnings": [str(n.get_name()) for n in editor.list_nodes_with_warnings()],
+    }
+
+
+def mcp_bp_add_call_function(blueprint_path, function_path, graph_name="EventGraph", position=None):
+    """Aggiunge un nodo di chiamata a funzione.
+
+    `function_path` è nella forma "/Script/<Modulo>.<Classe>:<Funzione>", per
+    esempio "/Script/Engine.KismetSystemLibrary:PrintString".
+    """
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = editor.add_call_function_node(str(function_path))
+    if nodo is None:
+        raise ValueError(
+            "Funzione '%s' non risolta. Il formato è "
+            "'/Script/<Modulo>.<Classe>:<Funzione>' (es. "
+            "'/Script/Engine.KismetSystemLibrary:PrintString'); per una funzione "
+            "di un Blueprint usa il path della sua classe generata." % function_path
+        )
+    _mcp_bpg_posiziona(nodo, position)
+    return _mcp_bpg_chiudi(blueprint, blueprint_path, nodo)
+
+
+def mcp_bp_add_branch(blueprint_path, graph_name="EventGraph", position=None):
+    """Aggiunge un nodo Branch (if/then/else)."""
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = editor.add_branch_node()
+    if nodo is None:
+        raise RuntimeError("Unreal non ha creato il nodo Branch.")
+    _mcp_bpg_posiziona(nodo, position)
+    return _mcp_bpg_chiudi(blueprint, blueprint_path, nodo)
+
+
+def mcp_bp_add_custom_event(blueprint_path, event_name, graph_name="EventGraph", position=None):
+    """Aggiunge un Custom Event al grafo evento."""
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = editor.add_custom_event_node(str(event_name))
+    if nodo is None:
+        raise ValueError(
+            "Custom event '%s' non creato: succede se il grafo '%s' non è un grafo "
+            "evento (una funzione non può contenerne)." % (event_name, graph_name)
+        )
+    _mcp_bpg_posiziona(nodo, position)
+    return _mcp_bpg_chiudi(blueprint, blueprint_path, nodo)
+
+
+def mcp_bp_add_variable_node(
+    blueprint_path, variable_name, mode="get", graph_name="EventGraph", position=None, class_path=""
+):
+    """Aggiunge un nodo Get o Set per una variabile membro.
+
+    La variabile dev'essere già stata creata (`ue_add_variable`).
+    """
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    verso = str(mode).lower()
+    if verso not in ("get", "set"):
+        raise ValueError("mode dev'essere 'get' o 'set', ricevuto '%s'." % mode)
+
+    metodo = (
+        editor.add_get_member_variable_node if verso == "get" else editor.add_set_member_variable_node
+    )
+    nodo = metodo(unreal.Name(str(variable_name)), str(class_path or ""))
+    if nodo is None:
+        raise ValueError(
+            "Variabile '%s' non trovata sul Blueprint. Creala prima con "
+            "`ue_add_variable`, o passa `class_path` se sta su un'altra classe."
+            % variable_name
+        )
+    _mcp_bpg_posiziona(nodo, position)
+    return _mcp_bpg_chiudi(blueprint, blueprint_path, nodo)
+
+
+def mcp_bp_add_node_by_name(blueprint_path, node_name, graph_name="EventGraph", position=None):
+    """Aggiunge un nodo qualunque dalla palette, per "Categoria|Nome".
+
+    **Attenzione alla lingua dell'editor**: questi nomi sono localizzati. Su
+    un editor italiano il Branch è "Utilità|FlowControl|Ramo", non
+    "Utilities|FlowControl|Branch". Usa `mcp_bp_list_palette` per trovare la
+    stringa esatta, o preferisci i tool tipizzati (`ue_bp_add_branch`,
+    `ue_bp_add_call_function`…), che non passano dalla localizzazione.
+    """
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    x, y = (position.get("x", 0), position.get("y", 0)) if isinstance(position, dict) else (
+        position or (0, 0)
+    )
+    nodo = editor.create_node_from_name(
+        str(node_name), unreal.Vector2D(float(x), float(y)), []
+    )
+    if nodo is None:
+        raise ValueError(
+            "Nessun nodo di palette chiamato '%s'. I nomi sono localizzati come "
+            "l'editor: cercalo con `ue_bp_list_palette`." % node_name
+        )
+    return _mcp_bpg_chiudi(blueprint, blueprint_path, nodo)
+
+
+def mcp_bp_list_palette(blueprint_path, graph_name="EventGraph", contains=None, limit=60):
+    """Cerca fra i nodi aggiungibili al grafo, filtrando per sottostringa.
+
+    Serve a trovare la stringa esatta da dare a `mcp_bp_add_node_by_name`: la
+    palette completa ha migliaia di voci, e i nomi seguono la lingua
+    dell'editor.
+    """
+    _blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    voci = [str(v) for v in editor.list_available_nodes([])]
+    if contains:
+        ago = str(contains).lower()
+        voci = [v for v in voci if ago in v.lower()]
+    return {
+        "blueprint": blueprint_path,
+        "graph": str(graph_name),
+        "total": len(voci),
+        "matches": voci[: int(limit)],
+    }
+
+
+def mcp_bp_connect(blueprint_path, from_node, from_pin, to_node, to_pin, graph_name="EventGraph"):
+    """Collega un pin di uscita a un pin di ingresso.
+
+    `from_node`/`to_node` sono nomi oggetto (`K2Node_CallFunction_0`) oppure
+    `event:<NomeMembro>` per i nodi evento già nel grafo.
+    """
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    partenza = _mcp_bpg_node(editor, from_node)
+    arrivo = _mcp_bpg_node(editor, to_node)
+    pin_partenza = _mcp_bpg_pin(partenza, from_pin, "output")
+    pin_arrivo = _mcp_bpg_pin(arrivo, to_pin, "input")
+
+    biblioteca = unreal.BlueprintGraphPinLibrary
+    if not biblioteca.can_create_connection(pin_partenza, pin_arrivo):
+        raise ValueError(
+            "Unreal rifiuta la connessione %s.%s -> %s.%s: i tipi non sono "
+            "compatibili (%s contro %s), o un pin di ingresso già occupato non "
+            "ne accetta un secondo."
+            % (
+                partenza.get_name(),
+                from_pin,
+                arrivo.get_name(),
+                to_pin,
+                biblioteca.get_pin_type_display_string(pin_partenza),
+                biblioteca.get_pin_type_display_string(pin_arrivo),
+            )
+        )
+    if not biblioteca.try_create_connection(pin_partenza, pin_arrivo):
+        raise RuntimeError("La connessione è stata accettata ma non creata.")
+
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {
+        "blueprint": blueprint_path,
+        "graph": str(graph_name),
+        "connected": "%s.%s -> %s.%s"
+        % (partenza.get_name(), from_pin, arrivo.get_name(), to_pin),
+    }
+
+
+def mcp_bp_break_pin(blueprint_path, node, pin, graph_name="EventGraph"):
+    """Stacca tutti i collegamenti di un pin."""
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = _mcp_bpg_node(editor, node)
+    riferimento = _mcp_bpg_pin(nodo, pin)
+    biblioteca = unreal.BlueprintGraphPinLibrary
+    prima = len(list(biblioteca.list_connected_pins(riferimento)))
+    biblioteca.break_pin_links(riferimento)
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {
+        "blueprint": blueprint_path,
+        "node": str(nodo.get_name()),
+        "pin": str(pin),
+        "broken": prima,
+    }
+
+
+def mcp_bp_set_pin_value(blueprint_path, node, pin, value, graph_name="EventGraph"):
+    """Scrive il valore letterale di un pin di ingresso non collegato.
+
+    Il valore viaggia come stringa, che è la forma in cui Unreal serializza i
+    default dei pin: "true", "42", "1.5", "Ciao".
+    """
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = _mcp_bpg_node(editor, node)
+    riferimento = _mcp_bpg_pin(nodo, pin, "input")
+
+    biblioteca = unreal.BlueprintGraphPinLibrary
+    testo = "true" if value is True else "false" if value is False else str(value)
+    if not biblioteca.set_pin_value(riferimento, testo):
+        raise ValueError(
+            "Unreal ha rifiutato il valore '%s' per il pin '%s' (tipo %s)."
+            % (testo, pin, biblioteca.get_pin_type_display_string(riferimento))
+        )
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {
+        "blueprint": blueprint_path,
+        "node": str(nodo.get_name()),
+        "pin": str(pin),
+        "value": str(biblioteca.get_pin_value(riferimento)),
+    }
+
+
+def mcp_bp_remove_node(blueprint_path, node, graph_name="EventGraph"):
+    """Cancella un nodo dal grafo, con i suoi collegamenti."""
+    blueprint, editor = _mcp_bpg_editor(blueprint_path, graph_name)
+    nodo = _mcp_bpg_node(editor, node)
+    nome = str(nodo.get_name())
+    editor.remove_nodes([nodo])
+    unreal.BlueprintEditorLibrary.compile_blueprint(blueprint)
+    mcp_asset_lib().save_asset(blueprint_path)
+    return {
+        "blueprint": blueprint_path,
+        "removed": nome,
+        "nodes": [str(n.get_name()) for n in editor.list_all_nodes()],
+    }
 
 
 # =================================================================== animazione

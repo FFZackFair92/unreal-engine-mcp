@@ -17,7 +17,7 @@ lì, non nella suite con `fake_unreal`).
 |---|---|---|
 | Levels / Actors | Buono | `ue_spawn_actor`, `ue_spawn_many`, `ue_list_actors`, `ue_set_actor_transform`, `ue_set_actor_property`, `ue_attach_actor`, `ue_detach_actor`, `ue_actor_hierarchy`, `ue_delete_actor`, `ue_new_level`, `ue_open_level` |
 | Blueprints (creazione/componenti/variabili) | Buono | `ue_create_blueprint`, `ue_add_component`, `ue_add_variable`, `ue_set_class_defaults`, `ue_compile_blueprint`, `ue_reparent_blueprint` |
-| Blueprints (node graph) | **Assente per scelta esplicita** | Bypassato via `ue_cpp_class_create` → build → `ue_reparent_blueprint`; vedi nota architetturale sotto |
+| Blueprints (node graph) | **Assente per scelta esplicita** | Bypassato via `ue_cpp_class_create` → build → `ue_reparent_blueprint`; vedi nota architetturale sotto — **colmato dalla fase 11 su UE 5.8+** |
 | Materiali | Buono | `ue_create_material`, `ue_create_material_instance`, `ue_assign_material` (grafo materiale pienamente scriptabile) |
 | Asset (CRUD, import) | Buono | `ue_import_assets`, `ue_list_assets`, `ue_delete_asset`, `ue_rename_asset`, `ue_duplicate_asset`, `ue_make_folder` |
 | Audio | Oltre db-lyon | `ue_import_audio`, `ue_create_metasound_source`, `ue_create_sound_cue` |
@@ -50,7 +50,10 @@ con `fake_unreal` + riga in `docs/TOOLS.md` + voce in `CHANGELOG.md`.
    è una proprietà protetta nella Python API — stesso muro del punto 3 sotto,
    scoperto verificando dal vivo prima di scrivere codice. Layout a mano nel
    Widget Designer; logica via classe C++ parent con `BindWidget`.
-3. **Blueprint node graph** — ✅ fatta il 31/07/2026, ridimensionata come
+3. **Blueprint node graph** — ⚠️ **conclusione superata dalla fase 11, vedi
+   sotto**. Quanto segue è quello che si sapeva il 31/07/2026 prima di
+   cercare meglio, lasciato per intero perché l'errore è più istruttivo della
+   correzione. ✅ fatta il 31/07/2026, ridimensionata come
    previsto dopo la fase 2: `ue_bp_list_graphs`, `ue_bp_list_events`,
    `ue_bp_add_event_override`, `ue_bp_add_function_graph`. Confermato dal
    vivo che `Nodes` di `EdGraph` è protetta come il `WidgetTree` — niente
@@ -162,22 +165,54 @@ dichiarato un progetto open-world/procedurale. È esattamente il motivo per
 cui la fase 9 è l'unica non verificabile fino in fondo: senza un terreno nel
 progetto non c'è niente su cui provare l'ultima chiamata.
 
-## Stato finale (10 fasi su 10, 127 tool)
+11. **Blueprint node graph, davvero** — ✅ fatta il 31/07/2026, dopo aver
+    riaperto il fronte chiuso dalla fase 3. `ue_bp_graph_info`,
+    `ue_bp_add_call_function`, `ue_bp_add_branch`, `ue_bp_add_custom_event`,
+    `ue_bp_add_variable_node`, `ue_bp_add_node_by_name`,
+    `ue_bp_list_palette`, `ue_bp_connect`, `ue_bp_break_pin`,
+    `ue_bp_set_pin_value`, `ue_bp_remove_node`.
+
+    **Cosa aveva sbagliato la fase 3.** Non i fatti: `EdGraph.Nodes` è una
+    proprietà protetta, e lo è ancora oggi. La deduzione: che passare da lì
+    fosse l'unica via. UE 5.8 espone `unreal.BlueprintGraphEditor`, che
+    manipola il grafo dall'esterno come fa l'editor stesso. Non era stata
+    trovata perché la ricerca era partita dalla domanda sbagliata — "come
+    leggo questa proprietà?" invece di "chi modifica un grafo?".
+
+    Verificato dal vivo su UE 5.8: BeginPlay → PrintString → Branch con una
+    variabile booleana su `Condition`, compilato `BS_UP_TO_DATE` senza errori
+    né warning, salvato e riletto da zero con le connessioni al loro posto.
+    Due trappole trovate e gestite: la palette dei nodi è **localizzata**
+    (su editor italiano il Branch è `Utilità|ControlloDiFlusso|Ramo`), e
+    `set_pin_value` di Unreal **non valida** il valore contro il tipo del pin
+    — `"non_un_bool"` su un booleano viene accettato, quindi il tool rilegge
+    sempre e restituisce il valore vero.
+
+    UMG, Niagara ed EQS sono stati riverificati nella stessa occasione: lì il
+    muro è ancora al suo posto.
+
+## Stato finale (11 fasi su 11, 138 tool)
 
 Le 21 categorie di db-lyon sono coperte, con tre tipi di esito diversi e
 tutti dichiarati:
 
 | Copertura | Categorie |
 |---|---|
-| Piena, verificata dal vivo | Levels/Actors, Blueprint (dati), Materiali, Asset, Audio, Editor/viewport/PIE/render, Build/package, Reflection, Animazione (dati), Gameplay (fisica, navmesh, Blackboard, Behavior Tree), GAS, Networking, **PCG** |
-| Parziale per un limite reale della Python API di UE | Grafo Blueprint, UMG, Niagara, EQS — creabili come asset, non authorabili nel grafo/albero |
+| Piena, verificata dal vivo | Levels/Actors, **Grafo Blueprint** (UE 5.8+), Blueprint (dati), Materiali, Asset, Audio, Editor/viewport/PIE/render, Build/package, Reflection, Animazione (dati), Gameplay (fisica, navmesh, Blackboard, Behavior Tree), GAS, Networking, PCG |
+| Parziale per un limite reale della Python API di UE | UMG, Niagara, EQS — creabili come asset, non authorabili nel grafo/albero |
 | Parziale per impossibilità di creazione | Landscape — guidabile ma non creabile da Python |
 
-Quello che resta fuori non è un pezzo di roadmap non fatto: è il muro dei
-sistemi node-graph-based del motore (`EdGraph.Nodes`, `WidgetTree`,
-`EmitterHandles`, `EnvQuery.Options` — tutte proprietà protette), verificato
-caso per caso e non assunto. La via per la logica vera resta il workaround
-C++ (`ue_cpp_class_create` → build → `ue_reparent_blueprint`).
+Quello che resta fuori non è un pezzo di roadmap non fatto: è il muro di
+`WidgetTree`, `EmitterHandles` ed `EnvQuery.Options`, tutte proprietà
+protette, verificato caso per caso e non assunto.
+
+**Ma la fase 11 insegna a diffidare anche di questo elenco.** "La proprietà è
+protetta" descrive un metodo che non funziona, non una capacità che manca:
+per il grafo Blueprint la capacità c'era eccome, esposta da un'altra classe
+che nessuno aveva pensato di cercare. Prima di dichiarare chiuso un fronte
+conviene chiedersi non solo "come leggo questa proprietà?" ma anche "chi, nel
+motore, fa questo lavoro?" — e cercare *quello* fra le classi esposte. UMG,
+Niagara ed EQS meritano lo stesso trattamento a ogni major del motore.
 
 ## Nota architetturale: perché il node graph blueprint è stato evitato finora
 
@@ -216,3 +251,12 @@ ovvio a essere protetto, è il più scriptabile di tutti. Il discrimine non è
 "grafo sì / grafo no": è se sotto c'è un `UEdGraph` di nodi K2 (protetto —
 Blueprint, UMG, Niagara, EQS) o un grafo di oggetti dati (scrivibile —
 Behavior Tree, PCG).
+
+**Aggiornamento dopo la fase 11**: anche questa regola è caduta, per metà.
+Il grafo Blueprint *è* un `UEdGraph` di nodi K2 con `Nodes` protetta, ed è
+comunque scriptabile — perché `BlueprintGraphEditor` lo modifica senza
+passare da quella proprietà. La regola giusta non riguarda la forma del dato
+ma la ricerca: una proprietà protetta chiude *una strada*, non *la
+destinazione*, e prima di dichiarare un fronte chiuso vale la pena cercare
+quale classe del motore fa quel lavoro. UMG, Niagara ed EQS sono ancora
+chiusi con la conoscenza attuale, ma vanno rivisitati a ogni major.

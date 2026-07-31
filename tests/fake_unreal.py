@@ -309,6 +309,94 @@ class FakeEventNode:
         return "%s:EventGraph.K2Node_Event_%s" % (self._blueprint.path, self._event_name)
 
 
+# ------------------------------------------- fase 11: authoring del grafo K2
+#
+# Il grafo Blueprint è scriptabile da UE 5.8 via `BlueprintGraphEditor`, che
+# non tocca la proprietà protetta `EdGraph.Nodes` ma lavora sul grafo
+# dall'esterno. Il finto riproduce le due trappole che contano:
+# i *titoli* dei nodi sono localizzati mentre i *nomi oggetto* no, e
+# `set_pin_value` accetta qualunque stringa senza validarla contro il tipo
+# del pin (verificato dal vivo: "non_un_bool" finisce su un pin booleano).
+
+#: Pin per funzione, come li dà il motore: (nome, direzione, tipo, default).
+K2_FUNZIONI = {
+    "/Script/Engine.KismetSystemLibrary:PrintString": [
+        ("execute", "input", "Exec", ""),
+        ("InString", "input", "Stringa", "Hello"),
+        ("bPrintToScreen", "input", "Booleano", "true"),
+        ("Duration", "input", "Float (precisione singola)", "2.000000"),
+        ("then", "output", "Exec", ""),
+    ],
+    "/Script/Engine.GameplayStatics:GetPlayerPawn": [
+        ("PlayerIndex", "input", "Intero", "0"),
+        ("ReturnValue", "output", "Pawn Riferimento Oggetto", ""),
+    ],
+}
+
+#: Nodi della palette, con il nome localizzato che ha l'editor italiano.
+K2_PALETTE = {
+    "Utilità|ControlloDiFlusso|Ramo": ("K2Node_IfThenElse", "Ramo"),
+    "Utilità|Casting|CastToObject": ("K2Node_DynamicCast", "Cast To Object"),
+    "Sviluppo|PrintString": ("K2Node_CallFunction", "PrintString"),
+}
+
+#: Eventi già presenti in un event graph appena creato.
+K2_EVENTI_NEL_GRAFO = {
+    "ReceiveBeginPlay": "Evento BeginPlay",
+    "ReceiveTick": "Evento Tick",
+}
+
+
+class K2Pin(FakeObject):
+    """Un pin del grafo K2. I collegamenti vivono qui, come nell'engine."""
+
+    def __init__(self, name, direction, type_display, value="", node=None):
+        super().__init__()
+        self.name = name
+        self.direction = direction
+        self.type_display = type_display
+        self.value = value
+        self.node = node
+        self.connected = []
+
+
+class K2Node(FakeObject):
+    def __init__(self, name, title, class_name, pins):
+        super().__init__()
+        self._name = name
+        self._title = title
+        self._class_name = class_name
+        self.pins = []
+        for nome, direzione, tipo, default in pins:
+            self.pins.append(K2Pin(nome, direzione, tipo, default, self))
+        self._pos = IntPoint(0, 0)
+
+    def get_name(self):
+        return self._name
+
+    def get_node_title(self):
+        """Localizzato, come nell'editor: mai usato come chiave dai tool."""
+        return self._title
+
+    def get_class(self):
+        return types.SimpleNamespace(get_name=lambda: self._class_name)
+
+    def list_all_pins(self):
+        return list(self.pins)
+
+    def list_input_pins(self):
+        return [p for p in self.pins if p.direction == "input"]
+
+    def list_output_pins(self):
+        return [p for p in self.pins if p.direction == "output"]
+
+    def get_node_pos(self):
+        return self._pos
+
+    def set_node_pos(self, pos):
+        self._pos = pos
+
+
 class SoundCue(FakeObject):
     pass
 
@@ -1223,7 +1311,7 @@ def build_fake_unreal(tmp_path):
         GameplayAbilitiesBlueprintFactory, GameplayAbilityBlueprint,
         Vector2D, TextureRenderTarget2D, LandscapeComponent, LandscapeProxy, Landscape,
         LandscapePlaceholder, PCGGraph, PCGGraphFactory, PCGNode, PCGSettings, PCGEdge,
-        PCGComponent, PCGVolume,
+        PCGComponent, PCGVolume, K2Node, K2Pin,
     ):
         setattr(module, cls.__name__, cls)
 
@@ -1588,6 +1676,154 @@ def build_fake_unreal(tmp_path):
         add_event_override=add_event_override,
         add_function_graph=add_function_graph,
         list_all_pins=list_all_pins,
+    )
+
+    # ---- fase 11: authoring del grafo K2
+    module.EdGraphPinDirection = types.SimpleNamespace(
+        EGPD_INPUT="input", EGPD_OUTPUT="output"
+    )
+
+    def _nodi_del_grafo(blueprint, graph_name):
+        grafi = blueprint._props.setdefault("_k2_nodes", {})
+        if graph_name not in grafi:
+            iniziali = []
+            if graph_name == "EventGraph":
+                for indice, (membro, titolo) in enumerate(K2_EVENTI_NEL_GRAFO.items()):
+                    nodo = K2Node(
+                        "K2Node_Event_%d" % indice, titolo, "K2Node_Event",
+                        [("then", "output", "Exec", "")],
+                    )
+                    nodo._evento = membro
+                    iniziali.append(nodo)
+            grafi[graph_name] = iniziali
+        return grafi[graph_name]
+
+    def _nome_nuovo(blueprint, class_name):
+        contatori = blueprint._props.setdefault("_k2_counters", {})
+        indice = contatori.get(class_name, 0)
+        contatori[class_name] = indice + 1
+        return "%s_%d" % (class_name, indice)
+
+    class _GraphEditor(FakeObject):
+        def __init__(self, blueprint, graph_name):
+            super().__init__()
+            self.blueprint = blueprint
+            self.graph_name = graph_name
+
+        def get_graph(self):
+            return FakeGraph(self.graph_name)
+
+        def _aggiungi(self, class_name, title, pins):
+            nodo = K2Node(_nome_nuovo(self.blueprint, class_name), title, class_name, pins)
+            _nodi_del_grafo(self.blueprint, self.graph_name).append(nodo)
+            return nodo
+
+        def list_all_nodes(self):
+            return list(_nodi_del_grafo(self.blueprint, self.graph_name))
+
+        def find_event_node(self, event_name):
+            for nodo in _nodi_del_grafo(self.blueprint, self.graph_name):
+                if getattr(nodo, "_evento", None) == str(event_name):
+                    return nodo
+            return None
+
+        def add_call_function_node(self, function_path):
+            pins = K2_FUNZIONI.get(str(function_path))
+            if pins is None:
+                return None
+            return self._aggiungi("K2Node_CallFunction", str(function_path).rsplit(":", 1)[-1], pins)
+
+        def add_branch_node(self):
+            return self._aggiungi(
+                "K2Node_IfThenElse", "Ramo",
+                [
+                    ("execute", "input", "Exec", ""),
+                    ("Condition", "input", "Booleano", "true"),
+                    ("then", "output", "Exec", ""),
+                    ("else", "output", "Exec", ""),
+                ],
+            )
+
+        def add_custom_event_node(self, event_name):
+            if self.graph_name != "EventGraph":
+                return None
+            return self._aggiungi(
+                "K2Node_CustomEvent", str(event_name), [("then", "output", "Exec", "")]
+            )
+
+        def _nodo_variabile(self, member_name, class_name, prefisso, direzione):
+            if str(member_name) not in _vars(self.blueprint):
+                return None
+            return self._aggiungi(
+                class_name, "%s %s" % (prefisso, member_name),
+                [(str(member_name), direzione, "Booleano", "false")],
+            )
+
+        def add_get_member_variable_node(self, member_name, class_path=""):
+            return self._nodo_variabile(member_name, "K2Node_VariableGet", "Get", "output")
+
+        def add_set_member_variable_node(self, member_name, class_path=""):
+            return self._nodo_variabile(member_name, "K2Node_VariableSet", "Set", "input")
+
+        def create_node_from_name(self, node_with_category, location, context_pins, declaring_class=None):
+            voce = K2_PALETTE.get(str(node_with_category))
+            if voce is None:
+                return None
+            class_name, titolo = voce
+            if class_name == "K2Node_IfThenElse":
+                return self.add_branch_node()
+            return self._aggiungi(class_name, titolo, [("execute", "input", "Exec", "")])
+
+        def list_available_nodes(self, context_pins):
+            return sorted(K2_PALETTE)
+
+        def remove_nodes(self, nodes):
+            rimasti = [n for n in _nodi_del_grafo(self.blueprint, self.graph_name) if n not in nodes]
+            for nodo in nodes:
+                for pin in nodo.pins:
+                    for altro in list(pin.connected):
+                        altro.connected = [p for p in altro.connected if p is not pin]
+                    pin.connected = []
+            self.blueprint._props["_k2_nodes"][self.graph_name] = rimasti
+
+        def list_nodes_with_errors(self):
+            return []
+
+        def list_nodes_with_warnings(self):
+            return []
+
+    def get_graph_editor_by_name(blueprint, graph_name):
+        if str(graph_name) not in _grafi(blueprint):
+            return None
+        return _GraphEditor(blueprint, str(graph_name))
+
+    module.BlueprintGraphEditor = types.SimpleNamespace(
+        get_graph_editor_by_name=get_graph_editor_by_name,
+        get_graph_editor=lambda graph: _GraphEditor(graph, graph.get_name()),
+    )
+
+    def _sono_compatibili(a, b):
+        return a.direction == "output" and b.direction == "input" and a.type_display == b.type_display
+
+    def _stacca(pin):
+        for altro in list(pin.connected):
+            altro.connected = [p for p in altro.connected if p is not pin]
+        pin.connected = []
+
+    module.BlueprintGraphPinLibrary = types.SimpleNamespace(
+        get_pin_name=lambda pin: Name(pin.name),
+        get_pin_direction=lambda pin: pin.direction,
+        get_pin_type_display_string=lambda pin: pin.type_display,
+        get_pin_value=lambda pin: pin.value,
+        # Come nel motore: nessuna validazione contro il tipo del pin.
+        set_pin_value=lambda pin, value: (setattr(pin, "value", str(value)), True)[1],
+        get_owning_node=lambda pin: pin.node,
+        list_connected_pins=lambda pin: list(pin.connected),
+        can_create_connection=_sono_compatibili,
+        try_create_connection=lambda a, b: (
+            a.connected.append(b), b.connected.append(a), True
+        )[2],
+        break_pin_links=_stacca,
     )
 
     # ---- materiali
