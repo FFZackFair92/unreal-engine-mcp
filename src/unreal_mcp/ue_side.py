@@ -326,6 +326,63 @@ def mcp_set_camera(location=None, rotation=None):
     return {"location": mcp_vec(posizione), "rotation": mcp_rot(rotazione)}
 
 
+#: Direzioni delle viste preimpostate, come [pitch, yaw]. Roll sempre 0: una
+#: camera inclinata su un asse di rollio non aiuta nessuno a capire una scena.
+MCP_VISTE = {
+    "top": [-89.0, 0.0],
+    "front": [0.0, 180.0],
+    "back": [0.0, 0.0],
+    "left": [0.0, 90.0],
+    "right": [0.0, -90.0],
+    "persp": [-30.0, -45.0],
+}
+
+
+def mcp_orbit_camera(yaw=0.0, pitch=0.0, dolly=0.0, view=None, distance=None):
+    """Ruota o avvicina la camera attorno al punto che sta guardando.
+
+    L'orbita ha bisogno di un centro, e la viewport dell'editor non ne espone
+    uno: si ricava proiettando in avanti dalla camera di `distance` unità. È
+    un'approssimazione, ma è la stessa che fa l'occhio di chi guarda — il
+    punto al centro dello schermo — quindi ruotarci attorno sembra naturale.
+
+    Args:
+        yaw, pitch: gradi di rotazione attorno al centro.
+        dolly: avvicinamento in cm (positivo avvicina).
+        view: nome di una vista preimpostata, vedi MCP_VISTE.
+        distance: distanza del centro; default 1000 cm.
+    """
+    posizione, rotazione = _mcp_viewport().get_level_viewport_camera_info()
+    raggio = float(distance) if distance else 1000.0
+    centro = posizione + _mcp_forward(rotazione) * raggio
+
+    if view:
+        chiave = str(view).lower()
+        if chiave not in MCP_VISTE:
+            raise ValueError(
+                "Vista '%s' sconosciuta. Disponibili: %s"
+                % (view, ", ".join(sorted(MCP_VISTE)))
+            )
+        nuovo_pitch, nuovo_yaw = MCP_VISTE[chiave]
+    else:
+        # Oltre i ±89° la camera si ribalta e l'orizzonte si capovolge: è
+        # disorientante e non serve a niente, quindi ci si ferma prima.
+        nuovo_pitch = max(-89.0, min(89.0, rotazione.pitch + float(pitch)))
+        nuovo_yaw = rotazione.yaw + float(yaw)
+
+    nuova_rotazione = unreal.Rotator(0.0, nuovo_pitch, nuovo_yaw)
+    # Sotto i 50 cm la camera entra dentro quello che stava inquadrando.
+    nuovo_raggio = max(50.0, raggio - float(dolly))
+    nuova_posizione = centro - _mcp_forward(nuova_rotazione) * nuovo_raggio
+
+    _mcp_viewport().set_level_viewport_camera_info(nuova_posizione, nuova_rotazione)
+    return {
+        "location": mcp_vec(nuova_posizione),
+        "rotation": mcp_rot(nuova_rotazione),
+        "distance": nuovo_raggio,
+    }
+
+
 def mcp_focus_actor(label=None, distance=None):
     """Inquadra un attore (o tutta la selezione) come farebbe il tasto F.
 
@@ -1332,6 +1389,17 @@ def mcp_screenshot(filename=None, width=1280, height=720):
         nome += ".png"
     destinazione = mcp_full_path(os.path.join(cartella, nome))
 
+    # Con un `filename` fisso il file esiste già dal giro precedente, e chi
+    # aspetta la cattura vedrebbe subito quello vecchio credendo sia il nuovo.
+    # Toglierlo prima rende l'attesa di nuovo affidabile — ed è ciò che
+    # permette al pannello di riusare sempre lo stesso nome invece di
+    # riempire il disco di PNG da mezzo mega.
+    if os.path.exists(destinazione):
+        try:
+            os.remove(destinazione)
+        except OSError:
+            pass
+
     if hasattr(unreal, "AutomationLibrary"):
         unreal.AutomationLibrary.take_high_res_screenshot(
             int(width), int(height), destinazione
@@ -1343,13 +1411,13 @@ def mcp_screenshot(filename=None, width=1280, height=720):
         )
 
     # La cattura è asincrona: il file compare uno o due frame dopo la richiesta.
-    scadenza = _mcp_time().time() + 15.0
-    while _mcp_time().time() < scadenza:
-        if os.path.exists(destinazione) and os.path.getsize(destinazione) > 0:
-            break
-        _mcp_time().sleep(0.25)
-
-    esiste = os.path.exists(destinazione)
+    # Aspettarlo QUI però non funziona, ed è una trappola che sembra innocua:
+    # questo codice gira sul game thread, lo stesso che deve disegnare il frame
+    # che scrive il PNG. Dormire in attesa blocca proprio ciò che si aspetta, e
+    # il file compare un istante dopo che la funzione ha già risposto "non
+    # catturato". L'attesa sta sul lato server (vedi _attendi_screenshot in
+    # server.py), dove il sonno non ferma l'editor.
+    esiste = os.path.exists(destinazione) and os.path.getsize(destinazione) > 0
     return {
         "file": destinazione if esiste else None,
         "requested": destinazione,
@@ -1359,8 +1427,8 @@ def mcp_screenshot(filename=None, width=1280, height=720):
         "note": None
         if esiste
         else (
-            "Screenshot non ancora scritto su disco. In editor la cattura avviene al "
-            "frame successivo: riprova, oppure controlla che la viewport sia visibile."
+            "Cattura richiesta: il file viene scritto al frame successivo. "
+            "Chi chiama attende che compaia."
         ),
     }
 
@@ -1688,16 +1756,48 @@ def mcp_configure_pie(num_players=1, net_mode="standalone", one_process=True):
     }
 
 
-def mcp_start_pie():
+#: Metodi di `ULevelEditorSubsystem` per ciascuna modalità, in ordine di
+#: preferenza. Entrambi finiscono in `GUnrealEd->RequestPlaySession()`, ma con
+#: `WorldType` diverso — vedi LevelEditorSubsystem.cpp righe 196-209
+#: (SimulateInEditor) e 265-278 (PlayInEditor) di UE 5.8.
+MCP_PLAY_MODES = {
+    "play": ("editor_request_begin_play",),
+    "simulate": ("editor_play_simulate",),
+}
+
+
+def mcp_start_pie(mode="play"):
+    """Avvia il Play In Editor.
+
+    `mode="play"` è il Play vero (Alt+P): parte il GameMode, il
+    PlayerController possiede il pawn, l'input del giocatore è instradato.
+    `mode="simulate"` è Simulate (Alt+S): il mondo gira ma nessuno possiede un
+    pawn e l'input non arriva. Fino alla 0.x questa funzione faceva sempre
+    Simulate perché provava `editor_play_simulate` per prima.
+    """
+    mode = str(mode).lower()
+    methods = MCP_PLAY_MODES.get(mode)
+    if methods is None:
+        raise ValueError("mode deve essere uno di: %s" % ", ".join(sorted(MCP_PLAY_MODES)))
+
     subsystem = mcp_level_subsystem()
-    for method in ("editor_play_simulate", "editor_request_begin_play"):
+    for method in methods:
         if hasattr(subsystem, method):
             getattr(subsystem, method)()
-            return {"started": True, "api": method}
-    if hasattr(unreal, "EditorLevelLibrary"):
+            return {"started": True, "mode": mode, "api": method}
+
+    if mode == "play" and hasattr(unreal, "EditorLevelLibrary"):
         unreal.EditorLevelLibrary.editor_play_in_viewport(unreal.Vector(), unreal.Rotator())
-        return {"started": True, "api": "EditorLevelLibrary.editor_play_in_viewport"}
-    raise RuntimeError("Nessuna API di avvio PIE disponibile in questa versione di Unreal.")
+        return {
+            "started": True,
+            "mode": mode,
+            "api": "EditorLevelLibrary.editor_play_in_viewport",
+        }
+
+    raise RuntimeError(
+        "Nessuna API di avvio PIE in modalità %r disponibile in questa versione di Unreal."
+        % mode
+    )
 
 
 def mcp_stop_pie():

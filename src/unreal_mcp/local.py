@@ -1488,6 +1488,35 @@ def collect_render_output(output_dir: str | None, exclude: list[str] | None = No
     )
 
 
+#: Plugin che porta la Movie Render Queue. Il nome è quello del `.uplugin`
+#: dentro `Engine/Plugins`, non quello mostrato nella UI ("Movie Render Queue").
+MRQ_PLUGIN = "MovieRenderPipeline"
+
+
+def mrq_available(uproject: str | Path) -> dict:
+    """Se il progetto ha la Movie Render Queue abilitata.
+
+    Senza quel plugin non esiste nemmeno la classe `MoviePipelineQueueSubsystem`
+    e un render headless parte, gira e non produce niente: un processo che esce
+    senza errori e senza fotogrammi è il modo peggiore di fallire, perché
+    somiglia a un problema di configurazione della scena.
+    """
+    plugins = project_info(str(uproject)).get("plugins_enabled") or []
+    attivo = MRQ_PLUGIN in plugins
+    return {
+        "enabled": attivo,
+        "plugin": MRQ_PLUGIN,
+        "reason": ""
+        if attivo
+        else (
+            "Il plugin %s ('Movie Render Queue' nella UI) non è abilitato in "
+            "questo progetto: senza, il render headless parte e non scrive "
+            "niente. Abilitalo con ue_project_set_plugins(enable=['%s']) e "
+            "riavvia l'editor." % (MRQ_PLUGIN, MRQ_PLUGIN)
+        ),
+    }
+
+
 def start_render(
     uproject: str,
     sequence: str,
@@ -1509,6 +1538,10 @@ def start_render(
     path = Path(uproject).expanduser()
     if not path.exists():
         raise LocalError("File .uproject non trovato: %s" % path)
+
+    mrq = mrq_available(path)
+    if not mrq["enabled"]:
+        raise LocalError(mrq["reason"])
 
     _check_token("sequence", sequence, _UE_PATH_RE)
     if config:

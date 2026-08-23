@@ -189,7 +189,28 @@ async def test_pie_multi_client(tools, unreal):
 
     await tools.ue_start_pie()
     await tools.ue_stop_pie()
-    assert unreal.state["pie"] == ["start", "stop"]
+    assert unreal.state["pie"] == ["play", "stop"]
+
+
+async def test_pie_modo_predefinito_e_play_non_simulate(tools, unreal):
+    """Regressione: fino alla 0.x ue_start_pie faceva Simulate, non Play."""
+    esito = await tools.ue_start_pie()
+    assert esito["mode"] == "play"
+    assert esito["api"] == "editor_request_begin_play"
+    assert unreal.state["pie"] == ["play"]
+
+
+async def test_pie_modo_simulate(tools, unreal):
+    esito = await tools.ue_start_pie(mode="simulate")
+    assert esito["mode"] == "simulate"
+    assert esito["api"] == "editor_play_simulate"
+    assert unreal.state["pie"] == ["simulate"]
+
+
+async def test_pie_modo_invalido(tools):
+    with pytest.raises(RuntimeError) as excinfo:
+        await tools.ue_start_pie(mode="record")
+    assert "mode" in str(excinfo.value)
 
 
 async def test_pie_net_mode_invalido(tools):

@@ -34,7 +34,19 @@ def progetto(tmp_path, monkeypatch):
     monkeypatch.setattr(local, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(local, "RENDER_STATE_FILE", tmp_path / "state/render.json")
     monkeypatch.setattr(local, "WINDOWS_LAUNCHER_DAT", tmp_path / "assente.dat")
-    return local.create_project("MyGame", str(tmp_path / "Projects"))
+    creato = local.create_project("MyGame", str(tmp_path / "Projects"))
+    return creato
+
+
+@pytest.fixture
+def progetto_con_mrq(progetto):
+    """Progetto con la Movie Render Queue abilitata.
+
+    I test del render vero e proprio partono da qui: il caso senza plugin ha i
+    suoi test dedicati e non deve far fallire tutti gli altri.
+    """
+    local.set_project_plugins(progetto["uproject"], enable=[local.MRQ_PLUGIN])
+    return progetto
 
 
 # ------------------------------------------------------------ funzioni pure
@@ -111,15 +123,15 @@ def test_raccolta_dei_file_prodotti(tmp_path):
     assert local.collect_render_output(None) == []
 
 
-def test_i_file_gia_presenti_non_contano_come_prodotti(progetto, monkeypatch):
+def test_i_file_gia_presenti_non_contano_come_prodotti(progetto_con_mrq, monkeypatch):
     """Un render che non scrive niente non deve sembrare riuscito solo perché
     nella cartella c'era già roba di un render precedente."""
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    destinazione = Path(progetto["uproject"]).parent / "Saved/MovieRenders"
+    destinazione = Path(progetto_con_mrq["uproject"]).parent / "Saved/MovieRenders"
     destinazione.mkdir(parents=True, exist_ok=True)
     (destinazione / "vecchio.png").write_text("x")
 
-    esito = local.start_render(progetto["uproject"], "/Game/LS")
+    esito = local.start_render(progetto_con_mrq["uproject"], "/Game/LS")
     monkeypatch.setattr(local, "_process_alive", lambda pid: False)
     Path(esito["log"]).write_text("EXITCODE=0\n", encoding="utf-8")
 
@@ -139,14 +151,14 @@ def test_i_file_gia_presenti_non_contano_come_prodotti(progetto, monkeypatch):
         {"sequence": "/Game/LS", "map_path": "../fuori"},
     ],
 )
-def test_path_iniettabili_rifiutati(progetto, monkeypatch, kwargs):
+def test_path_iniettabili_rifiutati(progetto_con_mrq, monkeypatch, kwargs):
     """I path finiscono sulla riga di comando dell'editor, che la ri-tokenizza."""
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
     with pytest.raises(local.LocalError):
-        local.start_render(progetto["uproject"], **kwargs)
+        local.start_render(progetto_con_mrq["uproject"], **kwargs)
 
 
-def test_avvio_registra_lo_stato(progetto, monkeypatch):
+def test_avvio_registra_lo_stato(progetto_con_mrq, monkeypatch):
     catturato = {}
 
     class _Cattura(_FakePopen):
@@ -156,28 +168,28 @@ def test_avvio_registra_lo_stato(progetto, monkeypatch):
 
     monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
     esito = local.start_render(
-        progetto["uproject"], "/Game/Cine/LS_Intro", config="/Game/Cine/Cfg"
+        progetto_con_mrq["uproject"], "/Game/Cine/LS_Intro", config="/Game/Cine/Cfg"
     )
     assert esito["pid"] == 7777
     assert esito["sequence"] == "/Game/Cine/LS_Intro"
     salvato = json.loads(local.RENDER_STATE_FILE.read_text())
-    assert salvato["jobs"][progetto["uproject"]]["pid"] == 7777
+    assert salvato["jobs"][progetto_con_mrq["uproject"]]["pid"] == 7777
 
 
-def test_secondo_render_rifiutato(progetto, monkeypatch):
+def test_secondo_render_rifiutato(progetto_con_mrq, monkeypatch):
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    local.start_render(progetto["uproject"], "/Game/LS")
+    local.start_render(progetto_con_mrq["uproject"], "/Game/LS")
     monkeypatch.setattr(local, "_process_alive", lambda pid: True)
     with pytest.raises(local.LocalError, match="già un render"):
-        local.start_render(progetto["uproject"], "/Game/LS")
-    local.start_render(progetto["uproject"], "/Game/LS", force=True)
+        local.start_render(progetto_con_mrq["uproject"], "/Game/LS")
+    local.start_render(progetto_con_mrq["uproject"], "/Game/LS", force=True)
 
 
-def test_successo_si_misura_sui_file_non_sul_codice_di_uscita(progetto, monkeypatch):
+def test_successo_si_misura_sui_file_non_sul_codice_di_uscita(progetto_con_mrq, monkeypatch):
     """MRQ headless può uscire con 0 senza scrivere niente, se la config non
     aveva nodi di output: il codice di uscita da solo mentirebbe."""
     monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
-    esito = local.start_render(progetto["uproject"], "/Game/LS")
+    esito = local.start_render(progetto_con_mrq["uproject"], "/Game/LS")
     monkeypatch.setattr(local, "_process_alive", lambda pid: False)
     Path(esito["log"]).write_text("EXITCODE=0\n", encoding="utf-8")
 
@@ -195,3 +207,36 @@ def test_successo_si_misura_sui_file_non_sul_codice_di_uscita(progetto, monkeypa
 
 def test_stato_senza_render_avviato(progetto):
     assert local.render_status()["running"] is False
+
+
+# ------------------------------------- il plugin deve esserci, prima di tutto
+
+
+def test_render_rifiutato_senza_il_plugin(progetto, monkeypatch):
+    """Un render headless senza Movie Render Queue parte e non scrive niente.
+
+    È il peggior modo di fallire: nessun errore, nessun fotogramma, e chi
+    guarda pensa di aver sbagliato la scena o il preset.
+    """
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    with pytest.raises(local.LocalError) as errore:
+        local.start_render(progetto["uproject"], "/Game/Cine/LS")
+    testo = str(errore.value)
+    assert "MovieRenderPipeline" in testo
+    assert "ue_project_set_plugins" in testo
+
+
+def test_render_procede_con_il_plugin(progetto, monkeypatch):
+    monkeypatch.setattr(local.subprocess, "Popen", _FakePopen)
+    local.set_project_plugins(progetto["uproject"], enable=[local.MRQ_PLUGIN])
+    esito = local.start_render(progetto["uproject"], "/Game/Cine/LS")
+    assert esito["pid"] == 7777
+
+
+def test_stato_del_plugin_leggibile(progetto):
+    stato = local.mrq_available(progetto["uproject"])
+    assert stato["enabled"] is False
+    assert stato["plugin"] == "MovieRenderPipeline"
+
+    local.set_project_plugins(progetto["uproject"], enable=["MovieRenderPipeline"])
+    assert local.mrq_available(progetto["uproject"])["enabled"] is True

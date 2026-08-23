@@ -1912,7 +1912,10 @@ def build_fake_unreal(tmp_path):
             return types.SimpleNamespace(get_outer=lambda: outer)
 
         def editor_play_simulate(self):
-            state["pie"].append("start")
+            state["pie"].append("simulate")
+
+        def editor_request_begin_play(self):
+            state["pie"].append("play")
 
         def editor_request_end_play(self):
             state["pie"].append("stop")

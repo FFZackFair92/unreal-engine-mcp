@@ -23,6 +23,9 @@ async def test_le_istruzioni_arrivano_al_modello():
     assert "Niagara emitter stacks and EQS remain unscriptable" in istruzioni
     assert "root widget that already exists" in istruzioni
     assert "landscape cannot be created from Python" in istruzioni
+    # Senza questo il modello si ferma a preset_fab_download e lascia il pack
+    # sul disco, fuori dal progetto.
+    assert "preset_fab_install" in istruzioni
 
 
 async def test_il_nome_del_server_e_esplicito():
@@ -44,6 +47,8 @@ async def test_i_tool_sono_registrati_con_le_descrizioni():
         "ue_screenshot",
         "ue_spawn_many",
         "ue_set_actor_property",
+        "preset_fab_status",
+        "preset_fab_install",
     ):
         assert atteso in per_nome, "tool mancante: %s" % atteso
         # Senza descrizione il modello non sa quando usarlo.

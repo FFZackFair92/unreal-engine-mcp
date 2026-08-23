@@ -177,7 +177,8 @@ contesto di quanto l'immagine faccia risparmiare. Sopra `UE_MCP_MAX_SCREENSHOT`
 | Tool | Parametri | Cosa fa |
 |---|---|---|
 | `ue_configure_pie` | `num_players`, `net_mode`, `one_process` | Numero di client e net mode (`standalone`, `listen_server`, `client`) per provare il multiplayer in locale. |
-| `ue_start_pie` / `ue_stop_pie` | — | Avvia e ferma la sessione. |
+| `ue_start_pie` | `mode` | Avvia la sessione. `play` (predefinito) è il Play vero, Alt+P: parte il GameMode, il PlayerController possiede il pawn, l'input del giocatore arriva. `simulate` è Simulate, Alt+S: il mondo gira ma nessuno possiede un pawn e l'input non è instradato — utile per guardare fisica o IA senza giocatore. |
+| `ue_stop_pie` | — | Ferma la sessione, in entrambe le modalità. |
 | `ue_set_project_setting` | `section`, `key`, `value`, `config` | Scrive in `Config/Default<config>.ini`. Alcune impostazioni richiedono il riavvio dell'editor. |
 
 ## Audio (editor)
@@ -660,13 +661,33 @@ contro il path traversal.
 | `preset_download_url` | Qualunque URL diretto (zip/glb/fbx/wav), estratto automaticamente. | dipende |
 | `preset_extract_archive` | Uno zip/tar già su disco. I `.rar` non sono supportati dalla libreria standard. | — |
 | `preset_library_list` | Elenca la libreria locale, pronta per `ue_import_assets`. | — |
-| `preset_fab_list_vault` / `preset_fab_download` | Contenuti Fab/Marketplace acquistati. | la tua licenza Epic |
+| `preset_fab_status` | Se il ponte verso Epic è utilizzabile: client installato, login fatto. | — |
+| `preset_fab_list_vault` | Contenuti Fab/Marketplace acquistati, filtrabili per titolo. | la tua licenza Epic |
+| `preset_fab_download` | Scarica un pack acquistato sul disco, senza installarlo. | la tua licenza Epic |
+| `preset_fab_install` | Scarica **e installa** un pack nel progetto, poi rilegge l'Asset Registry. | la tua licenza Epic |
 
 > **Avvertenza su Fab.** I contenuti acquistati stanno dietro il login Epic e non
-> hanno API pubblica. Questi due tool si appoggiano al client community
+> hanno API pubblica. Questi tool si appoggiano al client community
 > [`legendary`](https://github.com/derrod/legendary) (`pip install legendary-gl`,
-> poi `legendary auth`). Senza, il tool spiega come scaricare dall'Epic Games
-> Launcher. È software di terze parti, non una via ufficiale.
+> poi `legendary auth`). È software di terze parti, non una via ufficiale.
+>
+> A `preset_fab_install` non serve se il pack ce l'hai già: passagli una cartella o
+> uno zip invece dell'app name, e installa quello che l'Epic Games Launcher o la
+> finestra Fab dell'editor hanno già scaricato.
+
+L'installazione legge com'è fatto il pack invece di indovinarlo: nei pack del vault
+il `Content` può stare sotto `data/`, dentro una cartella con la versione del
+motore, oppure non esserci affatto perché è un plugin con il suo `.uplugin`. Il
+contenuto finisce in `Content/<subfolder>` (cioè `/Game/<subfolder>`), i plugin in
+`Plugins/` e vengono abilitati nel `.uproject`; `Binaries` e `Intermediate`
+precompilati restano fuori, perché appartengono a un'altra build. L'Asset Registry
+viene riletto sui path nuovi, così gli asset compaiono nel Content Browser senza
+riavviare — un **plugin**, invece, viene caricato solo all'avvio, e se ha `Source`
+C++ va prima compilato (`ue_build_start`).
+
+```
+preset_fab_status -> preset_fab_list_vault(query="soul") -> preset_fab_install("SoulCity")
+```
 
 ## Estenderlo con tool specifici del tuo progetto
 

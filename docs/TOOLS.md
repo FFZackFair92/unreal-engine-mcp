@@ -174,7 +174,8 @@ returning just the path.
 | Tool | Parameters | What it does |
 |---|---|---|
 | `ue_configure_pie` | `num_players`, `net_mode`, `one_process` | Client count and net mode (`standalone`, `listen_server`, `client`) for local multiplayer testing. |
-| `ue_start_pie` / `ue_stop_pie` | — | Starts and stops the session. |
+| `ue_start_pie` | `mode` | Starts the session. `play` (default) is real Play, Alt+P: the GameMode runs, the PlayerController possesses the pawn, player input is routed. `simulate` is Simulate, Alt+S: the world ticks but nothing is possessed and input is not routed — useful to watch physics or AI with no player. |
+| `ue_stop_pie` | — | Stops the session, in either mode. |
 | `ue_set_project_setting` | `section`, `key`, `value`, `config` | Writes into `Config/Default<config>.ini`. Some settings need an editor restart. |
 
 ## Audio (editor)
@@ -645,13 +646,33 @@ against the published md5 where available, are size-capped by
 | `preset_download_url` | Any direct URL (zip/glb/fbx/wav), extracted automatically. | depends |
 | `preset_extract_archive` | A zip/tar already on disk. `.rar` is not supported by the standard library. | — |
 | `preset_library_list` | Lists the local library, ready to feed `ue_import_assets`. | — |
-| `preset_fab_list_vault` / `preset_fab_download` | Purchased Fab/Marketplace content. | your Epic licence |
+| `preset_fab_status` | Is the Epic bridge usable: client installed, login done. | — |
+| `preset_fab_list_vault` | Purchased Fab/Marketplace content, filterable by title. | your Epic licence |
+| `preset_fab_download` | Downloads a purchased pack to disk, without installing it. | your Epic licence |
+| `preset_fab_install` | Downloads **and installs** a pack into the project, then rescans the Asset Registry. | your Epic licence |
 
 > **Fab caveat.** Purchased content sits behind an Epic login with no public API.
-> These two tools shell out to the community client
+> These tools shell out to the community client
 > [`legendary`](https://github.com/derrod/legendary) (`pip install legendary-gl`,
-> then `legendary auth`). Without it, the tool explains how to download from the
-> Epic Games Launcher instead. This is third-party software, not an official route.
+> then `legendary auth`). This is third-party software, not an official route.
+>
+> `preset_fab_install` does not need it if you already have the pack: pass a folder
+> or a zip instead of an app name, and it installs what the Epic Games Launcher or
+> the editor's own Fab window already downloaded.
+
+The install step reads the pack's layout rather than guessing it — vault packs put
+their `Content` under `data/`, under an engine-version folder, or ship a `.uplugin`
+instead. Content lands in `Content/<subfolder>` (visible as `/Game/<subfolder>`),
+plugins land in `Plugins/` and are enabled in the `.uproject`; precompiled
+`Binaries`/`Intermediate` are left behind, because they belong to another build.
+The Asset Registry is rescanned on the new paths, so the assets show up in the
+Content Browser without restarting — a new **plugin**, on the other hand, is only
+loaded at startup, and one with C++ `Source` has to be compiled first
+(`ue_build_start`).
+
+```
+preset_fab_status -> preset_fab_list_vault(query="soul") -> preset_fab_install("SoulCity")
+```
 
 ## Transports
 

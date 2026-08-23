@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`legendary` installed in a venv is now found.** `shutil.which` only looks at
+  the PATH of the process that launched the server, which on Windows does not
+  include the venv's `Scripts` folder: `pip install legendary-gl` succeeded and
+  the Fab tools kept reporting the client as missing. The interpreter's own
+  `Scripts`/`bin` folder is checked as well.
+- **`ue_start_pie` now starts Play, not Simulate.** It probed
+  `editor_play_simulate` before `editor_request_begin_play` and stopped at the
+  first hit, so every session was Simulate: the world ticked, but no GameMode
+  pawn was possessed and player input was never routed — the difference is
+  visible in `ULevelEditorSubsystem` (UE 5.8,
+  `Engine/Source/Editor/LevelEditor/Private/LevelEditorSubsystem.cpp`), where
+  `EditorPlaySimulate` (l. 196-209) and `EditorRequestBeginPlay` (l. 265-278)
+  both call `GUnrealEd->RequestPlaySession()` but set `WorldType` to
+  `SimulateInEditor` and `PlayInEditor` respectively.
+
+### Added
+
+- **`preset_fab_install`** — brings a purchased Fab pack all the way into the
+  project instead of stopping at the disk. `preset_fab_download` left the pack
+  in the local library and the assets nowhere the editor could see them, so the
+  last (and least obvious) step was still manual: vault packs do not have a
+  single layout, their `Content` sits under `data/`, under an engine-version
+  folder, or is absent because the pack is a plugin. The tool reads the layout,
+  copies content into `Content/<subfolder>` and plugins into `Plugins/`
+  (dropping the precompiled `Binaries`/`Intermediate`, which belong to another
+  build), enables the plugins in the `.uproject`, and rescans the Asset Registry
+  on the new paths — without that last call the `.uasset` files are on disk but
+  the Content Browser does not list them until the next restart. It also accepts
+  a folder or zip instead of an app name, which covers packs downloaded by hand
+  from the Epic Games Launcher or the editor's own Fab window, with no
+  `legendary` involved.
+- **`preset_fab_status`** — says whether `legendary` is installed and whether the
+  Epic login was done. The two failures have different remedies and used to
+  arrive as the same opaque error.
+- **`preset_fab_list_vault(query=...)`** — filters the vault by title or app name,
+  and now parses `legendary list --json` when that version supports it, falling
+  back to the text output.
+- **`ue_start_pie(mode=...)`** — `"play"` (default) or `"simulate"`. Simulate
+  is still reachable on purpose, for watching physics or AI with no player.
+  An unknown mode is rejected instead of silently falling back.
+
 ## [0.10.0] — 2026-07-31
 
 **I tre gap del confronto con la concorrenza, chiusi.** 143 tool → 162.

@@ -200,6 +200,12 @@ def test_anche_packaging_e_render_ricevono_lambiente(progetto, monkeypatch, tmp_
             super().__init__(args, **kwargs)
 
     monkeypatch.setattr(local.subprocess, "Popen", _Cattura)
+
+    # Il test parla di ambiente, non di render, ma `start_render` si rifiuta di
+    # partire senza la Movie Render Queue: il plugin va abilitato per arrivare
+    # alla Popen che qui interessa davvero.
+    local.set_project_plugins(progetto["uproject"], enable=[local.MRQ_PLUGIN])
+
     local.start_package(progetto["uproject"])
     local.start_render(progetto["uproject"], "/Game/LS")
     local.launch_editor(progetto["uproject"], skip_module_check=True)

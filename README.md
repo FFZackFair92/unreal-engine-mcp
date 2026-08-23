@@ -265,6 +265,65 @@ just works. Set `pyremote` or `remotecontrol` to pin one.
 
 Full parameter list in [docs/TOOLS.md](docs/TOOLS.md).
 
+### The viewport panel, inside the chat
+
+`ue_viewport_panel` doesn't answer with text: it's an [MCP App](https://modelcontextprotocol.io/extensions/apps/overview),
+an HTML view the host renders in an iframe inside the conversation. Viewport
+capture, a clickable actor list that frames what you pick, a filter by name or
+class, and a refresh button that never goes through the model.
+
+For visual checks while the agent builds a scene, `ue_screenshot` is still the
+cheaper tool — it attaches the PNG to the reply. The panel is for you, the
+screenshot is for the model.
+
+**On Claude Desktop there's nothing to set up:** the panel works against the
+local stdio server, with the config you already have. Open your project in
+Unreal and ask for the viewport panel.
+
+It works **fully offline**: the JavaScript helper is vendored under
+`src/unreal_mcp/vendor/`, the page fetches nothing, and the resource's CSP
+authorises no external origin. To move to a newer helper release, run
+`python scripts/vendor_ext_apps.py`.
+
+The tunnel below is **only for claude.ai on the web**, which can't reach your
+machine. On Claude Desktop, skip to the next section.
+
+```bash
+python scripts/tunnel.py
+```
+
+It starts the server over HTTP on `127.0.0.1:8000`, opens a cloudflared tunnel
+on top of it (the binary if present, otherwise `npx cloudflared`) and prints the
+URL to paste into **Settings → Connectors → Add custom connector**, already
+suffixed with `/mcp`. Ctrl-C tears both down.
+
+That URL is random and changes on every restart, though, so the connector has to
+be redone each time. With a domain on Cloudflare DNS the address becomes stable
+and you paste it once:
+
+```bash
+python scripts/tunnel.py --hostname unreal.yourdomain.com
+```
+
+The first run opens a browser to authorise, creates the tunnel and the DNS
+record; every run after that comes back up silently on the same address. In this
+mode the server also narrows its accepted `Host` headers to that one hostname
+instead of accepting any.
+
+> **The tunnel publishes a server exposing `ue_exec_python` to the internet** —
+> arbitrary code execution inside your editor. Cloudflared's throwaway URL has no
+> authentication in front of it: keep it up for the length of the test and don't
+> share it. On a named tunnel, put
+> [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+> in front of the hostname before leaving it running.
+
+The server takes `--http` on its own too, if you'd rather run the tunnel
+yourself:
+
+```bash
+python -m unreal_mcp.server --http
+```
+
 ### Working around the Blueprint graph limit
 
 **Blueprint node graphs cannot be authored from Python.** `EdGraph.Nodes` is
@@ -302,7 +361,8 @@ Material graphs, unlike Blueprint graphs, *are* fully scriptable:
   [compatibility table](#unreal-version-compatibility); `ue_status` reports
   what the running engine supports.
 - **Fab/Marketplace content** has no public API. Those tools shell out to the
-  community client [`legendary`](https://github.com/derrod/legendary).
+  community client [`legendary`](https://github.com/derrod/legendary), or install
+  a folder/zip you already downloaded yourself (`preset_fab_install`).
 
 ## Configuration
 
@@ -318,6 +378,9 @@ Material graphs, unlike Blueprint graphs, *are* fully scriptable:
 | `UE_MCP_ENGINE_DIRS` | — | Extra folders to search for engine installs |
 | `UE_MCP_LIBRARY` | `~/UnrealAssetLibrary` | Where downloaded assets land |
 | `UE_MCP_MAX_DOWNLOAD` | 4 GiB | Per-file download cap |
+| `UE_MCP_HTTP` | — | `1` serves over HTTP instead of stdio, same as `--http`. Distinct from `UE_MCP_TRANSPORT`, which picks the channel *to the editor* |
+| `UE_MCP_HTTP_PORT` | `8000` | Port the HTTP server listens on. Distinct from `UE_MCP_PORT`, which is Remote Control's |
+| `UE_MCP_ALLOWED_HOSTS` | `*` | Comma-separated `Host` allowlist in HTTP mode. The default accepts any host because a tunnel's public hostname isn't knowable in advance; set it to lock the server to a known domain |
 
 If the engine sits somewhere unusual, you can also drop an `mcp_engine.txt` next
 to the `.uproject` containing its path, or pass `engine_root` explicitly.

@@ -7,16 +7,19 @@ tramite la Remote Control API. Vedi README.md per l'attivazione dei plugin.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from mcp.server.fastmcp import Context, FastMCP, Image
+from mcp.server.transport_security import TransportSecuritySettings
 
-from . import assets, local
+from . import assets, local, ui
 from . import flow as flow_engine
 from .bridge import (
     BridgeConfig,
@@ -36,7 +39,7 @@ mcp = FastMCP(
     instructions=(
         "Drive Unreal Engine 5 on two levels: "
         "(1) LOCAL — find engine installs, create projects from a spec, open/close the editor, "
-        "compile C++, package the game, download free assets "
+        "compile C++, package the game, download free assets, install purchased Fab packs "
         "(ue_engine_*, ue_project_*, ue_editor_*, ue_build_*, ue_package_*, preset_*); "
         "(2) EDITOR — drive the running editor over the Remote Control API (every other tool). "
         "Cold start: ue_engine_list -> ue_project_create -> ue_editor_open -> ue_status. "
@@ -71,7 +74,12 @@ mcp = FastMCP(
         "and place relative to that. "
         "Verify visually: ue_focus_actor on what you touched, then ue_screenshot, which "
         "returns the viewport as an image — look at it before reporting success. "
-        "Use ue_spawn_many when placing more than a few actors."
+        "Use ue_spawn_many when placing more than a few actors. "
+        "Purchased Fab/Marketplace content: preset_fab_status -> preset_fab_list_vault -> "
+        "preset_fab_install, which downloads the pack and copies it into the project's "
+        "Content/Plugins folders, then rescans the Asset Registry. preset_fab_install also "
+        "accepts a folder or zip already on disk, for packs downloaded by hand from the "
+        "Epic Games Launcher or the editor's Fab window."
     ),
 )
 
@@ -748,24 +756,136 @@ async def preset_download_kenney(slug: str, destination: str | None = None) -> d
 
 
 @mcp.tool()
-async def preset_fab_list_vault() -> dict:
+async def preset_fab_status() -> dict:
+    """Verifica il ponte verso la libreria Fab/Marketplace dell'account Epic.
+
+    Dice se il client community `legendary` è installato e se il login Epic è
+    stato fatto: sono i due prerequisiti di preset_fab_list_vault e
+    preset_fab_install, e falliscono in modo diverso. Da chiamare per primo
+    quando si lavora con contenuti acquistati.
+    """
+    return await local_call(assets.fab_status)
+
+
+@mcp.tool()
+async def preset_fab_list_vault(query: str | None = None) -> dict:
     """Elenca il contenuto Unreal acquistato sull'account Epic (Fab/Marketplace).
 
     Non esiste un'API pubblica: serve il client community `legendary`
     (`pip install legendary-gl` + `legendary auth`). Senza di esso il tool
     spiega come procedere dall'Epic Games Launcher.
+
+    Args:
+        query: filtro parziale su titolo o app_name, es. "soul" per "Soul City".
     """
-    return await local_call(assets.fab_list_vault)
+    return await local_call(assets.fab_list_vault, query)
 
 
 @mcp.tool()
 async def preset_fab_download(app_name: str, destination: str | None = None) -> dict:
-    """Scarica un asset del vault Epic tramite `legendary`.
+    """Scarica un pack del vault Epic sul disco, senza installarlo.
+
+    Per portarlo dentro il progetto conviene preset_fab_install, che fa
+    download e installazione in un colpo solo.
 
     Args:
         app_name: identificativo restituito da preset_fab_list_vault.
+        destination: cartella alternativa alla libreria locale.
     """
     return await local_call(assets.fab_download, app_name, destination)
+
+
+@mcp.tool()
+async def preset_fab_install(
+    source: str,
+    uproject: str | None = None,
+    subfolder: str | None = None,
+    mode: str = "auto",
+    overwrite: bool = False,
+    enable_plugins: bool = True,
+    refresh_editor: bool = True,
+) -> dict:
+    """Installa un pack Fab dentro il progetto e lo rende visibile nell'editor.
+
+    Scarica il pack dal vault Epic se serve, ne riconosce la struttura e copia
+    il contenuto in `Content/<subfolder>` (compare come /Game/<subfolder>) e gli
+    eventuali plugin in `Plugins/`. I plugin vengono anche abilitati nel
+    .uproject; l'Asset Registry dell'editor viene aggiornato subito, così gli
+    asset compaiono nel Content Browser senza riavviare.
+
+    Args:
+        source: app_name del vault (vedi preset_fab_list_vault) oppure percorso
+            di una cartella o di uno zip già sul disco — per esempio un pack
+            scaricato a mano dalla finestra Fab dell'editor.
+        uproject: progetto di destinazione. Se omesso usa quello aperto
+            nell'editor.
+        subfolder: sottocartella di Content; default il nome del pack.
+        mode: "auto" (plugin + contenuto), "content" o "plugin".
+        overwrite: sovrascrive una destinazione già esistente.
+        enable_plugins: abilita nel .uproject i plugin appena installati.
+        refresh_editor: rilegge l'Asset Registry sui path appena creati.
+    """
+    progetto = await _risolvi_uproject(uproject)
+    esito = await local_call(assets.fab_install, source, progetto, subfolder, mode, overwrite)
+
+    if enable_plugins and esito["plugins_installed"]:
+        nomi = [p["name"] for p in esito["plugins_installed"]]
+        esito["plugins_enabled"] = await local_call(local.set_project_plugins, progetto, nomi)
+
+    if refresh_editor and esito["unreal_paths"]:
+        esito["editor_refresh"] = await _rileggi_asset_registry(esito["unreal_paths"])
+
+    return esito
+
+
+async def _risolvi_uproject(esplicito: str | None) -> str:
+    """Progetto su cui operare: quello passato, quello aperto, o niente.
+
+    Chiedere all'editor è la fonte più affidabile — è il progetto che l'utente
+    sta guardando — ma non deve essere un requisito: con l'editor chiuso si
+    ripiega sull'ultimo aperto da noi e infine su UE_MCP_PROJECT.
+    """
+    if esplicito:
+        return esplicito
+    with contextlib.suppress(Exception):
+        stato = await run("result = mcp_project_status()")
+        if isinstance(stato, dict) and stato.get("project_file"):
+            return str(stato["project_file"])
+    with contextlib.suppress(Exception):
+        locale = local.editor_status()
+        if locale.get("uproject"):
+            return str(locale["uproject"])
+    dall_ambiente = os.environ.get("UE_MCP_PROJECT")
+    if dall_ambiente:
+        return dall_ambiente
+    raise RuntimeError(
+        "Non so in quale progetto installare: apri l'editor (ue_editor_open) "
+        "oppure passa `uproject` con il percorso del file .uproject."
+    )
+
+
+async def _rileggi_asset_registry(paths: list[str]) -> dict:
+    """Fa rileggere all'editor le cartelle appena copiate su disco.
+
+    Senza questo i .uasset ci sono ma il Content Browser non li mostra finché
+    non si riavvia: l'Asset Registry scansiona all'avvio.
+    """
+    try:
+        return await run(
+            "registry = unreal.AssetRegistryHelpers.get_asset_registry()\n"
+            "registry.scan_paths_synchronous(%s, force_rescan=True)\n"
+            "result = {\n"
+            "    'scanned': %s,\n"
+            "    'assets': {p: len(unreal.EditorAssetLibrary.list_assets(p, True, False))\n"
+            "               for p in %s},\n"
+            "}" % (lit(paths), lit(paths), lit(paths))
+        )
+    except Exception as exc:  # noqa: BLE001 - l'editor chiuso non invalida l'installazione
+        return {
+            "scanned": [],
+            "error": str(exc)[-400:],
+            "hint": "I file sono stati copiati: compariranno all'apertura dell'editor.",
+        }
 
 
 # =============================================================== editor / stato
@@ -1429,6 +1549,60 @@ async def ue_focus_actor(label: str | None = None, distance: float | None = None
 
 # ================================================================ screenshot
 
+
+async def _diagnosi_cattura_mancata() -> str:
+    """Perché la cattura non è arrivata, quando si riesce a saperlo.
+
+    Il sospettato numero uno è "Use Less CPU when in Background": con quello
+    attivo l'editor che non ha il fuoco smette di ridisegnare la viewport, e
+    `take_high_res_screenshot` non ha nessun frame da salvare. Il sintomo è
+    perfido — l'editor risponde a tutto il resto, quindi sembra un problema
+    della cattura — e usare il pannello sposta il fuoco su Claude, cioè
+    provoca esattamente la condizione che lo rompe.
+    """
+    try:
+        attivo = await run(
+            "import unreal\n"
+            "_c = unreal.find_object(None, '/Script/UnrealEd.EditorPerformanceSettings')\n"
+            "result = bool(unreal.get_default_object(_c).get_editor_property("
+            "'bThrottleCPUWhenNotForeground')) if _c else None"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+    if attivo:
+        return (
+            " Causa probabile: in Editor Preferences → Performance è attivo "
+            "'Use Less CPU when in Background', e con l'editor non in primo "
+            "piano la viewport non ridisegna. Disattivalo."
+        )
+    return ""
+
+
+async def _attendi_screenshot(percorso: str | None, secondi: float = 15.0) -> Path | None:
+    """Aspetta che l'editor scriva il PNG, restituendo il file quando c'è.
+
+    L'attesa deve stare qui e non dentro l'editor: là girerebbe sul game
+    thread, che è lo stesso che disegna il frame da cui esce il PNG, e
+    bloccherebbe la cosa che sta aspettando. Qui invece l'editor continua a
+    girare mentre noi dormiamo, e il file compare dopo un paio di frame.
+
+    Se l'editor è su un'altra macchina il file non comparirà mai da questa
+    parte: si esce allo scadere del tempo e il chiamante lo segnala.
+    """
+    if not percorso:
+        return None
+
+    file = Path(percorso)
+    scadenza = asyncio.get_running_loop().time() + secondi
+    while asyncio.get_running_loop().time() < scadenza:
+        # La dimensione conta: il PNG appare vuoto per un istante mentre viene
+        # scritto, e leggerlo lì darebbe un'immagine troncata.
+        if file.is_file() and file.stat().st_size > 0:
+            return file
+        await asyncio.sleep(0.25)
+    return None
+
 # structured_output=False: il tool restituisce [Image, dict], e l'output
 # strutturato di FastMCP sa serializzare solo JSON — con lo schema attivo la
 # chiamata fallisce con "Unable to serialize unknown type: Image".
@@ -1458,19 +1632,23 @@ async def ue_screenshot(
         f"result = mcp_screenshot({lit(filename)}, {int(width)}, {int(height)})"
     )
 
-    percorso = (esito or {}).get("file") if isinstance(esito, dict) else None
-    if not return_image or not percorso:
+    richiesto = (esito or {}).get("requested") if isinstance(esito, dict) else None
+    file = await _attendi_screenshot(richiesto)
+    if file is not None:
+        esito["file"] = str(file)
+        esito["captured"] = True
+        esito["note"] = None
+    if not return_image:
         return esito
 
-    file = Path(percorso)
     # L'editor potrebbe essere su un'altra macchina (UE_MCP_HOST): in quel caso
     # il path esiste per lui e non per noi, e c'è solo da dirlo.
-    if not file.is_file():
+    if file is None:
         esito["image"] = None
         esito["image_note"] = (
-            "PNG scritto dall'editor ma non leggibile da qui: probabilmente "
-            "l'editor è su un'altra macchina. Il percorso resta valido per lui."
-        )
+            "PNG non comparso entro l'attesa: se l'editor è su un'altra "
+            "macchina il percorso resta valido per lui."
+        ) + await _diagnosi_cattura_mancata()
         return esito
 
     peso = file.stat().st_size
@@ -1488,6 +1666,376 @@ async def ue_screenshot(
     # Lista: FastMCP la converte in [ImageContent, TextContent], così il modello
     # vede davvero la viewport e ha comunque i metadati accanto.
     return [Image(path=str(file)), esito]
+
+
+# ============================================================= pannello viewport
+
+#: Nome del file che il pannello riusa per ogni cattura. Fisso di proposito:
+#: vedi il commento in _cattura_data_uri.
+PANNELLO_SCREENSHOT = "viewport_panel.png"
+
+
+class PannelloViewport(TypedDict):
+    """Forma del risultato di ue_viewport_panel.
+
+    Serve un TypedDict e non un `dict` generico: FastMCP genera lo schema di
+    output solo da un tipo strutturato, e senza schema non popola
+    `structuredContent` — che è il campo da cui il pannello legge i dati.
+    Con `-> dict` la vista si carica e resta vuota, senza errori.
+
+    Qui dentro non c'è l'immagine, di proposito: vedi ue_viewport_frame.
+    """
+
+    error: str | None
+    status: dict[str, Any]
+    actors: list[dict[str, Any]]
+    focused: str | None
+
+
+class FrameViewport(TypedDict):
+    """Forma del risultato di ue_viewport_frame."""
+
+    error: str | None
+    screenshot: str | None
+    screenshot_note: str | None
+
+
+async def _cattura_data_uri(width: int, height: int) -> tuple[str | None, str | None]:
+    """Cattura la viewport e la restituisce come data URI, o dice perché no.
+
+    Il pannello vive in un iframe sandboxed che non ha accesso al filesystem:
+    un percorso non gli servirebbe a niente, l'immagine deve viaggiare dentro
+    la risposta. Restituisce (data_uri, nota): esattamente uno dei due è None.
+    """
+    # Nome fisso, non col timestamp: il pannello ricattura a ogni comando e in
+    # auto-refresh ogni cinque secondi, e un file nuovo da mezzo mega ogni
+    # volta riempirebbe il disco senza che nessuno se ne accorga. L'unico
+    # PNG che serve è l'ultimo, e l'editor lo sovrascrive.
+    esito = await run(
+        f"result = mcp_screenshot({lit(PANNELLO_SCREENSHOT)}, {int(width)}, {int(height)})"
+    )
+    richiesto = (esito or {}).get("requested") if isinstance(esito, dict) else None
+    if not richiesto:
+        return None, "L'editor non ha restituito nessun percorso."
+
+    file = await _attendi_screenshot(richiesto)
+    if file is None:
+        return None, (
+            "Cattura non comparsa entro l'attesa: se l'editor è su un'altra "
+            "macchina il file non è leggibile da qui."
+        ) + await _diagnosi_cattura_mancata()
+
+    peso = file.stat().st_size
+    # Il base64 gonfia di circa un terzo e qui il PNG viaggia due volte (dal
+    # server all'host, dall'host all'iframe): vale il limite dello screenshot.
+    if peso > MAX_SCREENSHOT_BYTES:
+        return None, (
+            "PNG di %.1f MB, oltre il limite di %.1f MB. Abbassa width/height "
+            "oppure alza UE_MCP_MAX_SCREENSHOT." % (peso / 1e6, MAX_SCREENSHOT_BYTES / 1e6)
+        )
+
+    b64 = base64.b64encode(file.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{b64}", None
+
+
+@mcp.tool(meta={"ui": {"resourceUri": ui.VIEWPORT_URI}})
+async def ue_viewport_panel(focus: str | None = None) -> PannelloViewport:
+    """Apre il pannello viewport: cattura, outliner e stato in un'unica vista.
+
+    A differenza di ue_screenshot questo tool è pensato per l'occhio umano, non
+    per quello del modello: l'host lo renderizza come MCP App dentro la chat,
+    con la lista degli attori cliccabile. Il pannello richiama questo stesso
+    tool per aggiornarsi, passando `focus` quando l'utente clicca un attore.
+
+    La cattura non è qui dentro ma in ue_viewport_frame, che è la vista a
+    chiamare per conto suo: così il PNG non passa dal contesto del modello.
+
+    Per la verifica visiva durante la costruzione di una scena resta più
+    economico ue_screenshot, che allega il PNG direttamente alla risposta.
+
+    Args:
+        focus: attore da inquadrare; se omesso lascia la camera dov'è.
+    """
+    try:
+        if focus:
+            await run(f"result = mcp_focus_actor({lit(focus)}, None)")
+
+        stato = await run("result = mcp_project_status()")
+        if isinstance(stato, dict):
+            stato["transport"] = _bridge.transport
+        attori = await run("result = mcp_find_actors(None, None)")
+    except Exception as exc:  # noqa: BLE001
+        # Un'eccezione qui farebbe sparire il pannello e l'utente vedrebbe
+        # solo un errore rosso: meglio renderizzarlo dentro la vista, dove
+        # resta accanto al bottone Aggiorna per riprovare.
+        return {"error": str(exc), "status": {}, "actors": [], "focused": focus}
+
+    return {
+        "error": None,
+        "status": stato if isinstance(stato, dict) else {},
+        "actors": attori if isinstance(attori, list) else [],
+        "focused": focus,
+    }
+
+
+@mcp.tool()
+async def ue_viewport_camera(
+    yaw: float = 0.0,
+    pitch: float = 0.0,
+    dolly: float = 0.0,
+    view: str | None = None,
+    distance: float | None = None,
+) -> dict:
+    """Orbita, avvicina o allinea la camera della viewport.
+
+    Ruota attorno al punto che la camera sta guardando, invece di ruotare sul
+    posto: è quello che serve per girare intorno a una scena senza perderla di
+    vista. Usato dai controlli del pannello viewport.
+
+    Args:
+        yaw, pitch: gradi di rotazione attorno al centro inquadrato.
+        dolly: avvicinamento in cm; negativo allontana.
+        view: vista preimpostata fra top, front, back, left, right, persp.
+        distance: distanza del centro di rotazione, default 1000 cm.
+    """
+    return await run(
+        f"result = mcp_orbit_camera({float(yaw)}, {float(pitch)}, {float(dolly)}, "
+        f"{lit(view)}, {lit(distance)})"
+    )
+
+
+@mcp.tool()
+async def ue_viewport_frame(width: int = 960, height: int = 540) -> FrameViewport:
+    """Cattura per il pannello viewport. **Non chiamarlo direttamente.**
+
+    Esiste separato da ue_viewport_panel per una ragione precisa: un PNG della
+    viewport pesa mezzo megabyte, e in base64 dentro un risultato di tool sono
+    circa 200.000 token. Nel pannello l'immagine la chiede la vista con una sua
+    chiamata, che non passa dal contesto del modello; se il risultato del
+    pannello contenesse il data URI, ogni apertura brucerebbe il contesto.
+
+    Se sei il modello e ti serve vedere la viewport, usa ue_screenshot: allega
+    il PNG come immagine vera, che costa una frazione del base64.
+
+    Args:
+        width, height: risoluzione della cattura.
+    """
+    try:
+        immagine, nota = await _cattura_data_uri(width, height)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "screenshot": None, "screenshot_note": None}
+    return {"error": None, "screenshot": immagine, "screenshot_note": nota}
+
+
+@mcp.resource(
+    ui.VIEWPORT_URI,
+    name="Pannello viewport",
+    description="Interfaccia interattiva del pannello viewport, servita all'host.",
+    mime_type=ui.UI_MIME,
+    meta={"ui": {"csp": ui.VIEWPORT_CSP}},
+)
+def resource_viewport_ui() -> str:
+    return ui.VIEWPORT_HTML
+
+
+# ============================================================= pannello contenuti
+
+#: Come le classi Unreal finiscono nelle categorie del pannello.
+#:
+#: Un pattern che comincia con "=" richiede il nome esatto, gli altri sono
+#: sottostringhe. La distinzione non è pedanteria: "World" come sottostringa
+#: cattura anche WorldDataLayers e WorldPartitionMiniMap, che sono oggetti
+#: interni di un livello e non livelli — e l'utente si ritrova righe che non
+#: può aprire. Dove il nome della classe è preciso si usa "=", dove è una
+#: famiglia (MaterialInstance, MaterialFunction...) serve la sottostringa.
+#:
+#: L'ordine conta: vince la prima categoria che combacia.
+CATEGORIE_ASSET: list[tuple[str, tuple[str, ...]]] = [
+    ("livelli", ("=World",)),
+    ("audio", ("Sound", "MetaSound", "Submix", "Dialogue")),
+    ("blueprint", ("Blueprint",)),
+    ("mesh", ("StaticMesh", "SkeletalMesh", "GeometryCollection")),
+    ("animazioni", ("Anim", "BlendSpace", "=Skeleton", "PhysicsAsset")),
+    ("materiali", ("Material",)),
+    ("texture", ("Texture", "RenderTarget")),
+    ("effetti", ("Niagara", "ParticleSystem", "=CascadeParticleSystem")),
+]
+
+
+def _combacia(classe: str, pattern: str) -> bool:
+    if pattern.startswith("="):
+        return classe.lower() == pattern[1:].lower()
+    return pattern.lower() in classe.lower()
+
+
+def _categoria(classe: str) -> str:
+    for nome, pattern in CATEGORIE_ASSET:
+        if any(_combacia(classe, p) for p in pattern):
+            return nome
+    return "altro"
+
+
+class PannelloContenuti(TypedDict):
+    """Risultato di ue_content_panel: solo il riassunto, mai l'elenco intero.
+
+    Un progetto vero ha migliaia di asset, e questo risultato passa dal
+    contesto del modello: l'elenco lo chiede la vista con ue_content_list.
+    """
+
+    error: str | None
+    project: str | None
+    totale: int
+    conteggi: dict[str, int]
+    levels: list[dict[str, Any]]
+
+
+class ElencoAsset(TypedDict):
+    """Risultato di ue_content_list."""
+
+    error: str | None
+    assets: list[dict[str, Any]]
+    totale: int
+    troncato: bool
+
+
+async def _tutti_gli_asset() -> list[dict[str, Any]]:
+    elenco = await run("result = mcp_list_assets('/Game', True, None)")
+    return elenco if isinstance(elenco, list) else []
+
+
+@mcp.tool(meta={"ui": {"resourceUri": ui.CONTENUTI_URI}})
+async def ue_content_panel() -> PannelloContenuti:
+    """Apre il pannello contenuti: livelli, audio e asset del progetto.
+
+    Come ue_viewport_panel, è una vista per l'occhio umano: l'host la
+    renderizza come MCP App dentro la chat, con le categorie navigabili.
+
+    Restituisce solo i conteggi e i livelli, che sono pochi e servono subito.
+    L'elenco degli asset lo chiede la vista con ue_content_list, così migliaia
+    di righe non passano dal contesto del modello.
+    """
+    try:
+        asset = await _tutti_gli_asset()
+        stato = await run("result = mcp_project_status()")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error": str(exc),
+            "project": None,
+            "totale": 0,
+            "conteggi": {},
+            "levels": [],
+        }
+
+    conteggi: dict[str, int] = {}
+    livelli: list[dict[str, Any]] = []
+    for voce in asset:
+        categoria = _categoria(str(voce.get("class", "")))
+        conteggi[categoria] = conteggi.get(categoria, 0) + 1
+        if categoria == "livelli":
+            livelli.append(voce)
+
+    progetto = None
+    if isinstance(stato, dict) and stato.get("project_file"):
+        progetto = Path(str(stato["project_file"])).stem
+
+    return {
+        "error": None,
+        "project": progetto,
+        "totale": len(asset),
+        "conteggi": conteggi,
+        # I livelli sono l'unica categoria quasi sempre corta, e sono ciò che
+        # si vuole vedere per primo aprendo un progetto.
+        "levels": sorted(livelli, key=lambda v: str(v.get("path", ""))),
+    }
+
+
+@mcp.tool()
+async def ue_content_list(
+    category: str | None = None, query: str | None = None, limit: int = 400
+) -> ElencoAsset:
+    """Elenco degli asset di una categoria. **Non chiamarlo direttamente.**
+
+    Serve al pannello contenuti, che lo interroga per riempire la colonna
+    dell'elenco. Su un progetto vero restituisce centinaia di righe: nel
+    contesto del modello sono token buttati, e per cercare un asset da agente
+    esiste ue_list_assets, che filtra per classe e per path.
+
+    Args:
+        category: una fra livelli, audio, blueprint, mesh, animazioni,
+            materiali, texture, effetti, altro. Se omessa le prende tutte.
+        query: sottostringa da cercare nel path.
+        limit: massimo di righe restituite.
+    """
+    try:
+        asset = await _tutti_gli_asset()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "assets": [], "totale": 0, "troncato": False}
+
+    trovati = [
+        v for v in asset
+        if (not category or _categoria(str(v.get("class", ""))) == category)
+        and (not query or query.lower() in str(v.get("path", "")).lower())
+    ]
+    trovati.sort(key=lambda v: str(v.get("path", "")))
+    tetto = max(1, int(limit))
+    return {
+        "error": None,
+        "assets": trovati[:tetto],
+        "totale": len(trovati),
+        "troncato": len(trovati) > tetto,
+    }
+
+
+class StatoLavori(TypedDict):
+    """Risultato di ue_jobs_status.
+
+    Tipizzato e non `dict` per la stessa ragione degli altri pannelli: senza
+    outputSchema FastMCP non popola structuredContent, e la vista dovrebbe
+    ripiegare sul parsing del testo.
+    """
+
+    build: dict[str, Any]
+    package: dict[str, Any]
+    render: dict[str, Any]
+
+
+@mcp.tool()
+async def ue_jobs_status() -> StatoLavori:
+    """Stato dei lavori lunghi avviati da questo MCP: build, packaging, render.
+
+    Il pannello contenuti lo interroga per mostrare la barra di avanzamento.
+    Non solleva se un lavoro non è mai partito: risponde `running: false`, che
+    è l'informazione che serve.
+    """
+    lavori: dict[str, Any] = {}
+    for nome, funzione in (
+        ("build", local.build_status),
+        ("package", local.package_status),
+        ("render", local.render_status),
+    ):
+        try:
+            lavori[nome] = await local_call(funzione, 0)
+        except Exception as exc:  # noqa: BLE001
+            # Un lavoro mai avviato non è un errore da propagare: il pannello
+            # lo interroga ogni tre secondi, e sollevare farebbe lampeggiare
+            # un errore per una condizione del tutto normale.
+            lavori[nome] = {"running": False, "reason": str(exc)}
+    return {
+        "build": lavori["build"],
+        "package": lavori["package"],
+        "render": lavori["render"],
+    }
+
+
+@mcp.resource(
+    ui.CONTENUTI_URI,
+    name="Pannello contenuti",
+    description="Interfaccia interattiva del pannello contenuti, servita all'host.",
+    mime_type=ui.UI_MIME,
+    meta={"ui": {"csp": ui.VIEWPORT_CSP}},
+)
+def resource_contenuti_ui() -> str:
+    return ui.CONTENUTI_HTML
 
 
 # ================================================================== networking
@@ -1624,9 +2172,17 @@ async def ue_configure_pie(
 
 
 @mcp.tool()
-async def ue_start_pie() -> dict:
-    """Avvia il Play In Editor con le impostazioni correnti."""
-    return await run("result = mcp_start_pie()")
+async def ue_start_pie(mode: str = "play") -> dict:
+    """Avvia il Play In Editor con le impostazioni correnti.
+
+    Args:
+        mode: "play" (predefinito) è il Play vero, Alt+P — parte il GameMode, il
+            PlayerController possiede il pawn, l'input del giocatore arriva.
+            "simulate" è Simulate, Alt+S — il mondo gira ma nessuno possiede un
+            pawn e l'input non è instradato: utile per osservare la fisica o una
+            IA senza giocatore.
+    """
+    return await run(f"result = mcp_start_pie({lit(mode)})")
 
 
 @mcp.tool()
@@ -3491,9 +4047,46 @@ except ImportError:
 
 
 def main() -> None:
-    """Entry point stdio."""
+    """Entry point. Stdio di default, HTTP con --http o UE_MCP_HTTP=1.
+
+    Lo stdio copre tutti i client che lanciano il server in locale, pannello
+    viewport compreso: le MCP App sono indipendenti dal trasporto. L'HTTP serve
+    solo a claude.ai sul web, che girando sui server di Anthropic non può
+    raggiungere questa macchina se non attraverso un URL pubblico.
+
+    Attenzione a cosa si espone: questo server offre `ue_exec_python`, cioè
+    esecuzione di codice arbitrario dentro l'editor. Il bind resta su 127.0.0.1
+    apposta — un tunnel lo pubblica comunque, quindi tienilo su per il tempo
+    della prova e non condividere l'URL.
+    """
+    # Nomi distinti da UE_MCP_TRANSPORT e UE_MCP_PORT: quelli descrivono già
+    # il canale verso l'editor e la porta del Remote Control, e riusarli qui
+    # significherebbe che chi imposta la porta del bridge sposta per sbaglio
+    # quella su cui ascolta il server.
+    scelto = (
+        "streamable-http"
+        if "--http" in sys.argv or os.environ.get("UE_MCP_HTTP") == "1"
+        else "stdio"
+    )
+    if scelto == "streamable-http":
+        mcp.settings.port = int(os.environ.get("UE_MCP_HTTP_PORT", mcp.settings.port))
+
+        # L'SDK rifiuta con "Invalid Host header" ogni richiesta il cui Host
+        # non sia in lista: è protezione anti DNS-rebinding, pensata per un
+        # server in ascolto su localhost che un browser potrebbe attaccare.
+        # Dietro un tunnel l'Host è il dominio pubblico, che non si conosce
+        # prima di averlo aperto — quindi qui si accetta tutto. Non è un buco
+        # in più: chi arriva fin qui ha già l'URL del tunnel, e il tunnel è la
+        # cosa che va tenuta privata.
+        ammessi = os.environ.get("UE_MCP_ALLOWED_HOSTS", "*")
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=ammessi != "*",
+            allowed_hosts=[] if ammessi == "*" else ammessi.split(","),
+            allowed_origins=[] if ammessi == "*" else ammessi.split(","),
+        )
+
     try:
-        mcp.run()
+        mcp.run(transport=scelto)
     finally:
         # Il client httpx tiene aperta una connessione keep-alive verso
         # l'editor: senza questo resta appesa alla chiusura del server.
