@@ -7,7 +7,6 @@ tramite la Remote Control API. Vedi README.md per l'attivazione dei plugin.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import inspect
 import json
@@ -19,7 +18,7 @@ from typing import Any, TypedDict
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import assets, local, ui
+from . import assets, local
 from . import flow as flow_engine
 from .bridge import (
     BridgeConfig,
@@ -1556,9 +1555,9 @@ async def _diagnosi_cattura_mancata() -> str:
     Il sospettato numero uno è "Use Less CPU when in Background": con quello
     attivo l'editor che non ha il fuoco smette di ridisegnare la viewport, e
     `take_high_res_screenshot` non ha nessun frame da salvare. Il sintomo è
-    perfido — l'editor risponde a tutto il resto, quindi sembra un problema
-    della cattura — e usare il pannello sposta il fuoco su Claude, cioè
-    provoca esattamente la condizione che lo rompe.
+    perfido: l'editor risponde a tutto il resto, quindi sembra un problema
+    della cattura. E qualunque cosa sposti il fuoco via dall'editor provoca
+    esattamente la condizione che lo rompe.
     """
     try:
         attivo = await run(
@@ -1668,116 +1667,6 @@ async def ue_screenshot(
     return [Image(path=str(file)), esito]
 
 
-# ============================================================= pannello viewport
-
-#: Nome del file che il pannello riusa per ogni cattura. Fisso di proposito:
-#: vedi il commento in _cattura_data_uri.
-PANNELLO_SCREENSHOT = "viewport_panel.png"
-
-
-class PannelloViewport(TypedDict):
-    """Forma del risultato di ue_viewport_panel.
-
-    Serve un TypedDict e non un `dict` generico: FastMCP genera lo schema di
-    output solo da un tipo strutturato, e senza schema non popola
-    `structuredContent` — che è il campo da cui il pannello legge i dati.
-    Con `-> dict` la vista si carica e resta vuota, senza errori.
-
-    Qui dentro non c'è l'immagine, di proposito: vedi ue_viewport_frame.
-    """
-
-    error: str | None
-    status: dict[str, Any]
-    actors: list[dict[str, Any]]
-    focused: str | None
-
-
-class FrameViewport(TypedDict):
-    """Forma del risultato di ue_viewport_frame."""
-
-    error: str | None
-    screenshot: str | None
-    screenshot_note: str | None
-
-
-async def _cattura_data_uri(width: int, height: int) -> tuple[str | None, str | None]:
-    """Cattura la viewport e la restituisce come data URI, o dice perché no.
-
-    Il pannello vive in un iframe sandboxed che non ha accesso al filesystem:
-    un percorso non gli servirebbe a niente, l'immagine deve viaggiare dentro
-    la risposta. Restituisce (data_uri, nota): esattamente uno dei due è None.
-    """
-    # Nome fisso, non col timestamp: il pannello ricattura a ogni comando e in
-    # auto-refresh ogni cinque secondi, e un file nuovo da mezzo mega ogni
-    # volta riempirebbe il disco senza che nessuno se ne accorga. L'unico
-    # PNG che serve è l'ultimo, e l'editor lo sovrascrive.
-    esito = await run(
-        f"result = mcp_screenshot({lit(PANNELLO_SCREENSHOT)}, {int(width)}, {int(height)})"
-    )
-    richiesto = (esito or {}).get("requested") if isinstance(esito, dict) else None
-    if not richiesto:
-        return None, "L'editor non ha restituito nessun percorso."
-
-    file = await _attendi_screenshot(richiesto)
-    if file is None:
-        return None, (
-            "Cattura non comparsa entro l'attesa: se l'editor è su un'altra "
-            "macchina il file non è leggibile da qui."
-        ) + await _diagnosi_cattura_mancata()
-
-    peso = file.stat().st_size
-    # Il base64 gonfia di circa un terzo e qui il PNG viaggia due volte (dal
-    # server all'host, dall'host all'iframe): vale il limite dello screenshot.
-    if peso > MAX_SCREENSHOT_BYTES:
-        return None, (
-            "PNG di %.1f MB, oltre il limite di %.1f MB. Abbassa width/height "
-            "oppure alza UE_MCP_MAX_SCREENSHOT." % (peso / 1e6, MAX_SCREENSHOT_BYTES / 1e6)
-        )
-
-    b64 = base64.b64encode(file.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{b64}", None
-
-
-@mcp.tool(meta={"ui": {"resourceUri": ui.VIEWPORT_URI}})
-async def ue_viewport_panel(focus: str | None = None) -> PannelloViewport:
-    """Apre il pannello viewport: cattura, outliner e stato in un'unica vista.
-
-    A differenza di ue_screenshot questo tool è pensato per l'occhio umano, non
-    per quello del modello: l'host lo renderizza come MCP App dentro la chat,
-    con la lista degli attori cliccabile. Il pannello richiama questo stesso
-    tool per aggiornarsi, passando `focus` quando l'utente clicca un attore.
-
-    La cattura non è qui dentro ma in ue_viewport_frame, che è la vista a
-    chiamare per conto suo: così il PNG non passa dal contesto del modello.
-
-    Per la verifica visiva durante la costruzione di una scena resta più
-    economico ue_screenshot, che allega il PNG direttamente alla risposta.
-
-    Args:
-        focus: attore da inquadrare; se omesso lascia la camera dov'è.
-    """
-    try:
-        if focus:
-            await run(f"result = mcp_focus_actor({lit(focus)}, None)")
-
-        stato = await run("result = mcp_project_status()")
-        if isinstance(stato, dict):
-            stato["transport"] = _bridge.transport
-        attori = await run("result = mcp_find_actors(None, None)")
-    except Exception as exc:  # noqa: BLE001
-        # Un'eccezione qui farebbe sparire il pannello e l'utente vedrebbe
-        # solo un errore rosso: meglio renderizzarlo dentro la vista, dove
-        # resta accanto al bottone Aggiorna per riprovare.
-        return {"error": str(exc), "status": {}, "actors": [], "focused": focus}
-
-    return {
-        "error": None,
-        "status": stato if isinstance(stato, dict) else {},
-        "actors": attori if isinstance(attori, list) else [],
-        "focused": focus,
-    }
-
-
 @mcp.tool()
 async def ue_viewport_camera(
     yaw: float = 0.0,
@@ -1790,7 +1679,7 @@ async def ue_viewport_camera(
 
     Ruota attorno al punto che la camera sta guardando, invece di ruotare sul
     posto: è quello che serve per girare intorno a una scena senza perderla di
-    vista. Usato dai controlli del pannello viewport.
+    vista.
 
     Args:
         yaw, pitch: gradi di rotazione attorno al centro inquadrato.
@@ -1802,188 +1691,6 @@ async def ue_viewport_camera(
         f"result = mcp_orbit_camera({float(yaw)}, {float(pitch)}, {float(dolly)}, "
         f"{lit(view)}, {lit(distance)})"
     )
-
-
-@mcp.tool()
-async def ue_viewport_frame(width: int = 960, height: int = 540) -> FrameViewport:
-    """Cattura per il pannello viewport. **Non chiamarlo direttamente.**
-
-    Esiste separato da ue_viewport_panel per una ragione precisa: un PNG della
-    viewport pesa mezzo megabyte, e in base64 dentro un risultato di tool sono
-    circa 200.000 token. Nel pannello l'immagine la chiede la vista con una sua
-    chiamata, che non passa dal contesto del modello; se il risultato del
-    pannello contenesse il data URI, ogni apertura brucerebbe il contesto.
-
-    Se sei il modello e ti serve vedere la viewport, usa ue_screenshot: allega
-    il PNG come immagine vera, che costa una frazione del base64.
-
-    Args:
-        width, height: risoluzione della cattura.
-    """
-    try:
-        immagine, nota = await _cattura_data_uri(width, height)
-    except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc), "screenshot": None, "screenshot_note": None}
-    return {"error": None, "screenshot": immagine, "screenshot_note": nota}
-
-
-@mcp.resource(
-    ui.VIEWPORT_URI,
-    name="Pannello viewport",
-    description="Interfaccia interattiva del pannello viewport, servita all'host.",
-    mime_type=ui.UI_MIME,
-    meta={"ui": {"csp": ui.VIEWPORT_CSP}},
-)
-def resource_viewport_ui() -> str:
-    return ui.VIEWPORT_HTML
-
-
-# ============================================================= pannello contenuti
-
-#: Come le classi Unreal finiscono nelle categorie del pannello.
-#:
-#: Un pattern che comincia con "=" richiede il nome esatto, gli altri sono
-#: sottostringhe. La distinzione non è pedanteria: "World" come sottostringa
-#: cattura anche WorldDataLayers e WorldPartitionMiniMap, che sono oggetti
-#: interni di un livello e non livelli — e l'utente si ritrova righe che non
-#: può aprire. Dove il nome della classe è preciso si usa "=", dove è una
-#: famiglia (MaterialInstance, MaterialFunction...) serve la sottostringa.
-#:
-#: L'ordine conta: vince la prima categoria che combacia.
-CATEGORIE_ASSET: list[tuple[str, tuple[str, ...]]] = [
-    ("livelli", ("=World",)),
-    ("audio", ("Sound", "MetaSound", "Submix", "Dialogue")),
-    ("blueprint", ("Blueprint",)),
-    ("mesh", ("StaticMesh", "SkeletalMesh", "GeometryCollection")),
-    ("animazioni", ("Anim", "BlendSpace", "=Skeleton", "PhysicsAsset")),
-    ("materiali", ("Material",)),
-    ("texture", ("Texture", "RenderTarget")),
-    ("effetti", ("Niagara", "ParticleSystem", "=CascadeParticleSystem")),
-]
-
-
-def _combacia(classe: str, pattern: str) -> bool:
-    if pattern.startswith("="):
-        return classe.lower() == pattern[1:].lower()
-    return pattern.lower() in classe.lower()
-
-
-def _categoria(classe: str) -> str:
-    for nome, pattern in CATEGORIE_ASSET:
-        if any(_combacia(classe, p) for p in pattern):
-            return nome
-    return "altro"
-
-
-class PannelloContenuti(TypedDict):
-    """Risultato di ue_content_panel: solo il riassunto, mai l'elenco intero.
-
-    Un progetto vero ha migliaia di asset, e questo risultato passa dal
-    contesto del modello: l'elenco lo chiede la vista con ue_content_list.
-    """
-
-    error: str | None
-    project: str | None
-    totale: int
-    conteggi: dict[str, int]
-    levels: list[dict[str, Any]]
-
-
-class ElencoAsset(TypedDict):
-    """Risultato di ue_content_list."""
-
-    error: str | None
-    assets: list[dict[str, Any]]
-    totale: int
-    troncato: bool
-
-
-async def _tutti_gli_asset() -> list[dict[str, Any]]:
-    elenco = await run("result = mcp_list_assets('/Game', True, None)")
-    return elenco if isinstance(elenco, list) else []
-
-
-@mcp.tool(meta={"ui": {"resourceUri": ui.CONTENUTI_URI}})
-async def ue_content_panel() -> PannelloContenuti:
-    """Apre il pannello contenuti: livelli, audio e asset del progetto.
-
-    Come ue_viewport_panel, è una vista per l'occhio umano: l'host la
-    renderizza come MCP App dentro la chat, con le categorie navigabili.
-
-    Restituisce solo i conteggi e i livelli, che sono pochi e servono subito.
-    L'elenco degli asset lo chiede la vista con ue_content_list, così migliaia
-    di righe non passano dal contesto del modello.
-    """
-    try:
-        asset = await _tutti_gli_asset()
-        stato = await run("result = mcp_project_status()")
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "error": str(exc),
-            "project": None,
-            "totale": 0,
-            "conteggi": {},
-            "levels": [],
-        }
-
-    conteggi: dict[str, int] = {}
-    livelli: list[dict[str, Any]] = []
-    for voce in asset:
-        categoria = _categoria(str(voce.get("class", "")))
-        conteggi[categoria] = conteggi.get(categoria, 0) + 1
-        if categoria == "livelli":
-            livelli.append(voce)
-
-    progetto = None
-    if isinstance(stato, dict) and stato.get("project_file"):
-        progetto = Path(str(stato["project_file"])).stem
-
-    return {
-        "error": None,
-        "project": progetto,
-        "totale": len(asset),
-        "conteggi": conteggi,
-        # I livelli sono l'unica categoria quasi sempre corta, e sono ciò che
-        # si vuole vedere per primo aprendo un progetto.
-        "levels": sorted(livelli, key=lambda v: str(v.get("path", ""))),
-    }
-
-
-@mcp.tool()
-async def ue_content_list(
-    category: str | None = None, query: str | None = None, limit: int = 400
-) -> ElencoAsset:
-    """Elenco degli asset di una categoria. **Non chiamarlo direttamente.**
-
-    Serve al pannello contenuti, che lo interroga per riempire la colonna
-    dell'elenco. Su un progetto vero restituisce centinaia di righe: nel
-    contesto del modello sono token buttati, e per cercare un asset da agente
-    esiste ue_list_assets, che filtra per classe e per path.
-
-    Args:
-        category: una fra livelli, audio, blueprint, mesh, animazioni,
-            materiali, texture, effetti, altro. Se omessa le prende tutte.
-        query: sottostringa da cercare nel path.
-        limit: massimo di righe restituite.
-    """
-    try:
-        asset = await _tutti_gli_asset()
-    except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc), "assets": [], "totale": 0, "troncato": False}
-
-    trovati = [
-        v for v in asset
-        if (not category or _categoria(str(v.get("class", ""))) == category)
-        and (not query or query.lower() in str(v.get("path", "")).lower())
-    ]
-    trovati.sort(key=lambda v: str(v.get("path", "")))
-    tetto = max(1, int(limit))
-    return {
-        "error": None,
-        "assets": trovati[:tetto],
-        "totale": len(trovati),
-        "troncato": len(trovati) > tetto,
-    }
 
 
 class StatoLavori(TypedDict):
@@ -2003,7 +1710,6 @@ class StatoLavori(TypedDict):
 async def ue_jobs_status() -> StatoLavori:
     """Stato dei lavori lunghi avviati da questo MCP: build, packaging, render.
 
-    Il pannello contenuti lo interroga per mostrare la barra di avanzamento.
     Non solleva se un lavoro non è mai partito: risponde `running: false`, che
     è l'informazione che serve.
     """
@@ -2016,26 +1722,15 @@ async def ue_jobs_status() -> StatoLavori:
         try:
             lavori[nome] = await local_call(funzione, 0)
         except Exception as exc:  # noqa: BLE001
-            # Un lavoro mai avviato non è un errore da propagare: il pannello
-            # lo interroga ogni tre secondi, e sollevare farebbe lampeggiare
-            # un errore per una condizione del tutto normale.
+            # Un lavoro mai avviato non è un errore da propagare: chi
+            # interroga lo stato ciclicamente vedrebbe lampeggiare un errore
+            # per una condizione del tutto normale.
             lavori[nome] = {"running": False, "reason": str(exc)}
     return {
         "build": lavori["build"],
         "package": lavori["package"],
         "render": lavori["render"],
     }
-
-
-@mcp.resource(
-    ui.CONTENUTI_URI,
-    name="Pannello contenuti",
-    description="Interfaccia interattiva del pannello contenuti, servita all'host.",
-    mime_type=ui.UI_MIME,
-    meta={"ui": {"csp": ui.VIEWPORT_CSP}},
-)
-def resource_contenuti_ui() -> str:
-    return ui.CONTENUTI_HTML
 
 
 # ================================================================== networking
@@ -4049,9 +3744,8 @@ except ImportError:
 def main() -> None:
     """Entry point. Stdio di default, HTTP con --http o UE_MCP_HTTP=1.
 
-    Lo stdio copre tutti i client che lanciano il server in locale, pannello
-    viewport compreso: le MCP App sono indipendenti dal trasporto. L'HTTP serve
-    solo a claude.ai sul web, che girando sui server di Anthropic non può
+    Lo stdio copre tutti i client che lanciano il server in locale. L'HTTP
+    serve solo a claude.ai sul web, che girando sui server di Anthropic non può
     raggiungere questa macchina se non attraverso un URL pubblico.
 
     Attenzione a cosa si espone: questo server offre `ue_exec_python`, cioè

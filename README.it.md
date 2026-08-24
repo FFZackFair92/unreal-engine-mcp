@@ -236,65 +236,25 @@ ue_engine_list  →  ue_project_create  →  ue_editor_open  →  ue_status
 
 Elenco completo dei parametri in [docs/TOOLS.it.md](docs/TOOLS.it.md).
 
-### Il pannello viewport dentro la chat
+### Raggiungere il server da claude.ai sul web
 
-`ue_viewport_panel` non risponde con del testo: è una [MCP App](https://modelcontextprotocol.io/extensions/apps/overview),
-cioè una vista HTML che l'host renderizza in un iframe dentro la conversazione.
-Cattura della viewport, elenco degli attori cliccabile per inquadrarli, filtro
-per nome o classe, e un bottone che riaggiorna il tutto senza passare dal
-modello.
-
-Per la verifica visiva mentre l'agente costruisce una scena resta più
-economico `ue_screenshot`, che allega il PNG direttamente alla risposta: il
-pannello è per te, lo screenshot è per il modello.
-
-**Su Claude Desktop non serve fare niente:** il pannello funziona sul server
-locale in stdio, con la stessa configurazione che usi già. Apri il progetto in
-Unreal e chiedi il pannello viewport.
-
-Funziona anche **completamente offline**: l'helper JavaScript è vendorizzato in
-`src/unreal_mcp/vendor/`, la pagina non scarica niente e la CSP della risorsa
-non autorizza nessuna origine esterna. Per aggiornare l'helper a una nuova
-versione: `python scripts/vendor_ext_apps.py`.
-
-Il tunnel qui sotto serve **solo per claude.ai sul web**, che al tuo computer
-non può arrivare. Se usi Claude Desktop, salta al paragrafo successivo.
-
-```bash
-python scripts/tunnel.py
-```
-
-Avvia il server in HTTP su `127.0.0.1:8000`, ci apre sopra un tunnel
-cloudflared (usa il binario se c'è, altrimenti `npx cloudflared`) e stampa
-l'URL da incollare in **Impostazioni → Connettori → Connettore
-personalizzato**, già con il suffisso `/mcp`. Ctrl-C chiude tutto.
-
-Quell'URL però è casuale e cambia a ogni riavvio, quindi il connettore va
-rifatto ogni volta. Con un dominio sul DNS di Cloudflare l'indirizzo diventa
-stabile e lo incolli una volta sola:
-
-```bash
-python scripts/tunnel.py --hostname unreal.tuodominio.com
-```
-
-Al primo avvio apre il browser per l'autorizzazione, crea il tunnel e il
-record DNS; dalle volte dopo riparte in silenzio sullo stesso indirizzo. In
-questa modalità il server stringe anche gli `Host` ammessi a quell'unico
-hostname, invece di accettarli tutti.
-
-> **Il tunnel pubblica su Internet un server che espone `ue_exec_python`**,
-> cioè esecuzione di codice arbitrario dentro il tuo editor. L'URL temporaneo
-> di cloudflared non ha nessuna autenticazione davanti: tienilo aperto il
-> tempo della prova e non condividerlo. Su un tunnel nominato, metti
-> [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
-> davanti all'hostname prima di lasciarlo attivo.
-
-Il server accetta `--http` anche da solo, se preferisci gestirti il tunnel a
-mano:
+I client locali lanciano il server in stdio e non serve altro. claude.ai gira
+sui server di Anthropic, che al tuo computer non arrivano: gli serve un endpoint
+HTTP e un tunnel tuo davanti.
 
 ```bash
 python -m unreal_mcp.server --http
 ```
+
+Si lega a `127.0.0.1:8000`; l'URL da incollare in **Impostazioni → Connettori →
+Aggiungi connettore personalizzato** è l'indirizzo pubblico del tunnel con
+`/mcp` in fondo.
+
+> **Un tunnel pubblica su Internet un server che espone `ue_exec_python`**,
+> cioè esecuzione di codice arbitrario dentro il tuo editor. Tienilo su per il
+> tempo della prova e non condividerlo, oppure metti
+> [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+> (o equivalente) davanti al dominio prima di lasciarlo acceso.
 
 ### Aggirare il limite sui grafi Blueprint
 

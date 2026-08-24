@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`ue_start_pie(mode=...)`** — `"play"` (default) or `"simulate"`. Simulate
   is still reachable on purpose, for watching physics or AI with no player.
   An unknown mode is rejected instead of silently falling back.
+- **HTTP transport** — `python -m unreal_mcp.server --http` binds
+  `127.0.0.1:8000` for hosts that cannot launch the server themselves, such as
+  claude.ai on the web. `UE_MCP_ALLOWED_HOSTS` narrows the accepted `Host`
+  headers. Put your own tunnel and your own authentication in front of it:
+  this server exposes `ue_exec_python`.
 
 ## [0.10.0] — 2026-07-31
 
