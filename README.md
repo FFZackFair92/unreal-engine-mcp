@@ -284,15 +284,24 @@ custom connector** is the tunnel's public address with `/mcp` appended.
 > [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
 > (or equivalent) in front of the hostname before leaving it running.
 
-### Working around the Blueprint graph limit
+### Authoring Blueprint graphs
 
-**Blueprint node graphs cannot be authored from Python.** `EdGraph.Nodes` is
-protected, pins are not exposed and there is no linking API — this is a hard
-limit of the engine, not of this server. Details in
-[docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+**Blueprint node graphs are scriptable on UE 5.8+.** Start with
+`ue_bp_graph_info`, which returns the node object names every other tool takes
+as a key, then `ue_bp_add_call_function`, `ue_bp_add_branch`,
+`ue_bp_add_custom_event`, `ue_bp_add_variable_node`, or
+`ue_bp_add_node_by_name` with `ue_bp_list_palette` for anything else. Wire with
+`ue_bp_connect`, set literals with `ue_bp_set_pin_value`. Event nodes are
+addressed by the alias `event:ReceiveBeginPlay`.
 
-What works instead: **put the logic in a C++ parent class.** The Blueprint stays
-the container for components and tweakable values; the behaviour is inherited.
+`EdGraph.Nodes` is still protected and pins are still unexposed — the route is
+`unreal.BlueprintGraphEditor`, which edits the graph from the outside the way
+the editor does. Details in [docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+
+**Check `ue_status` → `capabilities.blueprint_graph_authoring` first.** On an
+engine without that API the tools fail with an explanation, and the older route
+still applies: **put the logic in a C++ parent class.** The Blueprint stays the
+container for components and tweakable values; the behaviour is inherited.
 
 ```
 ue_cpp_class_create      # writes the class, and the whole C++ module if the
@@ -308,8 +317,8 @@ absorbed by it, so values set in the editor survive the move. Functions marked
 `BlueprintCallable` become callable from the graph — an agent can build the
 vocabulary the designer then wires up by hand.
 
-Material graphs, unlike Blueprint graphs, *are* fully scriptable:
-`ue_create_material` really does create and connect the nodes.
+Material graphs are fully scriptable too: `ue_create_material` really does
+create and connect the nodes.
 
 ### Other limits
 

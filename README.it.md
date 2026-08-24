@@ -256,16 +256,24 @@ Aggiungi connettore personalizzato** è l'indirizzo pubblico del tunnel con
 > [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
 > (o equivalente) davanti al dominio prima di lasciarlo acceso.
 
-### Aggirare il limite sui grafi Blueprint
+### Costruire i grafi Blueprint
 
-**I grafi Blueprint non si possono costruire da Python.** `EdGraph.Nodes` è
-protetta, i pin non sono esposti e non esiste un'API per collegarli: è un limite
-del motore, non di questo server. Dettagli in
-[docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+**Su UE 5.8+ i grafi Blueprint si scrivono da Python.** Si parte da
+`ue_bp_graph_info`, che restituisce i nomi oggetto dei nodi usati come chiave da
+tutti gli altri tool, poi `ue_bp_add_call_function`, `ue_bp_add_branch`,
+`ue_bp_add_custom_event`, `ue_bp_add_variable_node`, oppure
+`ue_bp_add_node_by_name` con `ue_bp_list_palette` per qualsiasi altro nodo. I
+fili con `ue_bp_connect`, i letterali con `ue_bp_set_pin_value`. Gli eventi si
+indirizzano con l'alias `event:ReceiveBeginPlay`.
 
-Quello che funziona: **mettere la logica in una classe C++ padre.** Il Blueprint
-resta il contenitore di componenti e valori regolabili, il comportamento si
-eredita.
+`EdGraph.Nodes` resta protetta e i pin restano non esposti: la via è
+`unreal.BlueprintGraphEditor`, che modifica il grafo dall'esterno come fa
+l'editor. Dettagli in [docs/UNREAL-NOTES.md](docs/UNREAL-NOTES.md).
+
+**Controlla prima `ue_status` → `capabilities.blueprint_graph_authoring`.** Su un
+motore senza quell'API i tool falliscono spiegandolo, e resta valida la via
+vecchia: **mettere la logica in una classe C++ padre.** Il Blueprint resta il
+contenitore di componenti e valori regolabili, il comportamento si eredita.
 
 ```
 ue_cpp_class_create      # scrive la classe, e l'intero modulo C++ se il
@@ -281,8 +289,8 @@ vengono assorbite, quindi i valori impostati nell'editor sopravvivono al
 passaggio. Le funzioni `BlueprintCallable` diventano nodi richiamabili dal
 grafo: l'agente costruisce il vocabolario che poi il designer collega a mano.
 
-I grafi *materiale*, a differenza di quelli Blueprint, sono pienamente
-programmabili: `ue_create_material` crea e collega davvero i nodi.
+Anche i grafi materiale sono pienamente programmabili: `ue_create_material` crea
+e collega davvero i nodi.
 
 ### Altri limiti
 

@@ -80,16 +80,33 @@ pin.import_text('(PinCategory="object",PinSubCategoryObject="/Script/Engine.Acto
 pin.import_text('(PinCategory="struct",PinSubCategoryObject="/Script/CoreUObject.Vector")')
 ```
 
-## Blueprint node graphs cannot be authored from Python
+## Blueprint node graphs are scriptable — but not through `EdGraph.Nodes`
 
 `EdGraph.Nodes` is protected, `EdGraphPin` is not exposed, K2 node classes can be
-instantiated but not inserted into a graph, and there is no pin-linking API.
-Variables, components and defaults are scriptable; **logic is not**.
+instantiated but not inserted into a graph, and there is no pin-linking API. All
+of that is still true, and until 0.8.0 this note concluded from it that logic
+could not be authored from Python.
 
-The way around it is not to script the graph but to avoid needing one: generate
-a C++ parent class, compile, and reparent the Blueprint onto it. The Blueprint
-keeps its components and its editor-set values; the behaviour is inherited.
-`UFUNCTION(BlueprintCallable)` members then show up as nodes a human can wire.
+The conclusion was wrong, and the way it was wrong is worth keeping. The facts
+were right; the deduction — that going through `Nodes` was the only route — was
+not. **UE 5.8 exposes `unreal.BlueprintGraphEditor`**, a class that manipulates
+the graph from the outside the way the editor itself does, never touching
+`Nodes`. It went unfound because the search was for how to *read a protected
+property*, not for who *edits a graph*.
+
+The tools are `ue_bp_graph_info` (start here: it returns the node object names
+every other tool takes as a key), `ue_bp_add_call_function`, `ue_bp_add_branch`,
+`ue_bp_add_custom_event`, `ue_bp_add_variable_node`, `ue_bp_add_node_by_name`
+with `ue_bp_list_palette`, then `ue_bp_connect`, `ue_bp_break_pin`,
+`ue_bp_set_pin_value` and `ue_bp_remove_node`. Event nodes are addressed by the
+alias `event:ReceiveBeginPlay`.
+
+**Check `ue_status` → `capabilities.blueprint_graph_authoring` first.** On
+engines without that API the tools fail with an explanation rather than an
+`AttributeError`, and the old route is still the answer there: generate a C++
+parent class, compile, and reparent the Blueprint onto it. The Blueprint keeps
+its components and its editor-set values, the behaviour is inherited, and
+`UFUNCTION(BlueprintCallable)` members show up as nodes a human can wire.
 
 ## Material graphs, unlike Blueprint graphs, *are* scriptable
 

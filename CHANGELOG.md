@@ -4,7 +4,10 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.0] — 2026-08-24
+
+Il vault Fab arriva dentro il progetto, e due modi in cui il server smetteva di
+rispondere.
 
 ### Fixed
 
@@ -53,6 +56,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   claude.ai on the web. `UE_MCP_ALLOWED_HOSTS` narrows the accepted `Host`
   headers. Put your own tunnel and your own authentication in front of it:
   this server exposes `ue_exec_python`.
+
+### Fixed — the server could stop answering
+
+- **`_run_legendary` passed the JSON-RPC pipe to its child.** This server speaks
+  MCP over stdio, so its stdin *is* the protocol: `subprocess.run` without an
+  explicit `stdin` let `legendary` inherit it, and any prompt left the child
+  waiting on a stream that would never speak while eating the protocol's bytes.
+  The tool never returned and no error appeared anywhere, while the same command
+  answered in 3.18 s from a terminal. Now `stdin=subprocess.DEVNULL`, and so do
+  the other thirteen child-process spawns in `local.py`: a server on stdio must
+  never hand its own pipe to a child, and the rule reads better with no
+  exceptions to remember.
+- **Timeouts longer than any client's made that failure invisible.** 300 s for
+  the vault meant a fault did not produce a readable error, it produced
+  disappearance — the client gave up first and the real message never arrived.
+  Now `VAULT_TIMEOUT = 150` and `STATUS_TIMEOUT = 30`.
+- **`local_call` ran blocking work on the event loop**, for 24 tools. Until it
+  returned the server answered nothing at all: one `ue_build_status` on a large
+  log was enough to time out unrelated calls. `bridge.py` already used
+  `asyncio.to_thread`; this was the missing half.
+
+### Changed
+
+- **The Blueprint graph limit is gone from the docs.** README and
+  `docs/UNREAL-NOTES.md` still said node graphs could not be authored from
+  Python, which 0.8.0 disproved — the server's own instructions had said the
+  opposite since then. An instruction that has become false is worse than none:
+  an agent gives up on a tool that works.
 
 ## [0.10.0] — 2026-07-31
 

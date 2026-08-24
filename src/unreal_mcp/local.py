@@ -1299,7 +1299,7 @@ def start_build(
     if platform_module_is_windows():
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
-    process = subprocess.Popen(args, **kwargs)  # noqa: S603
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, **kwargs)  # noqa: S603
     state = {
         "pid": process.pid,
         "uproject": str(path),
@@ -1597,7 +1597,7 @@ def start_render(
     if platform_module_is_windows():
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
-    process = subprocess.Popen(args, **kwargs)  # noqa: S603
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, **kwargs)  # noqa: S603
     state = {
         "pid": process.pid,
         "uproject": str(path),
@@ -1817,7 +1817,7 @@ def start_package(
     if platform.system() == "Windows":
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
 
-    process = subprocess.Popen(args, **kwargs)  # noqa: S603
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, **kwargs)  # noqa: S603
     state = {
         "pid": process.pid,
         "uproject": str(path),
@@ -1904,7 +1904,7 @@ def _process_alive(pid: int) -> bool:
         if platform.system() == "Windows":
             output = subprocess.run(  # noqa: S603
                 ["tasklist", "/FI", "PID eq %d" % pid],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL
             ).stdout
             return str(pid) in output
         os.kill(pid, 0)
@@ -1976,7 +1976,7 @@ def launch_editor(
     else:
         kwargs["start_new_session"] = True
 
-    process = subprocess.Popen(args, **kwargs)  # noqa: S603
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, **kwargs)  # noqa: S603
     _save_state({"pid": process.pid, "uproject": str(path), "started_at": time.time()})
     return {
         "pid": process.pid,
@@ -2004,7 +2004,7 @@ def process_running_by_name(name: str) -> bool:
         if platform.system() == "Windows":
             output = subprocess.run(  # noqa: S603
                 ["tasklist", "/FI", "IMAGENAME eq %s" % name],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL
             )
             testo = ((output.stdout or "") + (output.stderr or "")).lower()
             return any(v.lower() in testo for v in varianti)
@@ -2013,7 +2013,7 @@ def process_running_by_name(name: str) -> bool:
         # compilazione passava sempre, e il build falliva più avanti.
         for variante in varianti:
             output = subprocess.run(  # noqa: S603
-                ["pgrep", "-f", variante], capture_output=True, text=True, timeout=20
+                ["pgrep", "-f", variante], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL
             )
             if output.returncode == 0 and (output.stdout or "").strip():
                 return True
@@ -2029,12 +2029,12 @@ def terminate_process_by_name(name: str) -> bool:
     try:
         if platform.system() == "Windows":
             subprocess.run(  # noqa: S603
-                ["taskkill", "/F", "/IM", name], capture_output=True, timeout=30
+                ["taskkill", "/F", "/IM", name], capture_output=True, timeout=30, stdin=subprocess.DEVNULL
             )
         else:
             for variante in _process_name_variants(name):
                 subprocess.run(  # noqa: S603
-                    ["pkill", "-f", variante], capture_output=True, timeout=30
+                    ["pkill", "-f", variante], capture_output=True, timeout=30, stdin=subprocess.DEVNULL
                 )
         return True
     except Exception:  # noqa: BLE001
@@ -2180,11 +2180,11 @@ def list_processes_with_cmdline() -> list[dict]:
                     "Get-CimInstance Win32_Process | "
                     "ForEach-Object { \"$($_.ProcessId),$($_.Name),$($_.CommandLine)\" }",
                 ],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL
             ).stdout
             return _parse_windows_process_list(uscita)
         uscita = subprocess.run(
-            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=30
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
         ).stdout
         return _parse_posix_process_list(uscita)
     except Exception:  # noqa: BLE001
@@ -2233,7 +2233,7 @@ def clear_build_locks(
                 if platform.system() == "Windows":
                     subprocess.run(  # noqa: S603
                         ["taskkill", "/PID", str(processo["pid"]), "/T", "/F"],
-                        capture_output=True, timeout=30,
+                        capture_output=True, timeout=30, stdin=subprocess.DEVNULL
                     )
                 else:
                     os.kill(processo["pid"], 9)
@@ -2286,7 +2286,7 @@ def kill_editor(timeout: float = 30.0) -> dict:
         return {"killed": False, "reason": "nessun editor avviato da questo MCP risulta attivo"}
 
     if platform.system() == "Windows":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)  # noqa: S603
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30, stdin=subprocess.DEVNULL)  # noqa: S603
     else:
         os.kill(pid, 15)
 

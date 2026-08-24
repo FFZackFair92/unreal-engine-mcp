@@ -441,9 +441,11 @@ def _run_legendary(args: list[str], timeout: float = 900.0) -> str:
     2026-08-23: `legendary status --json` 3,18 s a mano, mai una risposta dal
     tool.
 
-    Nota: in `local.py` ci sono altri quattordici punti che lanciano processi
-    figli senza `stdin` esplicito. Non hanno mai dato problemi — molti sono
-    DETACHED e nessuno legge stdin — ma il meccanismo e' lo stesso.
+    Non e' un caso isolato: in `local.py` ci sono altri tredici punti che
+    lanciano processi figli, e sono stati chiusi tutti allo stesso modo. Nessuno
+    aveva mai dato problemi — molti sono DETACHED e non leggono stdin — ma un
+    server su stdio non deve mai passare la propria pipe a un figlio, e la
+    regola vale meglio senza eccezioni da ricordare.
     """
     executable = _legendary_path()
     if executable is None:
