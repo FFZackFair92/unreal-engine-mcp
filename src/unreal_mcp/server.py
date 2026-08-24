@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -99,10 +100,24 @@ async def run(code: str) -> Any:
         raise RuntimeError(str(exc)) from exc
 
 
-def local_call(func, *args, **kwargs):
-    """Esegue un'operazione locale traducendo LocalError/AssetError in errori MCP."""
+async def local_call(func, *args, **kwargs):
+    """Esegue un'operazione locale su un thread, traducendo LocalError/AssetError.
+
+    ## Perche' `to_thread` e non una chiamata diretta
+
+    `func` e' codice **bloccante**: `subprocess.run` su UnrealBuildTool, letture
+    di log da centinaia di MB, `legendary` che parla con i server Epic. Chiamarlo
+    dentro una coroutine lo esegue sull'event loop, e finche' non ritorna il
+    server **non risponde a nessun altro tool** — non e' il singolo tool a essere
+    lento, e' tutto fermo. Con 24 tool che passano di qui, un solo
+    `ue_build_status` su un log grosso bastava a far scadere per timeout
+    chiamate che non c'entravano niente.
+
+    `bridge.py` faceva gia' la cosa giusta con `asyncio.to_thread`: questa e' la
+    meta' che mancava.
+    """
     try:
-        return func(*args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
     except (local.LocalError, assets.AssetError) as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -133,12 +148,25 @@ async def _attendi_job(
     arriva al client come notifica.
     """
     scadenza = asyncio.get_event_loop().time() + wait_seconds
-    stato = leggi_stato()
+    async def stato_ora() -> dict:
+        """Legge lo stato, che `leggi_stato` sia sincrona o una coroutine.
+
+        Da quando `local_call` e' passata a `asyncio.to_thread`, le closure che
+        i tool build/package/render passano qui sono `async def`. Ma
+        `_attendi_job` prende una callable qualsiasi, e chi la chiama con una
+        funzione normale ha ragione: **il contratto non e' cambiato**, si e'
+        allargato. Piegare i chiamanti per un dettaglio interno sarebbe stato il
+        verso sbagliato.
+        """
+        esito = leggi_stato()
+        return await esito if inspect.isawaitable(esito) else esito
+
+    stato = await stato_ora()
     await _progress(ctx, 0, wait_seconds, "%s: avviato" % etichetta)
 
     while stato.get("running") and asyncio.get_event_loop().time() < scadenza:
         await asyncio.sleep(min(5.0, max(1.0, wait_seconds / 60)))
-        stato = leggi_stato()
+        stato = await stato_ora()
         trascorso = stato.get("elapsed_seconds") or 0
         await _progress(
             ctx,
@@ -165,7 +193,7 @@ async def ue_engine_list() -> dict:
     Cerca in: variabile UE_MCP_ENGINE_DIRS, elenco dell'Epic Games Launcher,
     registro di Windows. Da chiamare per prima quando non c'è ancora un progetto.
     """
-    engines = local_call(local.find_engines)
+    engines = await local_call(local.find_engines)
     return {
         "count": len(engines),
         "engines": [e.as_dict() for e in engines],
@@ -178,8 +206,8 @@ async def ue_engine_templates(
     engine_version: str | None = None, engine_root: str | None = None
 ) -> dict:
     """Elenca i template ufficiali disponibili nell'installazione (TP_Blank, TP_ThirdPerson, ...)."""
-    engine = local_call(local.resolve_engine, engine_version, engine_root)
-    return {"engine": engine.version, "templates": local_call(local.list_templates, engine)}
+    engine = await local_call(local.resolve_engine, engine_version, engine_root)
+    return {"engine": engine.version, "templates": await local_call(local.list_templates, engine)}
 
 
 @mcp.tool()
@@ -216,7 +244,7 @@ async def ue_project_create(
         engine_root: percorso del motore, quando la ricerca automatica non lo trova
             (es. "C:/Program Files/Epic Games/UE_5.8").
     """
-    return local_call(
+    return await local_call(
         local.create_project,
         name=name,
         directory=directory,
@@ -235,14 +263,14 @@ async def ue_project_create(
 @mcp.tool()
 async def ue_project_find(directory: str, max_depth: int = 3) -> dict:
     """Cerca file .uproject sotto una cartella."""
-    projects = local_call(local.find_projects, directory, max_depth)
+    projects = await local_call(local.find_projects, directory, max_depth)
     return {"count": len(projects), "projects": projects}
 
 
 @mcp.tool()
 async def ue_project_info(uproject: str) -> dict:
     """Legge un .uproject: versione motore associata, plugin attivi e se il bridge è pronto."""
-    return local_call(local.project_info, uproject)
+    return await local_call(local.project_info, uproject)
 
 
 @mcp.tool()
@@ -254,7 +282,7 @@ async def ue_project_set_plugins(
     Per usare il bridge servono almeno `PythonScriptPlugin` e `RemoteControl`.
     L'editor va riavviato se era già aperto.
     """
-    return local_call(local.set_project_plugins, uproject, enable, disable)
+    return await local_call(local.set_project_plugins, uproject, enable, disable)
 
 
 @mcp.tool()
@@ -289,7 +317,7 @@ async def ue_editor_open(
     # L'editor riparte da zero: gli helper installati nella sessione precedente
     # non ci sono più.
     _bridge.forget_helpers()
-    launched = local_call(
+    launched = await local_call(
         local.launch_editor, uproject, engine_version, extra_args, engine_root, skip_module_check
     )
 
@@ -368,7 +396,7 @@ async def ue_cpp_class_create(
         with_tick: abilita il Tick (di default è spento, come conviene).
         force: sovrascrive i file se esistono già.
     """
-    return local_call(
+    return await local_call(
         local.create_cpp_class,
         uproject=uproject,
         class_name=class_name,
@@ -408,7 +436,7 @@ async def ue_build_start(
             quando la precedente è rimasta bloccata e ne hai chiuso i processi:
             due Build.bat insieme si accodano sullo stesso mutex.
     """
-    return local_call(
+    return await local_call(
         local.start_build,
         uproject,
         engine_version,
@@ -436,12 +464,12 @@ async def ue_build_status(
             limite, riportando l'avanzamento, invece di restituire subito. Una
             build completa dura minuti: meglio un'attesa sola che venti letture.
     """
-    def leggi() -> dict:
-        return local_call(local.build_status, tail_lines, uproject)
+    async def leggi() -> dict:
+        return await local_call(local.build_status, tail_lines, uproject)
 
     if wait_seconds > 0:
         return await _attendi_job(leggi, wait_seconds, ctx, "compilazione")
-    return leggi()
+    return await leggi()
 
 
 @mcp.tool()
@@ -491,7 +519,7 @@ async def ue_package_start(
         engine_root: percorso del motore, se la ricerca automatica non lo trova.
         target_platform: "Win64" | "Linux" | "Mac"; default la piattaforma corrente.
     """
-    return local_call(
+    return await local_call(
         local.start_package,
         uproject,
         engine_version,
@@ -522,12 +550,12 @@ async def ue_package_status(
         wait_seconds: se > 0 attende la fine del packaging fino a questo limite,
             riportando la fase corrente, invece di restituire subito.
     """
-    def leggi() -> dict:
-        return local_call(local.package_status, tail_lines, uproject)
+    async def leggi() -> dict:
+        return await local_call(local.package_status, tail_lines, uproject)
 
     if wait_seconds > 0:
         return await _attendi_job(leggi, wait_seconds, ctx, "packaging")
-    return leggi()
+    return await leggi()
 
 
 @mcp.tool()
@@ -555,13 +583,13 @@ async def ue_build_unblock(
         engine_version, engine_root: quale motore, per sapere quale file di
             lock controllare (`%TMP%\\<percorso di Build.bat>.lock`).
     """
-    return local_call(local.clear_build_locks, dry_run, engine_version, engine_root)
+    return await local_call(local.clear_build_locks, dry_run, engine_version, engine_root)
 
 
 @mcp.tool()
 async def ue_editor_status() -> dict:
     """Stato del processo editor avviato da questo MCP e del bridge Remote Control."""
-    process = local_call(local.editor_status)
+    process = await local_call(local.editor_status)
     try:
         await _bridge.info()
         bridge_ready = True
@@ -596,13 +624,13 @@ result = True
             )
             await asyncio.sleep(3)
             _bridge.forget_helpers()
-            return {"closed": True, "mode": "clean", "saved": save_all, **local_call(local.editor_status)}
+            return {"closed": True, "mode": "clean", "saved": save_all, **await local_call(local.editor_status)}
         except (UnrealBridgeError, RuntimeError) as exc:
             fallback_reason = str(exc)
     else:
         fallback_reason = "force=True"
 
-    killed = local_call(local.kill_editor)
+    killed = await local_call(local.kill_editor)
     _bridge.forget_helpers()
     return {
         "closed": killed.get("killed", False),
@@ -623,7 +651,7 @@ async def preset_library_list(
 
     I percorsi restituiti si passano direttamente a ue_import_assets.
     """
-    files = local_call(assets.list_library, subfolder, extensions)
+    files = await local_call(assets.list_library, subfolder, extensions)
     return {"library": str(assets.library_dir()), "count": len(files), "files": files[:300]}
 
 
@@ -638,14 +666,14 @@ async def preset_download_url(
     downloaded = await assets.download_file(url, destination, filename)
     result: dict[str, Any] = {"download": downloaded}
     if extract and downloaded["file"].lower().endswith((".zip", ".tar", ".tar.gz", ".tgz")):
-        result["extracted"] = local_call(assets.extract_archive, downloaded["file"])
+        result["extracted"] = await local_call(assets.extract_archive, downloaded["file"])
     return result
 
 
 @mcp.tool()
 async def preset_extract_archive(archive: str, destination: str | None = None) -> dict:
     """Estrae un archivio zip/tar già presente sul disco (i .rar non sono supportati)."""
-    return local_call(assets.extract_archive, archive, destination)
+    return await local_call(assets.extract_archive, archive, destination)
 
 
 @mcp.tool()
@@ -727,7 +755,7 @@ async def preset_fab_list_vault() -> dict:
     (`pip install legendary-gl` + `legendary auth`). Senza di esso il tool
     spiega come procedere dall'Epic Games Launcher.
     """
-    return local_call(assets.fab_list_vault)
+    return await local_call(assets.fab_list_vault)
 
 
 @mcp.tool()
@@ -737,7 +765,7 @@ async def preset_fab_download(app_name: str, destination: str | None = None) -> 
     Args:
         app_name: identificativo restituito da preset_fab_list_vault.
     """
-    return local_call(assets.fab_download, app_name, destination)
+    return await local_call(assets.fab_download, app_name, destination)
 
 
 # =============================================================== editor / stato
@@ -1313,7 +1341,7 @@ async def ue_render_sequence(
         resolution: [larghezza, altezza]; default [1920, 1080].
         force: avvia anche se risulta già un render in corso.
     """
-    return local_call(
+    return await local_call(
         local.start_render,
         uproject,
         sequence,
@@ -1346,12 +1374,12 @@ async def ue_render_status(
         wait_seconds: se > 0 attende la fine fino a questo limite riportando
             l'avanzamento, invece di restituire subito.
     """
-    def leggi() -> dict:
-        return local_call(local.render_status, tail_lines, uproject)
+    async def leggi() -> dict:
+        return await local_call(local.render_status, tail_lines, uproject)
 
     if wait_seconds > 0:
         return await _attendi_job(leggi, wait_seconds, ctx, "render")
-    return leggi()
+    return await leggi()
 
 
 # ================================================================ viewport

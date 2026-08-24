@@ -382,7 +382,33 @@ def _legendary_path() -> str | None:
     return shutil.which("legendary")
 
 
+# Quanto si aspetta `legendary` prima di arrendersi. Il valore precedente era
+# 300 s, cioe' **piu' lungo del timeout di qualsiasi client MCP**: quando
+# qualcosa andava storto il tool non falliva, spariva — il client mollava per
+# primo e l'errore vero non arrivava mai a destinazione. Meglio un errore
+# leggibile a 150 s che un silenzio a 300.
+VAULT_TIMEOUT = 150.0
+
+
 def _run_legendary(args: list[str], timeout: float = 900.0) -> str:
+    """Esegue `legendary` e ne restituisce lo stdout.
+
+    ## `stdin=DEVNULL` non e' pignoleria
+
+    Questo server parla MCP **su stdio**: il suo stdin e' la pipe JSON-RPC del
+    client. `subprocess.run` senza `stdin` esplicito fa ereditare quella pipe al
+    figlio — e se `legendary` prova a leggere una riga (una conferma, una
+    richiesta di credenziali, qualunque prompt) si mette in attesa su un flusso
+    che non gli parlera' mai, e nel frattempo **si mangia i byte del protocollo**.
+    Il sintomo e' un tool che non torna mai, senza un errore da nessuna parte,
+    mentre lo stesso comando da terminale risponde in tre secondi. Misurato il
+    2026-08-23: `legendary status --json` 3,18 s a mano, mai una risposta dal
+    tool.
+
+    Nota: in `local.py` ci sono altri quattordici punti che lanciano processi
+    figli senza `stdin` esplicito. Non hanno mai dato problemi — molti sono
+    DETACHED e nessuno legge stdin — ma il meccanismo e' lo stesso.
+    """
     executable = _legendary_path()
     if executable is None:
         raise AssetError(
@@ -395,7 +421,11 @@ def _run_legendary(args: list[str], timeout: float = 900.0) -> str:
             "dall'Epic Games Launcher (scheda Fab) e usa ue_import_assets."
         )
     result = subprocess.run(  # noqa: S603
-        [executable, *args], capture_output=True, text=True, timeout=timeout
+        [executable, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise AssetError(
@@ -407,7 +437,7 @@ def _run_legendary(args: list[str], timeout: float = 900.0) -> str:
 
 def fab_list_vault() -> dict:
     """Elenca il contenuto Unreal acquistato sull'account Epic (richiede legendary)."""
-    output = _run_legendary(["list", "--include-ue"], timeout=300)
+    output = _run_legendary(["list", "--include-ue"], timeout=VAULT_TIMEOUT)
     entries = []
     for line in output.splitlines():
         match = re.search(r"\*\s+(.+?)\s+\(App name:\s*([^,]+),\s*version:\s*([^)]*)\)", line)
