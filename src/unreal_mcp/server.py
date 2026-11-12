@@ -1136,9 +1136,19 @@ async def ue_spawn_actor(
 
 @mcp.tool()
 async def ue_list_actors(
-    name_contains: str | None = None, class_contains: str | None = None
+    name_contains: str | None = None,
+    class_contains: str | None = None,
+    tag: str | None = None,
 ) -> list[dict]:
-    """Elenca gli attori del livello corrente, con filtri opzionali su nome e classe."""
+    """Elenca gli attori del livello corrente, con filtri opzionali su nome, classe
+    e tag (i Tags dell'attore, vedi ue_actor_tags)."""
+    if tag is not None:
+        attori = await run(f"result = mcp_find_actors_by_tag({lit(tag)})")
+        n, c = (name_contains or "").lower(), (class_contains or "").lower()
+        return [
+            a for a in attori
+            if n in (a["label"] + a["name"]).lower() and c in a["class"].lower()
+        ]
     return await run(
         f"result = mcp_find_actors({lit(name_contains)}, {lit(class_contains)})"
     )
@@ -3495,6 +3505,205 @@ async def ue_sequence_open(sequence_path: str, close: bool = False) -> dict:
     I tool scrivono sull'asset e basta: questo è il modo di vedere il risultato
     senza cercare l'asset a mano nel Content Browser."""
     return await run(f"result = mcp_sequence_open({lit(sequence_path)}, {bool(close)})")
+
+
+# ============================================================ attori e livelli+
+# Fase 15: parità con ChiR24/Unreal_mcp su attori, ispezione, livelli ed editor.
+
+
+@mcp.tool()
+async def ue_actor_tags(
+    label: str, add: list[str] | None = None, remove: list[str] | None = None
+) -> dict:
+    """Legge e modifica i Tags di un attore (Details > Actor > Tags).
+
+    Senza add/remove restituisce solo i tag. I tag servono per ritrovare gruppi di
+    attori (ue_list_actors(tag=...)) e per la logica di gioco (Actor Has Tag).
+    """
+    return await run(f"result = mcp_actor_tags({lit(label)}, {lit(add)}, {lit(remove)})")
+
+
+@mcp.tool()
+async def ue_duplicate_actor(
+    label: str, new_label: str | None = None, offset: list[float] | None = None
+) -> dict:
+    """Duplica un attore piazzato (come Ctrl+D), con componenti e proprietà.
+
+    Args:
+        label: attore da copiare.
+        new_label: etichetta della copia nell'Outliner.
+        offset: spostamento [x,y,z] in cm rispetto all'originale (default nessuno).
+    """
+    return await run(
+        f"result = mcp_duplicate_actor({lit(label)}, {lit(new_label)}, {lit(offset)})"
+    )
+
+
+@mcp.tool()
+async def ue_set_actor_visibility(
+    label: str, hidden_in_game: bool | None = None, hidden_in_editor: bool | None = None
+) -> dict:
+    """Nasconde o mostra un attore.
+
+    hidden_in_game è la proprietà salvata (Actor Hidden In Game, vale in Play);
+    hidden_in_editor è il nascondi temporaneo della viewport (tasto H), non salvato.
+    """
+    return await run(
+        f"result = mcp_set_actor_visibility({lit(label)}, {lit(hidden_in_game)}, "
+        f"{lit(hidden_in_editor)})"
+    )
+
+
+@mcp.tool()
+async def ue_set_actor_folder(labels: list[str], folder: str) -> dict:
+    """Sposta attori in una cartella dell'Outliner (es. "Luci/Esterni").
+    folder vuoto = radice."""
+    return await run(f"result = mcp_set_actor_folder({lit(labels)}, {lit(folder)})")
+
+
+@mcp.tool()
+async def ue_select_actors(labels: list[str] | None = None, add: bool = False) -> dict:
+    """Seleziona attori nell'editor (senza labels: restituisce la selezione attuale).
+
+    add=True aggiunge alla selezione invece di sostituirla. La selezione è quella
+    che usano ue_focus_actor e i comandi dell'editor.
+    """
+    return await run(f"result = mcp_select_actors({lit(labels)}, {lit(add)})")
+
+
+@mcp.tool()
+async def ue_raycast(
+    start: list[float],
+    end: list[float] | None = None,
+    direction: list[float] | None = None,
+    distance: float = 100000.0,
+) -> dict:
+    """Line trace nel livello: cosa c'è tra due punti, o lungo una direzione.
+
+    Restituisce punto d'impatto, normale, distanza e attore colpito. Serve per
+    piazzare cose sulle superfici, verificare la linea di vista, misurare.
+
+    Args:
+        start: punto di partenza [x,y,z] in cm.
+        end: punto d'arrivo; in alternativa `direction` + `distance`.
+        direction: direzione [x,y,z] (default verso il basso).
+    """
+    return await run(
+        f"result = mcp_raycast({lit(start)}, {lit(end)}, {lit(direction)}, {lit(distance)})"
+    )
+
+
+@mcp.tool()
+async def ue_snap_to_floor(
+    labels: list[str], z_offset: float = 0.0, max_drop: float = 100000.0
+) -> dict:
+    """Appoggia gli attori sulla superficie sotto di loro.
+
+    Corregge sia gli attori sospesi sia quelli sprofondati nel pavimento: il
+    raggio parte 5 m sopra l'attore e ignora l'attore stesso. Usa il pivot
+    dell'attore: per mesh col pivot al centro passa z_offset (metà altezza).
+    """
+    return await run(
+        f"result = mcp_snap_to_floor({lit(labels)}, {lit(z_offset)}, {lit(max_drop)})"
+    )
+
+
+@mcp.tool()
+async def ue_get_actor_property(
+    label: str, names: list[str], component: str | None = None
+) -> dict:
+    """Legge proprietà di un attore piazzato o di un suo componente.
+
+    Il complemento di ue_set_actor_property: stessi nomi (snake_case della Python
+    API, es. "intensity", "static_mesh", "mobility"). Le proprietà che non esistono
+    finiscono in `failed` senza far fallire le altre.
+    """
+    return await run(
+        f"result = mcp_get_actor_property({lit(label)}, {lit(names)}, {lit(component)})"
+    )
+
+
+@mcp.tool()
+async def ue_call_actor_function(
+    label: str, function: str, args: list | None = None
+) -> dict:
+    """Chiama una funzione su un attore piazzato (funzione di Blueprint o
+    BlueprintCallable C++), con argomenti posizionali.
+
+    Utile per eventi "Call In Editor", per inizializzare attori procedurali, per
+    provare la logica senza Play. Vettori e asset si passano come in
+    ue_set_actor_property.
+    """
+    return await run(
+        f"result = mcp_call_actor_function({lit(label)}, {lit(function)}, {lit(args)})"
+    )
+
+
+@mcp.tool()
+async def ue_sublevels(
+    action: str = "list", level_path: str | None = None, streaming: str = "dynamic"
+) -> dict:
+    """Livelli in streaming del mondo corrente (finestra Levels).
+
+    action: 'list' | 'add' (aggiunge level_path come sublevel) | 'remove'.
+    streaming (per add): 'dynamic' (caricato da Blueprint/volumi) o 'always_loaded'.
+    """
+    action = action.lower()
+    if action == "list":
+        return await run("result = mcp_list_sublevels()")
+    if not level_path:
+        raise ValueError("Per add/remove serve level_path, es. /Game/Maps/L_Interni")
+    if action == "add":
+        return await run(f"result = mcp_add_sublevel({lit(level_path)}, {lit(streaming)})")
+    if action == "remove":
+        return await run(f"result = mcp_remove_sublevel({lit(level_path)})")
+    raise ValueError("action dev'essere list, add o remove")
+
+
+@mcp.tool()
+async def ue_build_lighting(quality: str = "preview", reflection_captures: bool = True) -> dict:
+    """Builda l'illuminazione statica (lightmap) del livello corrente.
+
+    quality: 'preview' | 'medium' | 'high' | 'production'. Serve solo per luci
+    Static/Stationary: con Lumen e luci Movable non c'è niente da buildare.
+    Su livelli grandi può richiedere minuti.
+    """
+    return await run(
+        f"result = mcp_build_lighting({lit(quality)}, {lit(reflection_captures)})"
+    )
+
+
+@mcp.tool()
+async def ue_cvar(name: str, value: str | float | int | None = None) -> dict:
+    """Legge (e, con value, imposta) una console variable, es. "r.ScreenPercentage",
+    "t.MaxFPS", "r.Lumen.DiffuseIndirect.Allow".
+
+    A differenza di ue_console_command restituisce il valore letto dal motore
+    (come float, int e bool), non solo il log.
+    """
+    return await run(f"result = mcp_cvar({lit(name)}, {lit(value)})")
+
+
+@mcp.tool()
+async def ue_undo(steps: int = 1, redo: bool = False) -> dict:
+    """Annulla (o ripete, con redo=True) le ultime operazioni dell'editor.
+
+    Ogni tool di questo server che modifica il livello apre una transazione,
+    quindi un passo = una chiamata a un tool.
+    """
+    comando = "TRANSACTION REDO" if redo else "TRANSACTION UNDO"
+    passi = max(1, min(int(steps), 50))
+    esiti = []
+    for _ in range(passi):
+        esiti.append(await run(f"result = mcp_console_command({lit(comando)}, 0.1)"))
+    return {"command": comando, "steps": passi, "log": esiti[-1].get("log_lines", [])}
+
+
+@mcp.tool()
+async def ue_open_asset(path: str) -> dict:
+    """Apre l'editor di un asset (Blueprint, materiale, sequenza, widget...)
+    come il doppio clic nel Content Browser."""
+    return await run(f"result = mcp_open_asset({lit(path)})")
 
 
 # ========================================================================== FLOW

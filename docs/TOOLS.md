@@ -1,6 +1,6 @@
 # Tool reference
 
-162 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+175 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
@@ -97,7 +97,7 @@ notifications, so a long build costs one round trip instead of twenty.
 |---|---|---|
 | `ue_spawn_actor` | `class_ref`, `location`, `rotation`, `scale`, `label` | Spawns from a class name, a `/Script/...` path, a Blueprint path, or a static mesh asset. The `label` is how other tools find it again. |
 | `ue_spawn_many` | `actors` | Spawns a list of actors in **one round trip and one undo transaction**. Each entry is `{class_ref, location, rotation, scale, label}`. A failing entry is reported without losing the rest. |
-| `ue_list_actors` | `name_contains`, `class_contains` | Lists level actors with optional filters. |
+| `ue_list_actors` | `name_contains`, `class_contains`, `tag` | Lists level actors with optional filters. |
 | `ue_set_actor_transform` | `label`, `location`, `rotation`, `scale` | Moves, rotates and scales an actor by label. |
 | `ue_set_actor_property` | `label`, `properties`, `component` | Sets properties on a **placed** actor or one of its components — a mesh, a light's intensity, a trigger radius. Vectors are `{"x":…}`, colours `{"r":…}`, and `/Game/...` strings are loaded as assets. |
 | `ue_list_actor_components` | `label` | Components of a placed actor, with name and class — tells you what to pass as `component` above. |
@@ -105,9 +105,31 @@ notifications, so a long build costs one round trip instead of twenty.
 | `ue_attach_actor` | `child_label`, `parent_label`, `socket`, `attach_rule` | Attaches one actor to another, so moving the parent moves the child. `attach_rule` is `KEEP_WORLD`, `KEEP_RELATIVE` or `SNAP_TO_TARGET`. |
 | `ue_detach_actor` | `label`, `keep_world` | Detaches an actor from its parent. |
 | `ue_actor_hierarchy` | `label` | Parent/child tree of the level actors, or of one subtree. |
+| `ue_actor_tags` | `label`, `add`, `remove` | Reads and edits an actor's Tags. Find them again with `ue_list_actors(tag=...)`. |
+| `ue_duplicate_actor` | `label`, `new_label`, `offset` | Duplicates a placed actor (like Ctrl+D), optionally offset by `[x,y,z]` cm. |
+| `ue_set_actor_visibility` | `label`, `hidden_in_game`, `hidden_in_editor` | *Actor Hidden In Game* (saved, applies in Play) and the temporary viewport hide (H key). |
+| `ue_set_actor_folder` | `labels`, `folder` | Moves actors into an Outliner folder (`"Lights/Outdoor"`; empty = root). |
+| `ue_select_actors` | `labels`, `add` | Sets the editor selection; with no labels, returns it. |
+| `ue_raycast` | `start`, `end` or `direction` + `distance` | Line trace in the level: impact point, normal, distance and actor hit. |
+| `ue_snap_to_floor` | `labels`, `z_offset`, `max_drop` | Drops actors onto the surface below them — fixes both floating actors and actors sunk into the floor (the ray starts 5 m above and ignores the actor itself). |
+| `ue_get_actor_property` | `label`, `names`, `component` | Reads properties of a placed actor or component — the counterpart of `ue_set_actor_property`. Missing names go to `failed`. |
+| `ue_call_actor_function` | `label`, `function`, `args` | Calls a Blueprint or BlueprintCallable function on a placed actor ("Call In Editor" events, procedural setup). |
 
 Actor edits are wrapped in `ScopedEditorTransaction`, so everything above is
 undoable with Ctrl+Z by whoever is watching the editor.
+
+## Levels and editor (editor)
+
+| Tool | Parameters | What it does |
+|---|---|---|
+| `ue_sublevels` | `action` (`list`/`add`/`remove`), `level_path`, `streaming` | Streaming levels of the current world (the Levels window). `streaming`: `dynamic` or `always_loaded`. |
+| `ue_build_lighting` | `quality`, `reflection_captures` | Builds static lighting (lightmaps): `preview`, `medium`, `high`, `production`. Only needed for Static/Stationary lights. |
+| `ue_cvar` | `name`, `value` | Reads (and with `value` sets) a console variable, returning the value the engine reports — unlike `ue_console_command`, which only returns the log. |
+| `ue_undo` | `steps`, `redo` | Undoes or redoes the last editor transactions. Every tool here that edits the level opens one, so one step = one tool call. |
+| `ue_open_asset` | `path` | Opens an asset's editor, like double-clicking it in the Content Browser. |
+
+These, and the actor tools above from `ue_actor_tags` on, were added in 0.12.0 after a
+comparison with [ChiR24/Unreal_mcp](https://github.com/ChiR24/Unreal_mcp).
 
 ## Blueprints (editor)
 

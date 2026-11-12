@@ -4,6 +4,27 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Attori e livelli: quello che c'era in [ChiR24/Unreal_mcp](https://github.com/ChiR24/Unreal_mcp)
+e mancava qui. 13 tool nuovi, 175 in tutto.
+
+### Added
+
+- **Actors:** `ue_actor_tags`, `ue_duplicate_actor`, `ue_set_actor_visibility`,
+  `ue_set_actor_folder`, `ue_select_actors`, `ue_get_actor_property` (the
+  counterpart of `ue_set_actor_property`), `ue_call_actor_function`.
+- **Placement:** `ue_raycast` (line trace with impact point, normal, actor hit) and
+  `ue_snap_to_floor`, which also fixes actors sunk into the floor.
+- **Levels and editor:** `ue_sublevels` (list/add/remove streaming levels),
+  `ue_build_lighting`, `ue_cvar` (reads the value back, not just the log),
+  `ue_undo`, `ue_open_asset`.
+- `ue_list_actors` accepts a `tag` filter.
+
+Not yet validated against a live editor: written on the same Python API calls
+used elsewhere in the project and covered by `tests/test_actors_levels.py`
+against `fake_unreal`.
+
 ## [0.11.0] — 2026-08-24
 
 Il vault Fab arriva dentro il progetto, e due modi in cui il server smetteva di

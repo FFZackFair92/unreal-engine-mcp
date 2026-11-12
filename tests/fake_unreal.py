@@ -256,6 +256,30 @@ class Actor(FakeObject):
     def get_actor_scale3d(self):
         return self._scale
 
+    # ---- fase 15: tag, visibilita', cartelle, chiamate
+    def set_actor_hidden_in_game(self, value):
+        self._props["hidden"] = bool(value)
+
+    def set_is_temporarily_hidden_in_editor(self, value):
+        self._hidden_editor = bool(value)
+
+    def is_temporarily_hidden_in_editor(self):
+        return getattr(self, "_hidden_editor", False)
+
+    def set_folder_path(self, value):
+        self._folder = str(value)
+
+    def get_folder_path(self):
+        return getattr(self, "_folder", "")
+
+    def call_method(self, name, args=()):
+        """Come nel motore: chiamare una funzione che non esiste e' un errore."""
+        chiamate = self._props.setdefault("_calls", [])
+        if name.startswith("Inesistente"):
+            raise Exception("Failed to find function '%s' on '%s'" % (name, self._label))
+        chiamate.append((name, tuple(args)))
+        return "ok:%s" % name
+
 
 class _FakeGeneratedClassPath(str):
     """Il path "<pacchetto>_C" restituito da `generated_class()`.
@@ -1888,6 +1912,20 @@ def build_fake_unreal(tmp_path):
         def set_selected_level_actors(self, actors):
             state["selected"] = list(actors)
 
+        def duplicate_actor(self, actor, to_world=None, offset=None):
+            copia = Actor(
+                class_name=actor._class_name,
+                label="%s_copia%d" % (actor._label, len(state["actors"])),
+                class_path=actor._class_path,
+            )
+            o = offset or Vector()
+            l = actor._location
+            copia._location = Vector(l.x + o.x, l.y + o.y, l.z + o.z)
+            copia._rotation = actor._rotation
+            copia._props = dict(actor._props)
+            state["actors"].append(copia)
+            return copia
+
     class LevelEditorSubsystem:
         def new_level(self, path):
             state["levels"].append(path)
@@ -1919,6 +1957,10 @@ def build_fake_unreal(tmp_path):
 
         def editor_request_end_play(self):
             state["pie"].append("stop")
+
+        def build_light_maps(self, quality, with_reflection_captures=False):
+            state.setdefault("light_builds", []).append((quality, with_reflection_captures))
+            return True
 
     class SubobjectDataSubsystem:
         """Fase 8: i componenti aggiunti a un Blueprint restano davvero
@@ -2446,11 +2488,71 @@ def build_fake_unreal(tmp_path):
             return HitResult(True, Vector(start.x, start.y, 0.0))
         return None
 
+    def _cvar(name, kind):
+        valore = state.setdefault("cvars", {}).get(name, "0")
+        try:
+            numero = float(valore)
+        except ValueError:
+            numero = 0.0
+        return {"float": numero, "int": int(numero), "bool": numero != 0}[kind]
+
+    def execute_console_command_cvar(world, cmd):
+        execute_console_command(world, cmd)
+        parti = cmd.split()
+        if len(parti) == 2 and "." in parti[0]:
+            state.setdefault("cvars", {})[parti[0]] = parti[1]
+
     module.SystemLibrary = types.SimpleNamespace(
         get_engine_version=lambda: "5.8.0-fake+++UE5",
-        execute_console_command=execute_console_command,
+        execute_console_command=execute_console_command_cvar,
         line_trace_single=line_trace_single,
+        get_console_variable_float_value=lambda n: _cvar(n, "float"),
+        get_console_variable_int_value=lambda n: _cvar(n, "int"),
+        get_console_variable_bool_value=lambda n: _cvar(n, "bool"),
     )
+    module.LightingBuildQuality = types.SimpleNamespace(
+        QUALITY_PREVIEW="Preview", QUALITY_MEDIUM="Medium",
+        QUALITY_HIGH="High", QUALITY_PRODUCTION="Production",
+    )
+
+    # ---- fase 15: livelli in streaming e editor degli asset
+    def _livello(path):
+        outer = types.SimpleNamespace(get_path_name=lambda: path)
+        return types.SimpleNamespace(
+            get_outer=lambda: outer, get_path_name=lambda: path + ":PersistentLevel"
+        )
+
+    def _livelli():
+        extra = [_livello(p) for p in state.setdefault("sublevels", [])]
+        return [_livello(state["current_level"])] + extra
+
+    def add_level_to_world(world, path, streaming_class):
+        if path in state.setdefault("sublevels", []) or not str(path).startswith("/Game/"):
+            return None
+        state["sublevels"].append(path)
+        return types.SimpleNamespace(streaming_class=streaming_class)
+
+    def remove_level_from_world(level):
+        path = level.get_outer().get_path_name()
+        if path in state.setdefault("sublevels", []):
+            state["sublevels"].remove(path)
+            return True
+        return False
+
+    module.EditorLevelUtils = types.SimpleNamespace(
+        get_levels=lambda world: _livelli(),
+        add_level_to_world=add_level_to_world,
+        remove_level_from_world=remove_level_from_world,
+    )
+    module.LevelStreamingDynamic = type("LevelStreamingDynamic", (FakeObject,), {})
+    module.LevelStreamingAlwaysLoaded = type("LevelStreamingAlwaysLoaded", (FakeObject,), {})
+
+    class AssetEditorSubsystem:
+        def open_editor_for_assets(self, assets):
+            state.setdefault("opened_editors", []).extend(assets)
+            return True
+
+    module.AssetEditorSubsystem = AssetEditorSubsystem
     module.TraceTypeQuery = types.SimpleNamespace(TRACE_TYPE_QUERY1="TraceTypeQuery1")
     module.DrawDebugTrace = types.SimpleNamespace(NONE="None")
 
@@ -2508,7 +2610,10 @@ def build_fake_unreal(tmp_path):
 
     class UnrealEditorSubsystem:
         def get_editor_world(self):
-            return types.SimpleNamespace(get_name=lambda: state["current_level"])
+            return types.SimpleNamespace(
+                get_name=lambda: state["current_level"],
+                get_path_name=lambda: state["current_level"],
+            )
 
         def get_game_world(self):
             return None

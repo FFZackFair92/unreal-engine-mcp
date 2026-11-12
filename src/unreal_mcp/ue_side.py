@@ -5293,3 +5293,261 @@ def mcp_sequence_open(sequence_path, close=False):
     sequenza = _mcp_sequence(sequence_path)
     unreal.LevelSequenceEditorBlueprintLibrary.open_level_sequence(sequenza)
     return {"sequence": sequence_path, "open": True}
+
+
+# ================================================================ fase 15
+# Attori e livelli: quello che c'era in ChiR24/Unreal_mcp (control_actor,
+# inspect, manage_level, control_editor) e mancava qui. Stesse regole del resto:
+# ogni modifica in una transazione undo, gli attori si trovano per label.
+
+
+def _mcp_plain(value):
+    """Un valore Unreal in qualcosa che il JSON sa trasportare."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return [_mcp_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _mcp_plain(v) for k, v in value.items()}
+    if all(hasattr(value, a) for a in ("x", "y", "z")):
+        return {"x": float(value.x), "y": float(value.y), "z": float(value.z)}
+    if all(hasattr(value, a) for a in ("pitch", "yaw", "roll")):
+        return {"pitch": float(value.pitch), "yaw": float(value.yaw), "roll": float(value.roll)}
+    if all(hasattr(value, a) for a in ("r", "g", "b")):
+        return {"r": float(value.r), "g": float(value.g), "b": float(value.b),
+                "a": float(getattr(value, "a", 1.0))}
+    if hasattr(value, "get_actor_label"):
+        return {"actor": value.get_actor_label()}
+    if hasattr(value, "get_path_name"):
+        try:
+            return str(value.get_path_name())
+        except Exception:  # noqa: BLE001
+            pass
+    return str(value)
+
+
+def mcp_actor_tags(label, add=None, remove=None):
+    actor = mcp_require_actor(label)
+    tags = [str(t) for t in (actor.get_editor_property("tags") or [])]
+    if add or remove:
+        togli = {str(t) for t in (remove or [])}
+        nuovi = [t for t in tags if t not in togli]
+        for t in add or []:
+            if str(t) not in nuovi:
+                nuovi.append(str(t))
+        with mcp_transaction("MCP: tag di %s" % label):
+            actor.set_editor_property("tags", [unreal.Name(t) for t in nuovi])
+        tags = nuovi
+    return {"actor": label, "tags": tags}
+
+
+def mcp_find_actors_by_tag(tag):
+    out = []
+    for actor in mcp_actor_subsystem().get_all_level_actors():
+        tags = [str(t) for t in (actor.get_editor_property("tags") or [])]
+        if str(tag) in tags:
+            out.append(mcp_actor_info(actor))
+    return out
+
+
+def mcp_duplicate_actor(label, new_label=None, offset=None):
+    actor = mcp_require_actor(label)
+    with mcp_transaction("MCP: duplica %s" % label):
+        copia = mcp_actor_subsystem().duplicate_actor(
+            actor, None, mcp_to_vector(offset or [0.0, 0.0, 0.0])
+        )
+        if copia is None:
+            raise RuntimeError("duplicate_actor non ha creato niente per '%s'" % label)
+        if new_label:
+            copia.set_actor_label(str(new_label))
+    return mcp_actor_info(copia)
+
+
+def mcp_set_actor_visibility(label, hidden_in_game=None, hidden_in_editor=None):
+    actor = mcp_require_actor(label)
+    with mcp_transaction("MCP: visibilita' di %s" % label):
+        if hidden_in_game is not None:
+            actor.set_actor_hidden_in_game(bool(hidden_in_game))
+        if hidden_in_editor is not None:
+            actor.set_is_temporarily_hidden_in_editor(bool(hidden_in_editor))
+    return {
+        "actor": label,
+        "hidden_in_game": bool(actor.get_editor_property("hidden")),
+        "hidden_in_editor": bool(actor.is_temporarily_hidden_in_editor()),
+    }
+
+
+def mcp_set_actor_folder(labels, folder):
+    attori = [mcp_require_actor(l) for l in labels]
+    with mcp_transaction("MCP: cartella Outliner %s" % folder):
+        for actor in attori:
+            actor.set_folder_path(unreal.Name(str(folder or "")))
+    return {"folder": folder, "actors": [a.get_actor_label() for a in attori]}
+
+
+def mcp_select_actors(labels=None, add=False):
+    subsystem = mcp_actor_subsystem()
+    if labels is not None:
+        scelti = [mcp_require_actor(l) for l in labels]
+        if add:
+            gia = list(subsystem.get_selected_level_actors())
+            scelti = gia + [a for a in scelti if a not in gia]
+        subsystem.set_selected_level_actors(scelti)
+    return {"selected": [mcp_actor_info(a) for a in subsystem.get_selected_level_actors()]}
+
+
+def _mcp_trace(start, end, ignore=None):
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    colpo = unreal.SystemLibrary.line_trace_single(
+        mondo, start, end, unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, False,
+        list(ignore or []), unreal.DrawDebugTrace.NONE, True,
+    )
+    # Vedi mcp_foliage_scatter: l'HitResult si legge solo con to_dict().
+    return colpo.to_dict() if colpo is not None else None
+
+
+def mcp_raycast(start, end=None, direction=None, distance=100000.0):
+    a = mcp_to_vector(start)
+    if end is not None:
+        b = mcp_to_vector(end)
+    else:
+        d = mcp_to_vector(direction or [0.0, 0.0, -1.0])
+        lung = (d.x ** 2 + d.y ** 2 + d.z ** 2) ** 0.5 or 1.0
+        k = float(distance) / lung
+        b = unreal.Vector(a.x + d.x * k, a.y + d.y * k, a.z + d.z * k)
+    hit = _mcp_trace(a, b)
+    if not hit or not hit.get("blocking_hit"):
+        return {"hit": False, "start": mcp_vec(a), "end": mcp_vec(b)}
+    out = {"hit": True, "start": mcp_vec(a), "end": mcp_vec(b)}
+    for chiave in ("location", "impact_point", "normal", "impact_normal", "distance",
+                   "hit_actor", "hit_component", "bone_name"):
+        if chiave in hit:
+            out[chiave] = _mcp_plain(hit[chiave])
+    return out
+
+
+def mcp_snap_to_floor(labels, z_offset=0.0, max_drop=100000.0):
+    """Appoggia gli attori sulla prima superficie sotto di loro (anche se sono
+    sprofondati nel pavimento: il raggio parte da sopra)."""
+    fatti, mancati = [], []
+    with mcp_transaction("MCP: appoggia al suolo"):
+        for label in labels:
+            actor = mcp_require_actor(label)
+            p = actor.get_actor_location()
+            hit = _mcp_trace(
+                unreal.Vector(p.x, p.y, p.z + 500.0),
+                unreal.Vector(p.x, p.y, p.z - float(max_drop)),
+                ignore=[actor],
+            )
+            if not hit or not hit.get("blocking_hit"):
+                mancati.append(label)
+                continue
+            z = float(hit["location"].z) + float(z_offset)
+            actor.set_actor_location(unreal.Vector(p.x, p.y, z), False, True)
+            fatti.append({"actor": label, "from_z": float(p.z), "to_z": z})
+    return {"snapped": fatti, "no_floor": mancati}
+
+
+def mcp_get_actor_property(label, names, component=None):
+    actor = mcp_require_actor(label)
+    target = actor if component is None else mcp_find_component(actor, component)
+    valori, errori = {}, {}
+    for nome in names:
+        try:
+            valori[nome] = _mcp_plain(target.get_editor_property(nome))
+        except Exception as exc:  # noqa: BLE001
+            errori[nome] = "%s: %s" % (type(exc).__name__, exc)
+    return {"actor": label, "component": component, "values": valori, "failed": errori}
+
+
+def mcp_call_actor_function(label, function, args=None):
+    """Chiama una funzione (BlueprintCallable o di Blueprint) su un attore piazzato."""
+    actor = mcp_require_actor(label)
+    argomenti = tuple(mcp_coerce_value(a) for a in (args or []))
+    with mcp_transaction("MCP: %s.%s" % (label, function)):
+        risultato = actor.call_method(str(function), argomenti)
+    return {"actor": label, "function": function, "result": _mcp_plain(risultato)}
+
+
+def mcp_list_sublevels():
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    livelli = []
+    for livello in unreal.EditorLevelUtils.get_levels(mondo):
+        try:
+            nome = str(livello.get_outer().get_path_name())
+        except Exception:  # noqa: BLE001
+            nome = str(livello.get_path_name())
+        livelli.append(nome)
+    return {"world": str(mondo.get_path_name()), "levels": livelli}
+
+
+def mcp_add_sublevel(level_path, streaming="dynamic"):
+    classi = {
+        "dynamic": "LevelStreamingDynamic",
+        "always_loaded": "LevelStreamingAlwaysLoaded",
+    }
+    nome_classe = classi.get(str(streaming).lower())
+    if nome_classe is None:
+        raise ValueError("streaming dev'essere 'dynamic' o 'always_loaded'")
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    with mcp_transaction("MCP: aggiungi sublevel %s" % level_path):
+        streaming_level = unreal.EditorLevelUtils.add_level_to_world(
+            mondo, str(level_path), getattr(unreal, nome_classe)
+        )
+    if streaming_level is None:
+        raise RuntimeError(
+            "Unreal non ha aggiunto '%s' (path sbagliato o gia' presente?)" % level_path
+        )
+    return {"added": level_path, "streaming": nome_classe, **mcp_list_sublevels()}
+
+
+def mcp_remove_sublevel(level_path):
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    for livello in unreal.EditorLevelUtils.get_levels(mondo):
+        try:
+            nome = str(livello.get_outer().get_path_name())
+        except Exception:  # noqa: BLE001
+            nome = str(livello.get_path_name())
+        if nome.split(".")[0] == str(level_path).split(".")[0]:
+            if not unreal.EditorLevelUtils.remove_level_from_world(livello):
+                raise RuntimeError("Unreal ha rifiutato di togliere '%s'" % level_path)
+            return {"removed": level_path, **mcp_list_sublevels()}
+    raise ValueError(
+        "'%s' non e' tra i livelli del mondo: %s" % (level_path, mcp_list_sublevels()["levels"])
+    )
+
+
+def mcp_build_lighting(quality="preview", reflection_captures=True):
+    qualita = {
+        "preview": "QUALITY_PREVIEW", "medium": "QUALITY_MEDIUM",
+        "high": "QUALITY_HIGH", "production": "QUALITY_PRODUCTION",
+    }
+    chiave = qualita.get(str(quality).lower())
+    if chiave is None:
+        raise ValueError("quality: preview, medium, high o production")
+    ok = mcp_level_subsystem().build_light_maps(
+        getattr(unreal.LightingBuildQuality, chiave), bool(reflection_captures)
+    )
+    return {"built": bool(ok), "quality": quality}
+
+
+def mcp_cvar(name, value=None):
+    mondo = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    if value is not None:
+        unreal.SystemLibrary.execute_console_command(mondo, "%s %s" % (name, value))
+    lib = unreal.SystemLibrary
+    letto = {
+        "float": lib.get_console_variable_float_value(str(name)),
+        "int": lib.get_console_variable_int_value(str(name)),
+        "bool": lib.get_console_variable_bool_value(str(name)),
+    }
+    return {"name": name, "set": value, "value": letto}
+
+
+def mcp_open_asset(path):
+    path = _mcp_normalizza_path_asset(path)
+    asset = mcp_asset_lib().load_asset(path)
+    if asset is None:
+        raise ValueError("Asset non trovato: %s" % path)
+    unreal.get_editor_subsystem(unreal.AssetEditorSubsystem).open_editor_for_assets([asset])
+    return {"opened": path}
