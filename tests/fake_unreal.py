@@ -1919,8 +1919,8 @@ def build_fake_unreal(tmp_path):
                 class_path=actor._class_path,
             )
             o = offset or Vector()
-            l = actor._location
-            copia._location = Vector(l.x + o.x, l.y + o.y, l.z + o.z)
+            pos = actor._location
+            copia._location = Vector(pos.x + o.x, pos.y + o.y, pos.z + o.z)
             copia._rotation = actor._rotation
             copia._props = dict(actor._props)
             state["actors"].append(copia)
@@ -2524,7 +2524,7 @@ def build_fake_unreal(tmp_path):
 
     def _livelli():
         extra = [_livello(p) for p in state.setdefault("sublevels", [])]
-        return [_livello(state["current_level"])] + extra
+        return [_livello(state["current_level"]), *extra]
 
     def add_level_to_world(world, path, streaming_class):
         if path in state.setdefault("sublevels", []) or not str(path).startswith("/Game/"):

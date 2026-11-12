@@ -5321,7 +5321,7 @@ def _mcp_plain(value):
     if hasattr(value, "get_path_name"):
         try:
             return str(value.get_path_name())
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - si ripiega su str()
             pass
     return str(value)
 
@@ -5378,7 +5378,7 @@ def mcp_set_actor_visibility(label, hidden_in_game=None, hidden_in_editor=None):
 
 
 def mcp_set_actor_folder(labels, folder):
-    attori = [mcp_require_actor(l) for l in labels]
+    attori = [mcp_require_actor(etichetta) for etichetta in labels]
     with mcp_transaction("MCP: cartella Outliner %s" % folder):
         for actor in attori:
             actor.set_folder_path(unreal.Name(str(folder or "")))
@@ -5388,7 +5388,7 @@ def mcp_set_actor_folder(labels, folder):
 def mcp_select_actors(labels=None, add=False):
     subsystem = mcp_actor_subsystem()
     if labels is not None:
-        scelti = [mcp_require_actor(l) for l in labels]
+        scelti = [mcp_require_actor(etichetta) for etichetta in labels]
         if add:
             gia = list(subsystem.get_selected_level_actors())
             scelti = gia + [a for a in scelti if a not in gia]
