@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 Attori e livelli: quello che c'era in [ChiR24/Unreal_mcp](https://github.com/ChiR24/Unreal_mcp)
 e mancava qui. 14 tool nuovi, 176 in tutto.
 
+### Fixed
+
+- `unreal_mcp.__version__` said `0.1.0` while the package was at `0.11.0`: it is
+  now read from the installed package metadata.
+- `StarterProject/Config/DefaultEngine.ini` no longer ships the Android File
+  Server section (a `SecurityToken` and `bAllowNetworkConnection=True` that a
+  starter project has no use for).
+
 ### Added
 
 - **Actors:** `ue_actor_tags`, `ue_duplicate_actor`, `ue_set_actor_visibility`,
