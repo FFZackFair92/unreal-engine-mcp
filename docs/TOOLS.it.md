@@ -1,6 +1,6 @@
 # Riferimento dei tool
 
-175 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
+176 tool, divisi su due livelli. Funziona su UE 5.0+ — i tool legati alla versione sono contrassegnati; `ue_status` riporta le `capabilities` del motore in esecuzione.
 
 **Livello locale** — gira come processo sulla tua macchina. Trova i motori, crea
 progetti, apre e chiude l'editor, compila il C++, produce il pacchetto, scarica

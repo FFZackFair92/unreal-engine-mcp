@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 Attori e livelli: quello che c'era in [ChiR24/Unreal_mcp](https://github.com/ChiR24/Unreal_mcp)
-e mancava qui. 13 tool nuovi, 175 in tutto.
+e mancava qui. 14 tool nuovi, 176 in tutto.
 
 ### Added
 

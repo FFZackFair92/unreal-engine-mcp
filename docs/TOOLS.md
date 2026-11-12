@@ -1,6 +1,6 @@
 # Tool reference
 
-175 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
+176 tools, split across two layers. Works on UE 5.0+ — version-dependent tools are marked; `ue_status` reports the running engine's `capabilities`.
 
 **Local layer** — runs as a process on your machine. Finds engines, creates
 projects, opens and closes the editor, compiles C++, packages the game,
